@@ -150,8 +150,6 @@ command.sh
 *.hdf5
 *.ckp
 
-data
-data/*
 
 tmp
 tmp/*
