@@ -178,7 +178,6 @@ runs_achieved/*
 runs_crossexp
 runs_crossexp/*
 
-*.json
 dumps
 dumps/*
 
