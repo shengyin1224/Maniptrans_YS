@@ -179,7 +179,7 @@ runs_crossexp/*
 dumps
 dumps/*
 
-*.pth
+
 
 dumps*
 dumps*/*
