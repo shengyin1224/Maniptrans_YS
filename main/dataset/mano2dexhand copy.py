@@ -45,9 +45,6 @@ def pack_data(data, dexhand):
                     )
                 )
             packed_data[k] = torch.stack(mano_joints).squeeze()
-        # 特殊处理 scene_objects 列表
-        elif k == "scene_objects":
-            packed_data[k] = data[0][k]
         elif type(data[0][k]) == torch.Tensor:
             packed_data[k] = torch.stack([d[k] for d in data]).squeeze()
         elif type(data[0][k]) == np.ndarray:
@@ -62,17 +59,10 @@ def soft_clamp(x, lower, upper):
 
 
 class Mano2Dexhand:
-    def __init__(self, args, dexhand, scene_objects, dataset_type="oakink2"):
-        """
-        args: 参数
-        dexhand: 机器人手模型
-        scene_objects: 包含所有物体信息的列表
-        dataset_type: 数据集类型，用于判断坐标转换逻辑
-        """
+    def __init__(self, args, dexhand, obj_urdf_path):
         self.gym = gymapi.acquire_gym()
         self.sim_params = gymapi.SimParams()
         self.dexhand = dexhand
-        self.scene_objects = scene_objects 
 
         self.sim_params.up_axis = gymapi.UP_AXIS_Z
         self.sim_params.gravity = gymapi.Vec3(0.0, 0.0, -9.81)
@@ -103,7 +93,6 @@ class Mano2Dexhand:
         if not self.headless:
             self.viewer = self.gym.create_viewer(self.sim, gymapi.CameraProperties())
 
-        # === 加载机器人 Asset ===
         asset_root = os.path.split(self.dexhand.urdf_path)[0]
         asset_file = os.path.split(self.dexhand.urdf_path)[1]
 
@@ -113,17 +102,21 @@ class Mano2Dexhand:
         asset_options.flip_visual_attachments = False
         asset_options.collapse_fixed_joints = False
         asset_options.default_dof_drive_mode = gymapi.DOF_MODE_POS
+        # asset_options.use_mesh_materials = True
         dexhand_asset = self.gym.load_asset(self.sim, asset_root, asset_file, asset_options)
 
         self.chain = pk.build_chain_from_urdf(open(os.path.join(asset_root, asset_file)).read())
         self.chain = self.chain.to(dtype=torch.float32, device=self.sim_device)
 
-        # 配置机器人关节参数
         dexhand_dof_stiffness = torch.tensor(
-            [10] * self.dexhand.n_dofs, dtype=torch.float, device=self.sim_device,
+            [10] * self.dexhand.n_dofs,
+            dtype=torch.float,
+            device=self.sim_device,
         )
         dexhand_dof_damping = torch.tensor(
-            [1] * self.dexhand.n_dofs, dtype=torch.float, device=self.sim_device,
+            [1] * self.dexhand.n_dofs,
+            dtype=torch.float,
+            device=self.sim_device,
         )
         self.limit_info = {}
         asset_rh_dof_props = self.gym.get_asset_dof_properties(dexhand_asset)
@@ -151,6 +144,7 @@ class Mano2Dexhand:
             dexhand_dof_props["driveMode"][i] = gymapi.DOF_MODE_POS
             dexhand_dof_props["stiffness"][i] = dexhand_dof_stiffness[i]
             dexhand_dof_props["damping"][i] = dexhand_dof_damping[i]
+
             self.dexhand_dof_lower_limits.append(dexhand_dof_props["lower"][i])
             self.dexhand_dof_upper_limits.append(dexhand_dof_props["upper"][i])
             self._dexhand_effort_limits.append(dexhand_dof_props["effort"][i])
@@ -160,7 +154,6 @@ class Mano2Dexhand:
         self.dexhand_dof_upper_limits = torch.tensor(self.dexhand_dof_upper_limits, device=self.sim_device)
         self._dexhand_effort_limits = torch.tensor(self._dexhand_effort_limits, device=self.sim_device)
         self._dexhand_dof_speed_limits = torch.tensor(self._dexhand_dof_speed_limits, device=self.sim_device)
-        
         default_dof_state = np.ones(self.num_dexhand_dofs, gymapi.DofState.dtype)
         default_dof_state["pos"] *= np.pi / 50
         default_dof_state["pos"][8] = 0.8
@@ -170,29 +163,16 @@ class Mano2Dexhand:
         self.dexhand_default_pose.p = gymapi.Vec3(0, 0, 0)
         self.dexhand_default_pose.r = gymapi.Quat(0, 0, 0, 1)
 
-        # === 配置坐标转换 ===
         table_width_offset = 0.2
         mujoco2gym_transf = np.eye(4)
-        # 1. 旋转修正 (Y-up to Z-up)
         mujoco2gym_transf[:3, :3] = aa_to_rotmat(np.array([0, 0, -np.pi / 2])) @ aa_to_rotmat(
             np.array([np.pi / 2, 0, 0])
         )
-        
         table_pos = gymapi.Vec3(-table_width_offset / 2, 0, 0.4)
         self.dexhand_pose = gymapi.Transform()
         table_half_height = 0.015
         self._table_surface_z = table_pos.z + table_half_height
-
-        # === [核心修改] 根据数据集类型决定平移策略 ===
-        if dataset_type == "humoto":
-            print("[INFO] Detected Humoto dataset: Using Scheme 1 (Rotation fix only, No Z-offset).")
-            # 方案一：仅旋转，不平移，保留原始高度
-            mujoco2gym_transf[:3, 3] = np.array([0, 0, 0])
-        else:
-            # 原有逻辑：旋转 + 平移到桌面高度
-            mujoco2gym_transf[:3, 3] = np.array([0, 0, self._table_surface_z])
-        # ===========================================
-
+        mujoco2gym_transf[:3, 3] = np.array([0, 0, self._table_surface_z])
         self.mujoco2gym_transf = torch.tensor(mujoco2gym_transf, device=self.sim_device, dtype=torch.float32)
 
         self.num_envs = args.num_envs
@@ -201,36 +181,28 @@ class Mano2Dexhand:
         env_lower = gymapi.Vec3(-spacing, -spacing, 0.0)
         env_upper = gymapi.Vec3(spacing, spacing, spacing)
 
-        # === 加载所有场景物体的 Assets ===
-        self.obj_assets = []
-        for obj_info in self.scene_objects:
-            asset_options = gymapi.AssetOptions()
-            asset_options.mesh_normal_mode = gymapi.COMPUTE_PER_VERTEX
-            asset_options.thickness = 0.001
-            asset_options.fix_base_link = True 
-            asset_options.vhacd_enabled = False
-            asset_options.disable_gravity = True
-            asset_options.density = 200
-            
-            current_asset = self.gym.load_asset(self.sim, *os.path.split(obj_info['urdf']), asset_options)
-            
-            rigid_shape_props_asset = self.gym.get_asset_rigid_shape_properties(current_asset)
-            for element in rigid_shape_props_asset:
-                element.friction = 0.00001
-            self.gym.set_asset_rigid_shape_properties(current_asset, rigid_shape_props_asset)
-            
-            self.obj_assets.append(current_asset)
+        asset_options = gymapi.AssetOptions()
+        asset_options.mesh_normal_mode = gymapi.COMPUTE_PER_VERTEX
+        asset_options.thickness = 0.001
+        asset_options.fix_base_link = True
+        asset_options.vhacd_enabled = False
+        asset_options.disable_gravity = True
+        asset_options.density = 200
+
+        current_asset = self.gym.load_asset(self.sim, *os.path.split(obj_urdf_path), asset_options)
+
+        rigid_shape_props_asset = self.gym.get_asset_rigid_shape_properties(current_asset)
+        for element in rigid_shape_props_asset:
+            element.friction = 0.00001
+        self.gym.set_asset_rigid_shape_properties(current_asset, rigid_shape_props_asset)
 
         self.envs = []
         self.hand_idxs = []
-        self.obj_actor_handles = [] 
 
         for i in range(self.num_envs):
             # Create env
             env = self.gym.create_env(self.sim, env_lower, env_upper, num_per_row)
             self.envs.append(env)
-            
-            # Create DexHand
             dexhand_actor = self.gym.create_actor(
                 env,
                 dexhand_asset,
@@ -240,22 +212,14 @@ class Mano2Dexhand:
                 (1 if self.dexhand.self_collision else 0),
             )
 
+            # Set initial DOF states
             self.gym.set_actor_dof_states(env, dexhand_actor, self.dexhand_default_dof_pos, gymapi.STATE_ALL)
+
+            # Set DOF control properties
             self.gym.set_actor_dof_properties(env, dexhand_actor, dexhand_dof_props)
 
-            # === 创建所有物体的 Actors ===
-            env_obj_handles = []
-            for k, asset in enumerate(self.obj_assets):
-                obj_name = self.scene_objects[k]['name']
-                handle = self.gym.create_actor(env, asset, gymapi.Transform(), f"{obj_name}_{i}", i, 0)
-                env_obj_handles.append(handle)
-            self.obj_actor_handles.append(env_obj_handles)
-            
-            if len(env_obj_handles) > 0:
-                self.obj_actor = env_obj_handles[0] 
-            # ==============================
+            self.obj_actor = self.gym.create_actor(env, current_asset, gymapi.Transform(), "manip_obj", i, 0)
 
-            # Visualization Spheres
             scene_asset_options = gymapi.AssetOptions()
             scene_asset_options.fix_base_link = True
             for joint_vis_id, joint_name in enumerate(self.dexhand.body_names):
@@ -344,62 +308,21 @@ class Mano2Dexhand:
             ),
         )
 
-    def fitting(self, max_iter, target_wrist_pos, target_wrist_rot, target_mano_joints):
+    def fitting(self, max_iter, obj_trajectory, target_wrist_pos, target_wrist_rot, target_mano_joints):
+
         assert target_mano_joints.shape[0] == self.num_envs
-        
-        # 转换 Target 到 Gym 坐标系
         target_wrist_pos = (self.mujoco2gym_transf[:3, :3] @ target_wrist_pos.T).T + self.mujoco2gym_transf[:3, 3]
         target_wrist_rot = self.mujoco2gym_transf[:3, :3] @ aa_to_rotmat(target_wrist_rot)
         target_mano_joints = target_mano_joints.view(-1, 3)
         target_mano_joints = (self.mujoco2gym_transf[:3, :3] @ target_mano_joints.T).T + self.mujoco2gym_transf[:3, 3]
         target_mano_joints = target_mano_joints.view(self.num_envs, -1, 3)
 
-        # 处理多物体轨迹，并计算 Offset
-        processed_trajs = []
-        for obj_info in self.scene_objects:
-            traj = obj_info['trajectory']
-            # 转换轨迹坐标系
-            traj = self.mujoco2gym_transf.to(traj.device) @ traj
-            processed_trajs.append(traj)
+        obj_trajectory = self.mujoco2gym_transf @ obj_trajectory
 
-        # === [打印] 第0个环境的所有物体的初始位置 ===
-        print(f"\n[MANO2DEXHAND] Env 0 - All Objects Initial Positions:")
-        for k, (obj_info, traj) in enumerate(zip(self.scene_objects, processed_trajs)):
-            obj_name = obj_info.get('name', f'obj_{k}')
-            # 获取第0个环境、第0帧的位置
-            obj_pos = traj[0, :3, 3].cpu().numpy()  # [3]
-            print(f"  Object {k} ({obj_name}): pos=({obj_pos[0]:.4f}, {obj_pos[1]:.4f}, {obj_pos[2]:.4f})")
-        print()
-
-        # 计算 Offset (选择距离<0.2且最小的物体)
         middle_pos = (target_mano_joints[:, 3] + target_wrist_pos) / 2
-        
-        # 计算所有物体到middle_pos的距离，并找到距离<0.2且最小的物体
-        min_dist = torch.full((self.num_envs,), float('inf'), device=middle_pos.device, dtype=middle_pos.dtype)
-        closest_obj_pos = None
-        
-        for obj_traj in processed_trajs:
-            obj_pos = obj_traj[:, :3, 3]  # [N, 3]
-            dist = torch.norm(middle_pos - obj_pos, dim=-1)  # [N]
-            
-            # 只考虑距离<0.2的物体
-            mask = dist < 0.2
-            # 更新最小距离和对应的物体位置
-            update_mask = mask & (dist < min_dist)
-            min_dist = torch.where(update_mask, dist, min_dist)
-            if closest_obj_pos is None:
-                closest_obj_pos = obj_pos.clone()
-            closest_obj_pos = torch.where(update_mask.unsqueeze(-1), obj_pos, closest_obj_pos)
-        
-        # 如果最小距离>=0.2，offset=0；否则用最近的物体计算offset
-        has_close_obj = min_dist < 0.2
-        if closest_obj_pos is None:
-            offset = torch.zeros_like(middle_pos)
-        else:
-            offset = middle_pos - closest_obj_pos
-            offset = offset / torch.norm(offset, dim=-1, keepdim=True) * 0.2
-            # 对于距离>=0.2的环境，offset设为0
-            offset = torch.where(has_close_obj.unsqueeze(-1), offset, torch.zeros_like(offset))
+        obj_pos = obj_trajectory[:, :3, 3]
+        offset = middle_pos - obj_pos
+        offset = offset / torch.norm(offset, dim=-1, keepdim=True) * 0.2
 
         opt_wrist_pos = torch.tensor(
             target_wrist_pos + offset,
@@ -424,17 +347,25 @@ class Mano2Dexhand:
         for k in self.dexhand.body_names:
             k = self.dexhand.to_hand(k)[0]
             if "tip" in k:
-                if "index" in k: weight.append(20)
-                elif "middle" in k: weight.append(10)
-                elif "ring" in k: weight.append(7)
-                elif "pinky" in k: weight.append(5)
-                elif "thumb" in k: weight.append(25)
-                else: raise ValueError
-            elif "proximal" in k: weight.append(1)
-            elif "intermediate" in k: weight.append(1)
-            else: weight.append(1)
+                if "index" in k:
+                    weight.append(20)
+                elif "middle" in k:
+                    weight.append(10)
+                elif "ring" in k:
+                    weight.append(7)
+                elif "pinky" in k:
+                    weight.append(5)
+                elif "thumb" in k:
+                    weight.append(25)
+                else:
+                    raise ValueError
+            elif "proximal" in k:
+                weight.append(1)
+            elif "intermediate" in k:
+                weight.append(1)
+            else:
+                weight.append(1)
         weight = torch.tensor(weight, device=self.sim_device, dtype=torch.float32)
-
         iter = 0
         past_loss = 1e10
         while (self.headless and iter < max_iter) or (
@@ -443,36 +374,30 @@ class Mano2Dexhand:
             iter += 1
 
             opt_wrist_quat = rot6d_to_quat(opt_wrist_rot)[:, [1, 2, 3, 0]]
-            
+            opt_wrist_rotmat = rot6d_to_rotmat(opt_wrist_rot)
             self._root_state[:, 0, :3] = opt_wrist_pos.detach()
             self._root_state[:, 0, 3:7] = opt_wrist_quat.detach()
             self._root_state[:, 0, 7:] = torch.zeros_like(self._root_state[:, 0, 7:])
-
-            # 更新所有物体的位置
-            for k, traj in enumerate(processed_trajs):
-                pos = traj[:, :3, 3]
-                quat = rotmat_to_quat(traj[:, :3, :3])[:, [1, 2, 3, 0]]
-                
-                actor_idx = 1 + k
-                self._root_state[:, actor_idx, :3] = pos
-                self._root_state[:, actor_idx, 3:7] = quat
-
+            self._root_state[:, self.obj_actor, :3] = obj_trajectory[:, :3, 3]
+            self._root_state[:, self.obj_actor, 3:7] = rotmat_to_quat(obj_trajectory[:, :3, :3])[:, [1, 2, 3, 0]]
 
             opt_dof_pos_clamped = torch.clamp(opt_dof_pos, self.dexhand_dof_lower_limits, self.dexhand_dof_upper_limits)
 
             self.gym.set_dof_position_target_tensor(self.sim, gymtorch.unwrap_tensor(opt_dof_pos_clamped))
             self.gym.set_actor_root_state_tensor(self.sim, gymtorch.unwrap_tensor(self._root_state))
 
+            # Step the physics
             self.gym.simulate(self.sim)
             self.gym.fetch_results(self.sim, True)
             if not self.headless:
                 self.gym.step_graphics(self.sim)
 
+            # Update jacobian and mass matrix
             self.gym.refresh_rigid_body_state_tensor(self.sim)
             self.gym.refresh_dof_state_tensor(self.sim)
             self.gym.refresh_actor_root_state_tensor(self.sim)
             self.gym.refresh_net_contact_force_tensor(self.sim)
-            
+            # Step rendering
             if not self.headless:
                 self.gym.step_graphics(self.sim)
                 self.gym.draw_viewer(self.viewer, self.sim, False)
@@ -547,6 +472,7 @@ if __name__ == "__main__":
     dexhand = DexHandFactory.create_hand(_parser.dexhand, _parser.side)
 
     def run(parser, idx):
+
         dataset_type = ManipDataFactory.dataset_type(idx)
         demo_d = ManipDataFactory.create_data(
             manipdata_type=dataset_type,
@@ -560,14 +486,12 @@ if __name__ == "__main__":
         demo_data = pack_data([demo_d[idx]], dexhand)
 
         parser.num_envs = demo_data["mano_joints"].shape[0]
-        scene_objects = demo_data["scene_objects"]
 
-        # === [修改] 传入 dataset_type ===
-        mano2inspire = Mano2Dexhand(parser, dexhand, scene_objects, dataset_type=dataset_type)
-        # ==============================
+        mano2inspire = Mano2Dexhand(parser, dexhand, demo_data["obj_urdf_path"][0])
 
         to_dump = mano2inspire.fitting(
             parser.iter,
+            demo_data["obj_trajectory"],
             demo_data["wrist_pos"],
             demo_data["wrist_rot"],
             demo_data["mano_joints"].view(parser.num_envs, -1, 3),
@@ -575,9 +499,13 @@ if __name__ == "__main__":
 
         if dataset_type == "oakink2":
             dump_path = f"data/retargeting/OakInk-v2/mano2{str(dexhand)}/{os.path.split(demo_data['data_path'][0])[-1].replace('.pkl', f'@{idx[-1]}.pkl')}"
+        # === 修改开始：添加 Humoto 的保存路径 ===
         elif dataset_type == "humoto":
+            # 定义你想保存的位置，这里假设保存在 data/retargeting/Humoto/...
+            # demo_data['data_path'][0] 是 pkl 的完整路径
             filename = os.path.basename(demo_data['data_path'][0])
             dump_path = f"data/retargeting/Humoto/mano2{str(dexhand)}/{filename}"
+        # === 修改结束 ===
         elif dataset_type == "favor":
             dump_path = (
                 f"data/retargeting/favor_pass1/mano2{str(dexhand)}/{os.path.split(demo_data['data_path'][0])[-1]}"

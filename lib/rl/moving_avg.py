@@ -86,7 +86,14 @@ class RunningMeanStd(nn.Module):
             if self.norm_only:
                 y = input / torch.sqrt(current_var.float() + self.epsilon)
             else:
-                y = (input - current_mean.float()) / torch.sqrt(current_var.float() + self.epsilon)
+                try:
+                    y = (input - current_mean.float()) / torch.sqrt(current_var.float() + self.epsilon)
+                except Exception as e:
+                    print(f"Error in RunningMeanStd: {e}")
+                    print(f"Input shape: {input.shape}")
+                    print(f"Current mean shape: {current_mean.shape}")
+                    print(f"Current var shape: {current_var.shape}")
+                    raise e
                 y = torch.clamp(y, min=-20.0, max=20.0)
         return y
 

@@ -80,13 +80,10 @@ class HumotoDatasetBase(ManipData):
     def __init__(
         self,
         bone_map: dict,
-        # [修改点]: 给 data_dir 设置默认值！
-        # 请将其修改为你存放 humoto 数据集的真实根目录
         data_dir: str = "data/humoto", 
         split: str = "all",
         device="cuda:0",
-        # 请确保 JSON 路径也正确，如果变了也要改
-        human_model_json: str = "/home/ubuntu/DATA3/shengyin/ManipTrans/main/dataset/human_model/human_model_up_bone_yup.json", 
+        human_model_json: str = "main/dataset/human_model/human_model_up_bone_yup.json", 
         fix_orientation: bool = False, 
         fix_coordinate_system: bool = False,
         target_fps: int = 60,
@@ -208,31 +205,51 @@ class HumotoDatasetBase(ManipData):
             pose_params=True
         )
 
-        # 1. 物体处理
-        obj_names = list(raw_data['object_pose_params'].keys())
-        valid_objs = [o for o in obj_names if o not in ['table', 'tray', 'floor', 'ground', 'room', 'ground_plane']]
-        obj_id = valid_objs[0] if valid_objs else obj_names[0]
-
-        obj_pose_dict = {obj_id: raw_data['object_pose_params'][obj_id]}
-        interp_obj_dict = self._interpolate_pose_params(obj_pose_dict)
+        # === 1. 修改后的物体处理逻辑：加载所有物体 ===
         
-        obj_data = interp_obj_dict[obj_id]
-        obj_trajectory = self._quat_pos_to_mat_tensor(obj_data[:, :4], obj_data[:, 4:])
-        
-        # 应用全局修正
-        obj_trajectory = torch.matmul(self.global_fix_matrix, obj_trajectory)
+        # 获取所有物体名称，不再过滤 table, tray 等
+        all_obj_names = list(raw_data['object_pose_params'].keys())
+        if not all_obj_names:
+             pass
 
-        # Mesh 采样
-        verts_np, faces_np = raw_data['object_models'][obj_id]['mesh']
-        mesh_torch = Meshes(
-            verts=torch.tensor(verts_np, dtype=torch.float32, device=self.device)[None],
-            faces=torch.tensor(faces_np, dtype=torch.float32, device=self.device)[None]
-        )
-        obj_verts = self.random_sampling_pc(mesh_torch)
+        scene_objects_info = []
         
-        obj_urdf_path = os.path.join(seq_folder_path, f"{obj_id}.urdf")
+        for obj_name in all_obj_names:
+             # 1.1 处理每个物体的轨迹插值
+             obj_pose_dict = {obj_name: raw_data['object_pose_params'][obj_name]}
+             interp_obj_dict = self._interpolate_pose_params(obj_pose_dict)
+             obj_data = interp_obj_dict[obj_name]
+             
+             # 1.2 转换为矩阵并应用全局修正
+             traj_tensor = self._quat_pos_to_mat_tensor(obj_data[:, :4], obj_data[:, 4:])
+             traj_tensor = torch.matmul(self.global_fix_matrix, traj_tensor)
+             
+             # 1.3 获取 Mesh 并采样点云
+             if obj_name in raw_data['object_models']:
+                 verts_np, faces_np = raw_data['object_models'][obj_name]['mesh']
+                 mesh_torch = Meshes(
+                     verts=torch.tensor(verts_np, dtype=torch.float32, device=self.device)[None],
+                     faces=torch.tensor(faces_np, dtype=torch.float32, device=self.device)[None]
+                 )
+                 obj_verts = self.random_sampling_pc(mesh_torch)
+             else:
+                 obj_verts = torch.zeros((1000, 3), device=self.device)
 
+             # 1.4 获取 URDF 路径
+             obj_urdf_path = os.path.join(seq_folder_path, f"{obj_name}.urdf")
+             
+             # 1.5 存入列表
+             scene_objects_info.append({
+                 "name": obj_name,
+                 "urdf": obj_urdf_path,
+                 "trajectory": traj_tensor, # [T, 4, 4]
+                 "verts": obj_verts,        # [1000, 3]
+                 "is_dynamic": True 
+             })
+        
         # 2. 骨骼处理 (FK)
+        # [已移除] 之前检查 root_trans 的代码块
+        
         armature_params = raw_data['armature_pose_params']
         interp_armature_dict = self._interpolate_pose_params(armature_params)
         
@@ -244,6 +261,8 @@ class HumotoDatasetBase(ManipData):
                 mat = torch.matmul(self.global_fix_matrix, mat)
                 
             pose_params_matrix[b_name] = mat
+
+        # [已移除] 之前计算临时 FK 检查高度差的代码块
 
         with torch.no_grad():
             joint_positions_dict = self.human_model.compute_joint_positions(pose_params_matrix)
@@ -263,23 +282,25 @@ class HumotoDatasetBase(ManipData):
             if humoto_k in joint_positions_dict:
                 mano_joints[mano_k] = joint_positions_dict[humoto_k]
             else:
-                # 如果缺少关节，补0防止报错 (通常不会发生)
                 mano_joints[mano_k] = torch.zeros_like(wrist_pos)
 
+        # 4. 构造返回字典
         data = {
             "data_path": pkl_path,
-            "obj_id": obj_id,
-            "obj_verts": obj_verts,
-            "obj_urdf_path": obj_urdf_path,
-            "obj_trajectory": obj_trajectory,
+            # 兼容字段 (指向第一个物体)
+            "obj_id": scene_objects_info[0]["name"] if scene_objects_info else "none",
+            "obj_verts": scene_objects_info[0]["verts"] if scene_objects_info else torch.zeros((1000, 3), device=self.device),
+            "obj_urdf_path": scene_objects_info[0]["urdf"] if scene_objects_info else "",
+            "obj_trajectory": scene_objects_info[0]["trajectory"] if scene_objects_info else torch.eye(4, device=self.device)[None],
+            # 新增字段：包含所有物体
+            "scene_objects": scene_objects_info,
+            
             "wrist_pos": wrist_pos,
             "wrist_rot": wrist_rot,
             "mano_joints": mano_joints,
         }
 
-        # === [修改] 使用基类的高级方法加载 Retargeting 数据 ===
-        # 这一步会替换掉我们刚才手动写的 pickle.load 和 velocity 补全
-        
+        # 加载 Retargeting 数据
         if self.embodiment is not None:
             # 1. 构造路径
             hand_suffix = "_rh" if self.side == "right" else "_lh"
@@ -292,12 +313,11 @@ class HumotoDatasetBase(ManipData):
                 filename
             )
             
-            # 2. 直接调用基类方法！
-            # 这个方法会自动加载 .pkl，并帮你算出 velocity (opt_dof_velocity)
+            # 2. 直接调用基类方法
             self.load_retargeted_data(data, retarget_path)
-        # =====================================================
 
-        self.process_data(data, idx, obj_verts)
+        # process_data 传入第一个物体的 verts
+        self.process_data(data, idx, data["obj_verts"])
         return data
 
 # === 3. 注册子类 ===
@@ -306,10 +326,10 @@ class HumotoDatasetBase(ManipData):
 class HumotoDatasetRH(HumotoDatasetBase):
     def __init__(self, **kwargs):
         # 初始化时传入右手的骨骼映射
-        super().__init__(bone_map=BONE_MAP_RH, **kwargs)
+        super().__init__(bone_map=BONE_MAP_RH, side='right', **kwargs)
 
 @register_manipdata("humoto_lh")
 class HumotoDatasetLH(HumotoDatasetBase):
     def __init__(self, **kwargs):
         # 初始化时传入左手的骨骼映射
-        super().__init__(bone_map=BONE_MAP_LH, **kwargs)
+        super().__init__(bone_map=BONE_MAP_LH, side='left',**kwargs)

@@ -104,105 +104,6 @@ class ManipData(Dataset, ABC):
 
     def process_data(self, data, idx, rs_verts_obj):
         data["obj_trajectory"] = self.mujoco2gym_transf @ data["obj_trajectory"]
-        if "scene_objects" in data and data["scene_objects"] is not None:
-            converted_scene_objects = []
-            for obj in data["scene_objects"]:
-                if obj is None:
-                    continue
-                obj_copy = dict(obj)
-                traj = obj_copy.get("trajectory", None)
-                if traj is not None:
-                    if isinstance(traj, np.ndarray):
-                        traj_tensor = torch.tensor(traj, device=self.device, dtype=torch.float32)
-                    else:
-                        traj_tensor = traj.to(self.device).to(torch.float32)
-                    obj_copy["trajectory"] = torch.matmul(
-                        self.mujoco2gym_transf, traj_tensor
-                    )
-                    
-                    # 为每个物体计算 velocity, angular_velocity, verts_transf
-                    obj_verts = obj_copy.get("verts", None)
-                    if obj_verts is not None:
-                        if isinstance(obj_verts, np.ndarray):
-                            obj_verts_tensor = torch.tensor(obj_verts, device=self.device, dtype=torch.float32)
-                        else:
-                            obj_verts_tensor = obj_verts.to(self.device).to(torch.float32)
-                        
-                        # 计算 verts_transf
-                        obj_copy["verts_transf"] = (
-                            obj_copy["trajectory"][:, :3, :3] @ obj_verts_tensor.T[None]
-                        ).transpose(-1, -2) + obj_copy["trajectory"][:, :3, 3][:, None]
-                    
-                    # 计算 velocity
-                    obj_copy["velocity"] = self.compute_velocity(
-                        obj_copy["trajectory"][:, None, :3, 3], 1 / (120 / self.skip), guassian_filter=True
-                    ).squeeze(1)
-                    
-                    # 计算 angular_velocity
-                    obj_copy["angular_velocity"] = self.compute_angular_velocity(
-                        obj_copy["trajectory"][:, None, :3, :3], 1 / (120 / self.skip), guassian_filter=True
-                    ).squeeze(1)
-                    
-                    # 如果序列长度超过 max_seq_len，需要截断
-                    if len(obj_copy["trajectory"]) > self.max_seq_len:
-                        obj_copy["trajectory"] = obj_copy["trajectory"][: self.max_seq_len]
-                        obj_copy["velocity"] = obj_copy["velocity"][: self.max_seq_len]
-                        obj_copy["angular_velocity"] = obj_copy["angular_velocity"][: self.max_seq_len]
-                        if "verts_transf" in obj_copy:
-                            obj_copy["verts_transf"] = obj_copy["verts_transf"][: self.max_seq_len]
-                
-                pose = obj_copy.get("pose", None)
-                if pose is not None:
-                    if isinstance(pose, np.ndarray):
-                        pose_tensor = torch.tensor(pose, device=self.device, dtype=torch.float32)
-                        converted_pose = torch.matmul(self.mujoco2gym_transf, pose_tensor).cpu().numpy()
-                    else:
-                        pose_tensor = pose.to(self.device).to(torch.float32)
-                        converted_pose = torch.matmul(self.mujoco2gym_transf, pose_tensor)
-                    obj_copy["pose"] = converted_pose
-                converted_scene_objects.append(obj_copy)
-            data["scene_objects"] = converted_scene_objects
-            
-            # 使用第一个物体的值来设置向后兼容的变量
-            if len(converted_scene_objects) > 0:
-                first_obj = converted_scene_objects[0]
-                if "trajectory" in first_obj:
-                    data["obj_trajectory"] = first_obj["trajectory"]
-                if "velocity" in first_obj:
-                    data["obj_velocity"] = first_obj["velocity"]
-                if "angular_velocity" in first_obj:
-                    data["obj_angular_velocity"] = first_obj["angular_velocity"]
-                if "verts_transf" in first_obj:
-                    obj_verts_transf = first_obj["verts_transf"]
-                else:
-                    # 如果第一个物体没有 verts_transf，使用 rs_verts_obj 计算
-                    obj_verts_transf = (data["obj_trajectory"][:, :3, :3] @ rs_verts_obj.T[None]).transpose(-1, -2) + data[
-                        "obj_trajectory"
-                    ][:, :3, 3][:, None]
-            else:
-                # 如果 converted_scene_objects 为空，使用原来的方法
-                obj_verts_transf = (data["obj_trajectory"][:, :3, :3] @ rs_verts_obj.T[None]).transpose(-1, -2) + data[
-                    "obj_trajectory"
-                ][:, :3, 3][:, None]
-                # 需要计算 obj_velocity 和 obj_angular_velocity
-                data["obj_velocity"] = self.compute_velocity(
-                    data["obj_trajectory"][:, None, :3, 3], 1 / (120 / self.skip), guassian_filter=True
-                ).squeeze(1)
-                data["obj_angular_velocity"] = self.compute_angular_velocity(
-                    data["obj_trajectory"][:, None, :3, :3], 1 / (120 / self.skip), guassian_filter=True
-                ).squeeze(1)
-        else:
-            # 如果没有 scene_objects，使用原来的方法
-            obj_verts_transf = (data["obj_trajectory"][:, :3, :3] @ rs_verts_obj.T[None]).transpose(-1, -2) + data[
-                "obj_trajectory"
-            ][:, :3, 3][:, None]
-            # 如果没有 scene_objects，需要计算 obj_velocity 和 obj_angular_velocity
-            data["obj_velocity"] = self.compute_velocity(
-                data["obj_trajectory"][:, None, :3, 3], 1 / (120 / self.skip), guassian_filter=True
-            ).squeeze(1)
-            data["obj_angular_velocity"] = self.compute_angular_velocity(
-                data["obj_trajectory"][:, None, :3, :3], 1 / (120 / self.skip), guassian_filter=True
-            ).squeeze(1)
         data["wrist_pos"] = (self.mujoco2gym_transf[:3, :3] @ data["wrist_pos"].T).T + self.mujoco2gym_transf[:3, 3]
         data["wrist_rot"] = rotmat_to_aa(self.mujoco2gym_transf[:3, :3] @ data["wrist_rot"])
         for k in data["mano_joints"].keys():
@@ -211,10 +112,9 @@ class ManipData(Dataset, ABC):
             ).T + self.mujoco2gym_transf[:3, 3]
 
         # caculate distance
-        # obj_verts_transf 已经在上面根据是否有 scene_objects 计算好了
-        # 如果没有 scene_objects，obj_verts_transf 会在上面的 else 分支中计算
-        # 如果有 scene_objects，obj_verts_transf 会使用第一个物体的 verts_transf
-        # obj_velocity 和 obj_angular_velocity 也已经在上面处理好了
+        obj_verts_transf = (data["obj_trajectory"][:, :3, :3] @ rs_verts_obj.T[None]).transpose(-1, -2) + data[
+            "obj_trajectory"
+        ][:, :3, 3][:, None]
 
         tip_list = ["thumb_tip", "index_tip", "middle_tip", "ring_tip", "pinky_tip"]
 
@@ -225,6 +125,13 @@ class ManipData(Dataset, ABC):
         tips_near, _, _, _ = self.ch_dist(tips, obj_verts_transf)
         # tips_contact = tips_near <= 0.008**2  # ? 8mm, ch_dist return square distance
         data["tips_distance"] = torch.sqrt(tips_near)
+
+        data["obj_velocity"] = self.compute_velocity(
+            data["obj_trajectory"][:, None, :3, 3], 1 / (120 / self.skip), guassian_filter=True
+        ).squeeze(1)
+        data["obj_angular_velocity"] = self.compute_angular_velocity(
+            data["obj_trajectory"][:, None, :3, :3], 1 / (120 / self.skip), guassian_filter=True
+        ).squeeze(1)
         data["wrist_velocity"] = self.compute_velocity(
             data["wrist_pos"][:, None], 1 / (120 / self.skip), guassian_filter=True
         ).squeeze(1)

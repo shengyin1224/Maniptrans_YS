@@ -15,6 +15,23 @@ class ResBiHDictObsNetwork(A2CBuilder.Network):
         actions_num = kwargs.pop("actions_num")
         self.value_size = kwargs.pop("value_size", 1)
         self.num_seqs = kwargs.pop("num_seqs", 1)
+        input_shape = kwargs.get("input_shape")
+
+        if input_shape is not None and "dict_feature_encoder" in params:
+            # Handle gym.spaces.Dict
+            if hasattr(input_shape, "spaces"):
+                shapes = {k: v.shape for k, v in input_shape.spaces.items()}
+            elif isinstance(input_shape, dict):
+                shapes = input_shape
+            else:
+                shapes = {}
+
+            extractors = params["dict_feature_encoder"].get("extractors", {})
+            for key, shape in shapes.items():
+                if key in extractors:
+                    # Assuming shape is tuple e.g. (dim,)
+                    dim = shape[0] if isinstance(shape, tuple) else shape
+                    extractors[key]["input_dim"] = dim
 
         NetworkBuilder.BaseNetwork.__init__(self)
         self.load(params)

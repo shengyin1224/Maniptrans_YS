@@ -611,6 +611,11 @@ class VecTask(Env):
                 self.gym.step_graphics(self.sim)
                 self.gym.draw_viewer(self.viewer, self.sim, True)
 
+                # === [新增] 强行慢放，想多慢改多大 ===
+                # import time
+                # time.sleep(0.3) # 每次渲染暂停 0.05秒，相当于变慢 3-4 倍
+                # ===================================
+
                 # Wait for dt to elapse in real time.
                 # This synchronizes the physics simulation with the rendering rate.
                 self.gym.sync_frame_time(self.sim)
