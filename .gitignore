@@ -180,7 +180,7 @@ dumps
 dumps/*
 
 
-
+data/
 dumps*
 dumps*/*
 top_rollouts*
