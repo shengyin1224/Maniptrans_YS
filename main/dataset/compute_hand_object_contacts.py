@@ -190,13 +190,14 @@ def transform_object_points(object_points_local, object_pose):
     return points_transformed[:, :3]
 
 
-def analyze_motion_contacts(data_idx, dexhand, device="cuda:0", contact_threshold=0.005, num_object_points=1024):
+def analyze_motion_contacts(data_idx, dexhand, side="right", device="cuda:0", contact_threshold=0.005, num_object_points=1024):
     """
     分析一个motion的所有帧的手-物体接触
     
     Args:
         data_idx: 数据索引
         dexhand: 手部模型
+        side: 手部侧边（"left" 或 "right"）
         device: 计算设备
         contact_threshold: 接触距离阈值（米）
         num_object_points: 物体点云采样数量
@@ -206,11 +207,11 @@ def analyze_motion_contacts(data_idx, dexhand, device="cuda:0", contact_threshol
     """
     # 加载数据
     dataset_type = ManipDataFactory.dataset_type(data_idx)
-    cprint(f"Loading {dataset_type} data: {data_idx}", "cyan")
+    cprint(f"Loading {dataset_type} data: {data_idx} (side: {side})", "cyan")
     
     demo_d = ManipDataFactory.create_data(
         manipdata_type=dataset_type,
-        side="right",  # 可以根据需要修改
+        side=side,
         device=device,
         mujoco2gym_transf=torch.eye(4, device=device),
         dexhand=dexhand,
@@ -273,6 +274,7 @@ def analyze_motion_contacts(data_idx, dexhand, device="cuda:0", contact_threshol
     results = {
         'data_idx': data_idx,
         'dataset_type': dataset_type,
+        'side': side,
         'num_frames': num_frames,
         'num_objects': num_objects,
         'num_hand_points': num_hand_points,
@@ -336,7 +338,7 @@ def print_contact_summary(results):
     cprint("CONTACT ANALYSIS SUMMARY", "cyan", attrs=['bold'])
     cprint("="*80, "cyan")
     
-    cprint(f"\nData: {results['data_idx']} ({results['dataset_type']})", "white", attrs=['bold'])
+    cprint(f"\nData: {results['data_idx']} ({results['dataset_type']}, side: {results.get('side', 'unknown')})", "white", attrs=['bold'])
     cprint(f"Total frames: {num_frames}", "white")
     cprint(f"Contact threshold: {results['contact_threshold']*1000:.1f} mm", "white")
     cprint(f"Number of hand points: {results['num_hand_points']}", "white")
@@ -408,6 +410,7 @@ if __name__ == "__main__":
     results = analyze_motion_contacts(
         data_idx=args.data_idx,
         dexhand=dexhand,
+        side=args.side,
         device=args.device,
         contact_threshold=args.threshold,
         num_object_points=args.num_points
