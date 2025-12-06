@@ -306,6 +306,7 @@ class Mano2Dexhand:
             # === 接触点可视化 Spheres（为当前环境创建） ===
             if self.contact_data is not None and self.max_contacts_per_frame > 0:
                 env_contact_actors = []
+                env_contact_actor_env_indices = []
                 for contact_id in range(self.max_contacts_per_frame):
                     contact_sphere = self.gym.create_sphere(self.sim, 0.008, scene_asset_options)  # 稍大一点便于观察
                     # 初始位置设在远处（地下），后续更新时会移到正确位置
@@ -316,11 +317,17 @@ class Mano2Dexhand:
                         env, contact_sphere, init_transform, 
                         f"contact_point_{contact_id}", self.num_envs + 2, 0b1
                     )
+                    # 记录在当前环境内的 actor 序号（用于 tensor API 写入）
+                    env_idx_local = self.gym.find_actor_index(env, contact_actor, gymapi.DOMAIN_ENV)
+                    env_contact_actor_env_indices.append(env_idx_local)
                     # 使用醒目的红色标记接触点
                     contact_color = gymapi.Vec3(1.0, 0.0, 0.0)  # 红色
                     self.gym.set_rigid_body_color(env, contact_actor, 0, gymapi.MESH_VISUAL, contact_color)
                     env_contact_actors.append(contact_actor)
                 self.contact_sphere_actors.append(env_contact_actors)
+                if not hasattr(self, "contact_actor_env_indices"):
+                    self.contact_actor_env_indices = []
+                self.contact_actor_env_indices.append(env_contact_actor_env_indices)
 
         env_ptr = self.envs[0]
         dexhand_handle = 0
@@ -410,24 +417,37 @@ class Mano2Dexhand:
                 
                 # 获取接触点的世界坐标
                 contact_pos = contact['object_contact_pos']  # numpy array [3]
-                contact_actor = self.contact_sphere_actors[env_idx][contact_idx]
+                actor_env_idx = self.contact_actor_env_indices[env_idx][contact_idx]
                 
-                # 创建变换并设置位置
-                transform = gymapi.Transform()
-                transform.p = gymapi.Vec3(float(contact_pos[0]), float(contact_pos[1]), float(contact_pos[2]))
-                transform.r = gymapi.Quat(0, 0, 0, 1)
-                
-                self.gym.set_rigid_transform(env, contact_actor, 0, transform)
+                # 直接写入 root_state tensor（GPU pipeline 安全）
+                self._root_state[env_idx, actor_env_idx, 0:3] = torch.tensor(
+                    [contact_pos[0], contact_pos[1], contact_pos[2]],
+                    device=self._root_state.device,
+                    dtype=self._root_state.dtype,
+                )
+                self._root_state[env_idx, actor_env_idx, 3:7] = torch.tensor(
+                    [0.0, 0.0, 0.0, 1.0],
+                    device=self._root_state.device,
+                    dtype=self._root_state.dtype,
+                )
+                self._root_state[env_idx, actor_env_idx, 7:] = 0
                 
                 contact_idx += 1
             
             # 将未使用的 sphere 移到远处（不可见）
             for unused_idx in range(contact_idx, self.max_contacts_per_frame):
-                contact_actor = self.contact_sphere_actors[env_idx][unused_idx]
-                transform = gymapi.Transform()
-                transform.p = gymapi.Vec3(100, 100, -100)  # 移到地下远处
-                transform.r = gymapi.Quat(0, 0, 0, 1)
-                self.gym.set_rigid_transform(env, contact_actor, 0, transform)
+                actor_env_idx = self.contact_actor_env_indices[env_idx][unused_idx]
+                self._root_state[env_idx, actor_env_idx, 0:3] = torch.tensor(
+                    [100.0, 100.0, -100.0],
+                    device=self._root_state.device,
+                    dtype=self._root_state.dtype,
+                )
+                self._root_state[env_idx, actor_env_idx, 3:7] = torch.tensor(
+                    [0.0, 0.0, 0.0, 1.0],
+                    device=self._root_state.device,
+                    dtype=self._root_state.dtype,
+                )
+                self._root_state[env_idx, actor_env_idx, 7:] = 0
     
     def fitting(self, max_iter, target_wrist_pos, target_wrist_rot, target_mano_joints):
         assert target_mano_joints.shape[0] == self.num_envs
