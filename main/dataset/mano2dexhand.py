@@ -62,17 +62,19 @@ def soft_clamp(x, lower, upper):
 
 
 class Mano2Dexhand:
-    def __init__(self, args, dexhand, scene_objects, dataset_type="oakink2"):
+    def __init__(self, args, dexhand, scene_objects, dataset_type="oakink2", contact_data=None):
         """
         args: 参数
         dexhand: 机器人手模型
         scene_objects: 包含所有物体信息的列表
         dataset_type: 数据集类型，用于判断坐标转换逻辑
+        contact_data: 可选的接触数据字典（从 compute_hand_object_contacts.py 生成的 pkl 文件加载）
         """
         self.gym = gymapi.acquire_gym()
         self.sim_params = gymapi.SimParams()
         self.dexhand = dexhand
-        self.scene_objects = scene_objects 
+        self.scene_objects = scene_objects
+        self.contact_data = contact_data 
 
         self.sim_params.up_axis = gymapi.UP_AXIS_Z
         self.sim_params.gravity = gymapi.Vec3(0.0, 0.0, -9.81)
@@ -201,6 +203,18 @@ class Mano2Dexhand:
         env_lower = gymapi.Vec3(-spacing, -spacing, 0.0)
         env_upper = gymapi.Vec3(spacing, spacing, spacing)
 
+        # === 预计算接触点数量（用于创建 spheres） ===
+        if self.contact_data is not None:
+            max_contacts = 0
+            for frame in self.contact_data['frames']:
+                total_frame_contacts = sum(obj['num_contacts'] for obj in frame['objects'])
+                max_contacts = max(max_contacts, total_frame_contacts)
+            self.max_contacts_per_frame = max(max_contacts, 1)  # 至少创建1个以避免空列表
+            self.contact_sphere_actors = []
+            cprint(f"[CONTACT VIS] Will create {self.max_contacts_per_frame} contact point spheres per environment", "cyan")
+        else:
+            self.max_contacts_per_frame = 0
+
         # === 加载所有场景物体的 Assets ===
         self.obj_assets = []
         for obj_info in self.scene_objects:
@@ -285,6 +299,25 @@ class Mano2Dexhand:
                 else:
                     c = gymapi.Vec3(100 / 255, 150 / 255, 200 / 255)
                 self.gym.set_rigid_body_color(env, a, 0, gymapi.MESH_VISUAL, c)
+            
+            # === 接触点可视化 Spheres（为当前环境创建） ===
+            if self.contact_data is not None and self.max_contacts_per_frame > 0:
+                env_contact_actors = []
+                for contact_id in range(self.max_contacts_per_frame):
+                    contact_sphere = self.gym.create_sphere(self.sim, 0.008, scene_asset_options)  # 稍大一点便于观察
+                    # 初始位置设在远处（地下），后续更新时会移到正确位置
+                    init_transform = gymapi.Transform()
+                    init_transform.p = gymapi.Vec3(100, 100, -100)
+                    init_transform.r = gymapi.Quat(0, 0, 0, 1)
+                    contact_actor = self.gym.create_actor(
+                        env, contact_sphere, init_transform, 
+                        f"contact_point_{contact_id}", self.num_envs + 2, 0b1
+                    )
+                    # 使用醒目的红色标记接触点
+                    contact_color = gymapi.Vec3(1.0, 0.0, 0.0)  # 红色
+                    self.gym.set_rigid_body_color(env, contact_actor, 0, gymapi.MESH_VISUAL, contact_color)
+                    env_contact_actors.append(contact_actor)
+                self.contact_sphere_actors.append(env_contact_actors)
 
         env_ptr = self.envs[0]
         dexhand_handle = 0
@@ -344,6 +377,50 @@ class Mano2Dexhand:
             ),
         )
 
+    def _update_contact_spheres(self):
+        """更新所有环境中的接触点sphere位置
+        
+        注意：接触点spheres作为独立actors，需要通过gym API直接设置位置
+        """
+        if self.contact_data is None or not hasattr(self, 'contact_sphere_actors'):
+            return
+        
+        # 遍历每个环境（每个环境对应一帧）
+        for env_idx in range(self.num_envs):
+            if env_idx >= len(self.contact_data['frames']):
+                continue
+                
+            frame_data = self.contact_data['frames'][env_idx]
+            contact_idx = 0
+            env = self.envs[env_idx]
+            
+            # 收集该帧所有物体的所有接触点
+            for obj_data in frame_data['objects']:
+                for contact in obj_data['contacts']:
+                    if contact_idx >= self.max_contacts_per_frame:
+                        break
+                    
+                    # 获取接触点的世界坐标
+                    contact_pos = contact['object_contact_pos']  # numpy array [3]
+                    contact_actor = self.contact_sphere_actors[env_idx][contact_idx]
+                    
+                    # 创建变换并设置位置
+                    transform = gymapi.Transform()
+                    transform.p = gymapi.Vec3(float(contact_pos[0]), float(contact_pos[1]), float(contact_pos[2]))
+                    transform.r = gymapi.Quat(0, 0, 0, 1)
+                    
+                    self.gym.set_rigid_transform(env, contact_actor, 0, transform)
+                    
+                    contact_idx += 1
+            
+            # 将未使用的 sphere 移到远处（不可见）
+            for unused_idx in range(contact_idx, self.max_contacts_per_frame):
+                contact_actor = self.contact_sphere_actors[env_idx][unused_idx]
+                transform = gymapi.Transform()
+                transform.p = gymapi.Vec3(100, 100, -100)  # 移到地下远处
+                transform.r = gymapi.Quat(0, 0, 0, 1)
+                self.gym.set_rigid_transform(env, contact_actor, 0, transform)
+    
     def fitting(self, max_iter, target_wrist_pos, target_wrist_rot, target_mano_joints):
         assert target_mano_joints.shape[0] == self.num_envs
         
@@ -437,11 +514,15 @@ class Mano2Dexhand:
 
         iter = 0
         past_loss = 1e10
+        current_frame = 0  # 跟踪当前帧索引（用于接触点可视化）
+        
         while (self.headless and iter < max_iter) or (
             not self.headless and not self.gym.query_viewer_has_closed(self.viewer)
         ):
             iter += 1
-
+            # 更新当前帧索引（每个环境对应一帧）
+            # 因为 num_envs == num_frames，环境 i 对应帧 i
+            
             opt_wrist_quat = rot6d_to_quat(opt_wrist_rot)[:, [1, 2, 3, 0]]
             
             self._root_state[:, 0, :3] = opt_wrist_pos.detach()
@@ -460,6 +541,10 @@ class Mano2Dexhand:
 
             opt_dof_pos_clamped = torch.clamp(opt_dof_pos, self.dexhand_dof_lower_limits, self.dexhand_dof_upper_limits)
 
+            # === 更新接触点位置 ===
+            if self.contact_data is not None:
+                self._update_contact_spheres()
+            
             self.gym.set_dof_position_target_tensor(self.sim, gymtorch.unwrap_tensor(opt_dof_pos_clamped))
             self.gym.set_actor_root_state_tensor(self.sim, gymtorch.unwrap_tensor(self._root_state))
 
@@ -541,6 +626,12 @@ if __name__ == "__main__":
                 "type": str,
                 "default": "right",
             },
+            {
+                "name": "--contact_data",
+                "type": str,
+                "default": None,
+                "help": "Path to contact data pkl file (optional, for visualization)",
+            },
         ],
     )
 
@@ -562,8 +653,16 @@ if __name__ == "__main__":
         parser.num_envs = demo_data["mano_joints"].shape[0]
         scene_objects = demo_data["scene_objects"]
 
-        # === [修改] 传入 dataset_type ===
-        mano2inspire = Mano2Dexhand(parser, dexhand, scene_objects, dataset_type=dataset_type)
+        # === 加载接触数据（如果提供） ===
+        contact_data = None
+        if parser.contact_data is not None and os.path.exists(parser.contact_data):
+            cprint(f"[CONTACT VIS] Loading contact data from: {parser.contact_data}", "cyan")
+            with open(parser.contact_data, 'rb') as f:
+                contact_data = pickle.load(f)
+            cprint(f"[CONTACT VIS] Loaded {contact_data['num_frames']} frames with contact data", "green")
+        
+        # === [修改] 传入 dataset_type 和 contact_data ===
+        mano2inspire = Mano2Dexhand(parser, dexhand, scene_objects, dataset_type=dataset_type, contact_data=contact_data)
         # ==============================
 
         to_dump = mano2inspire.fitting(
