@@ -206,9 +206,12 @@ class Mano2Dexhand:
         # === 预计算接触点数量（用于创建 spheres） ===
         if self.contact_data is not None:
             max_contacts = 0
+            # 仅考虑“每帧 num_contacts 最大的那个物体”的接触点数（已经是点对数）
             for frame in self.contact_data['frames']:
-                total_frame_contacts = sum(obj['num_contacts'] for obj in frame['objects'])
-                max_contacts = max(max_contacts, total_frame_contacts)
+                if len(frame['objects']) == 0:
+                    continue
+                frame_max_contacts = max(obj.get('num_contacts', 0) for obj in frame['objects'])
+                max_contacts = max(max_contacts, frame_max_contacts)
             self.max_contacts_per_frame = max(max_contacts, 1)  # 至少创建1个以避免空列表
             self.contact_sphere_actors = []
             cprint(f"[CONTACT VIS] Will create {self.max_contacts_per_frame} contact point spheres per environment", "cyan")
@@ -394,24 +397,29 @@ class Mano2Dexhand:
             contact_idx = 0
             env = self.envs[env_idx]
             
-            # 收集该帧所有物体的所有接触点
-            for obj_data in frame_data['objects']:
-                for contact in obj_data['contacts']:
-                    if contact_idx >= self.max_contacts_per_frame:
-                        break
-                    
-                    # 获取接触点的世界坐标
-                    contact_pos = contact['object_contact_pos']  # numpy array [3]
-                    contact_actor = self.contact_sphere_actors[env_idx][contact_idx]
-                    
-                    # 创建变换并设置位置
-                    transform = gymapi.Transform()
-                    transform.p = gymapi.Vec3(float(contact_pos[0]), float(contact_pos[1]), float(contact_pos[2]))
-                    transform.r = gymapi.Quat(0, 0, 0, 1)
-                    
-                    self.gym.set_rigid_transform(env, contact_actor, 0, transform)
-                    
-                    contact_idx += 1
+            # 只可视化 num_contacts 最大的那个物体
+            if len(frame_data['objects']) > 0:
+                best_obj = max(frame_data['objects'], key=lambda o: o.get('num_contacts', 0))
+                contacts_iter = best_obj.get('contacts', [])
+            else:
+                contacts_iter = []
+            
+            for contact in contacts_iter:
+                if contact_idx >= self.max_contacts_per_frame:
+                    break
+                
+                # 获取接触点的世界坐标
+                contact_pos = contact['object_contact_pos']  # numpy array [3]
+                contact_actor = self.contact_sphere_actors[env_idx][contact_idx]
+                
+                # 创建变换并设置位置
+                transform = gymapi.Transform()
+                transform.p = gymapi.Vec3(float(contact_pos[0]), float(contact_pos[1]), float(contact_pos[2]))
+                transform.r = gymapi.Quat(0, 0, 0, 1)
+                
+                self.gym.set_rigid_transform(env, contact_actor, 0, transform)
+                
+                contact_idx += 1
             
             # 将未使用的 sphere 移到远处（不可见）
             for unused_idx in range(contact_idx, self.max_contacts_per_frame):

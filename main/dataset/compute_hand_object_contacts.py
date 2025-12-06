@@ -130,7 +130,7 @@ def load_object_point_clouds(scene_objects, num_points=1024, device="cpu"):
 
 def compute_hand_object_contacts(hand_points, object_points_world, threshold=0.005):
     """
-    计算手部点与物体点云的接触
+    计算手部点与物体点云的接触（保留所有在阈值内的手-物体点对）
     
     Args:
         hand_points: [num_hand_points, 3] 手部关节点位置（世界坐标系）
@@ -140,29 +140,45 @@ def compute_hand_object_contacts(hand_points, object_points_world, threshold=0.0
     Returns:
         contacts: Dict，包含接触信息
             - has_contact: bool, 是否有接触
-            - contact_hand_indices: List[int], 发生接触的手部点索引
-            - contact_object_points: List[torch.Tensor], 对应的物体接触点位置
-            - contact_distances: List[float], 接触距离
+            - contact_hand_indices: List[int], 发生接触的手部点索引（去重）
+            - contact_object_indices: List[int], 发生接触的物体点索引（逐对记录）
+            - contact_hand_points: List[np.ndarray], 手部接触点坐标
+            - contact_object_points: List[np.ndarray], 物体接触点坐标
+            - contact_distances: List[float], 每个接触点对的距离
+            - num_pairs: int, 手-物体点对数量
     """
-    # 计算每个手部点到所有物体点的距离
-    # hand_points: [num_hand_points, 3]
-    # object_points_world: [num_object_points, 3]
-    # distances: [num_hand_points, num_object_points]
-    distances = torch.cdist(hand_points, object_points_world)  # [num_hand_points, num_obj_points]
+    # 计算每个手部点到所有物体点的距离 [num_hand_points, num_object_points]
+    distances = torch.cdist(hand_points, object_points_world)
     
-    # 找到每个手部点的最近物体点
-    min_distances, min_indices = torch.min(distances, dim=1)  # [num_hand_points]
+    # 找出所有小于阈值的手-物体点对
+    contact_pairs = torch.nonzero(distances < threshold, as_tuple=False)  # [num_pairs, 2] -> (hand_idx, obj_idx)
     
-    # 找出距离小于阈值的接触
-    contact_mask = min_distances < threshold
-    contact_hand_indices = torch.where(contact_mask)[0].cpu().tolist()
+    if contact_pairs.numel() == 0:
+        return {
+            'has_contact': False,
+            'contact_hand_indices': [],
+            'contact_object_indices': [],
+            'contact_hand_points': [],
+            'contact_object_points': [],
+            'contact_distances': [],
+            'num_pairs': 0,
+        }
+    
+    hand_indices = contact_pairs[:, 0]
+    obj_indices = contact_pairs[:, 1]
+    distances_vals = distances[hand_indices, obj_indices]
     
     contacts = {
-        'has_contact': len(contact_hand_indices) > 0,
-        'contact_hand_indices': contact_hand_indices,
-        'contact_object_points': [object_points_world[min_indices[i]].cpu().numpy() for i in contact_hand_indices],
-        'contact_distances': [min_distances[i].item() for i in contact_hand_indices],
-        'contact_hand_points': [hand_points[i].cpu().numpy() for i in contact_hand_indices],
+        'has_contact': True,
+        # 去重后的手点集合（便于统计）
+        'contact_hand_indices': torch.unique(hand_indices).cpu().tolist(),
+        # 逐对记录（与 num_pairs 对齐）
+        'contact_hand_indices_pairs': hand_indices.cpu().tolist(),
+        'contact_object_indices_pairs': obj_indices.cpu().tolist(),
+        'contact_hand_points': hand_points[hand_indices].cpu().numpy().tolist(),
+        'contact_object_points': object_points_world[obj_indices].cpu().numpy().tolist(),
+        'contact_distances': distances_vals.cpu().tolist(),
+        'num_pairs': contact_pairs.shape[0],
     }
     
     return contacts
@@ -307,16 +323,19 @@ def analyze_motion_contacts(data_idx, dexhand, side="right", device="cuda:0", co
                 'object_idx': obj_idx,
                 'object_name': results['object_names'][obj_idx],
                 'has_contact': contacts['has_contact'],
-                'num_contacts': len(contacts['contact_hand_indices']),
+                'num_contacts': contacts['num_pairs'],
                 'contacts': []
             }
             
-            # 记录每个接触点的详细信息
-            for i, hand_idx in enumerate(contacts['contact_hand_indices']):
+            # 记录每个接触点对的详细信息（逐对存储）
+            for i in range(contacts['num_pairs']):
+                hand_idx = contacts['contact_hand_indices_pairs'][i]
+                obj_pt_idx = contacts['contact_object_indices_pairs'][i]
                 contact_info = {
                     'hand_point_idx': hand_idx,
                     'hand_point_name': results['hand_point_names'][hand_idx],
                     'hand_point_pos': contacts['contact_hand_points'][i],
+                    'object_point_idx': obj_pt_idx,
                     'object_contact_pos': contacts['contact_object_points'][i],
                     'distance': contacts['contact_distances'][i]
                 }
@@ -368,7 +387,9 @@ def print_contact_summary(results):
     for frame in results['frames']:
         for obj_data in frame['objects']:
             for contact in obj_data['contacts']:
-                hand_contact_counts[contact['hand_point_idx']] += 1
+                hand_idx = contact['hand_point_idx']
+                if hand_idx is not None and hand_idx in hand_contact_counts:
+                    hand_contact_counts[hand_idx] += 1
     
     cprint("\nMost frequently contacting hand points:", "yellow", attrs=['bold'])
     sorted_counts = sorted(hand_contact_counts.items(), key=lambda x: x[1], reverse=True)
