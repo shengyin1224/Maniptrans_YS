@@ -179,8 +179,9 @@ runs_crossexp/*
 dumps
 dumps/*
 
+data/contacts*
+data/humoto
 
-data/
 dumps*
 dumps*/*
 top_rollouts*
