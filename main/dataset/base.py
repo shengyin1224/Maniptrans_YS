@@ -303,4 +303,5 @@ class ManipData(Dataset, ABC):
             # ? only used for ablation study
             # data["opt_joints_pos"] = data["opt_joints_pos"][: self.max_seq_len]
             # data["opt_joints_velocity"] = data["opt_joints_velocity"][: self.max_seq_len]
+
         assert len(data["opt_wrist_pos"]) == len(data["obj_trajectory"])

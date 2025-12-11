@@ -26,8 +26,8 @@ python main/dataset/compute_hand_object_contacts.py \
     --data_idx "baking_with_spatula_mixing_bowl_and_scooping_to_tray-244" \
     --dexhand "inspire" \
     --side "right" \
-    --threshold 0.005 \
-    --output_dir "data/contacts"
+    --threshold 0.007 \
+    --output_dir "data/contacts_right"
 ```
 
 参数说明：

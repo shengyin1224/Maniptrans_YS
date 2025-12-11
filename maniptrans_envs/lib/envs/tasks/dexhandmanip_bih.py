@@ -111,7 +111,7 @@ class DexHandManipBiHEnv(VecTask):
         if self.tighten_method == "adaptive":
             # 配置参数（所有窗口大小都是基于epoch，而非episode）
             self.adaptive_success_window = self.cfg["env"].get("adaptiveSuccessWindow", 5)  # 连续N个epoch检查成功率
-            self.adaptive_success_threshold = self.cfg["env"].get("adaptiveSuccessThreshold", 0.20)  # 成功率阈值（20%）
+            self.adaptive_success_threshold = self.cfg["env"].get("adaptiveSuccessThreshold", 0.10)  # 成功率阈值（20%）
             self.adaptive_step_window = self.cfg["env"].get("adaptiveStepWindow", 5)  # 连续N个epoch检查平均step
             self.adaptive_step_threshold = self.cfg["env"].get("adaptiveStepThreshold", 20)  # 平均step阈值
             self.adaptive_no_improvement_window = self.cfg["env"].get("adaptiveNoImprovementWindow", 10)  # 连续N个epoch没有提升就降低难度
@@ -2454,24 +2454,24 @@ class DexHandManipBiHEnv(VecTask):
                                   f"(success rate {avg_success_rate*100:.1f}% >= {self.adaptive_success_threshold*100:.1f}% for {len(recent_success_rates)} epochs)")
                 
                 # 检查2：连续M个epoch平均step是否低于阈值 -> 降低难度
-                if len(self.adaptive_epoch_steps_history) >= self.adaptive_step_window:
-                    recent_steps = list(self.adaptive_epoch_steps_history)
-                    avg_recent_steps = sum(recent_steps) / len(recent_steps)
+                # if len(self.adaptive_epoch_steps_history) >= self.adaptive_step_window:
+                #     recent_steps = list(self.adaptive_epoch_steps_history)
+                #     avg_recent_steps = sum(recent_steps) / len(recent_steps)
                     
-                    if avg_recent_steps < self.adaptive_step_threshold:
-                        # 降低难度：提升scale_factor（提高阈值，更宽松）
-                        new_scale = min(
-                            self.adaptive_scale_factor_max,
-                            self.adaptive_global_scale_factor + self.adaptive_scale_step
-                        )
-                        if new_scale > self.adaptive_global_scale_factor:
-                            self.adaptive_global_scale_factor = new_scale
-                            scale_changed = True
-                            # 重新开始计时：降低难度后，从当前epoch开始重新计时
-                            self.adaptive_last_difficulty_increase_epoch = self.adaptive_current_epoch
-                            print(f"[ADAPTIVE] Epoch {self.adaptive_current_epoch}: Decreasing difficulty: "
-                                  f"scale_factor {old_scale:.4f} -> {new_scale:.4f} "
-                                  f"(avg steps too low: {avg_recent_steps:.2f} < {self.adaptive_step_threshold})")
+                #     if avg_recent_steps < self.adaptive_step_threshold:
+                #         # 降低难度：提升scale_factor（提高阈值，更宽松）
+                #         new_scale = min(
+                #             self.adaptive_scale_factor_max,
+                #             self.adaptive_global_scale_factor + self.adaptive_scale_step
+                #         )
+                #         if new_scale > self.adaptive_global_scale_factor:
+                #             self.adaptive_global_scale_factor = new_scale
+                #             scale_changed = True
+                #             # 重新开始计时：降低难度后，从当前epoch开始重新计时
+                #             self.adaptive_last_difficulty_increase_epoch = self.adaptive_current_epoch
+                #             print(f"[ADAPTIVE] Epoch {self.adaptive_current_epoch}: Decreasing difficulty: "
+                #                   f"scale_factor {old_scale:.4f} -> {new_scale:.4f} "
+                #                   f"(avg steps too low: {avg_recent_steps:.2f} < {self.adaptive_step_threshold})")
                 
                 # 检查3：连续N个epoch没有提升难度 -> 降低难度
                 if not scale_changed:
@@ -3043,15 +3043,20 @@ def compute_imitation_reward(
     target_obj_ang_vel = ensure_multi_object(target_states["manip_obj_ang_vel"], num_envs, 3)
 
     num_objs = current_obj_pos.shape[1]
+    obj_is_static = obj_is_static.to(torch.bool)  # [N, K]
+    dynamic_mask = ~obj_is_static
+    dynamic_count = dynamic_mask.sum(dim=-1).clamp_min(1)  # 避免除0
     
     # 处理多物体维度 [N, K, 3]
     diff_obj_pos = target_obj_pos - current_obj_pos
     diff_obj_pos_dist = torch.norm(diff_obj_pos, dim=-1)
+    # 屏蔽静态物体，避免静态占位的 NaN/无效值污染奖励
+    diff_obj_pos_dist = torch.where(dynamic_mask, diff_obj_pos_dist, torch.zeros_like(diff_obj_pos_dist))
     
     # 如果是多物体 [N, K]，我们对每个物体计算 Reward 然后 Sum
     reward_obj_pos = torch.exp(-80 * diff_obj_pos_dist)
     if reward_obj_pos.dim() > 1:
-        reward_obj_pos = reward_obj_pos.sum(dim=-1)
+        reward_obj_pos = (reward_obj_pos * dynamic_mask).sum(dim=-1) / dynamic_count
 
     # Rotation
     # Flatten to [N*K, 4] for quat functions
@@ -3060,24 +3065,27 @@ def compute_imitation_reward(
     
     diff_obj_rot = quat_mul(flat_targ, quat_conjugate(flat_curr))
     diff_obj_rot_angle = quat_to_angle_axis(diff_obj_rot)[0].view(num_envs, num_objs)
+    diff_obj_rot_angle = torch.where(dynamic_mask, diff_obj_rot_angle, torch.zeros_like(diff_obj_rot_angle))
     
     reward_obj_rot = torch.exp(-3 * (diff_obj_rot_angle).abs())
     if reward_obj_rot.dim() > 1:
-        reward_obj_rot = reward_obj_rot.sum(dim=-1)
+        reward_obj_rot = (reward_obj_rot * dynamic_mask).sum(dim=-1) / dynamic_count
     
     diff_obj_vel = target_obj_vel - current_obj_vel
+    diff_obj_vel = torch.where(dynamic_mask.unsqueeze(-1), diff_obj_vel, torch.zeros_like(diff_obj_vel))
     # [N, K, 3] -> norm -> [N, K] -> mean over D
     # diff_obj_vel.abs().mean(dim=-1) 是原代码逻辑 (L1 Norm per dim)
     reward_obj_vel = torch.exp(-1 * diff_obj_vel.abs().mean(dim=-1))
     if reward_obj_vel.dim() > 1:
-        reward_obj_vel = reward_obj_vel.sum(dim=-1)
+        reward_obj_vel = (reward_obj_vel * dynamic_mask).sum(dim=-1) / dynamic_count
 
     current_obj_ang_vel = states["manip_obj_ang_vel"]
     target_obj_ang_vel = target_states["manip_obj_ang_vel"]
     diff_obj_ang_vel = target_obj_ang_vel - current_obj_ang_vel
+    diff_obj_ang_vel = torch.where(dynamic_mask.unsqueeze(-1), diff_obj_ang_vel, torch.zeros_like(diff_obj_ang_vel))
     reward_obj_ang_vel = torch.exp(-1 * diff_obj_ang_vel.abs().mean(dim=-1))
     if reward_obj_ang_vel.dim() > 1:
-        reward_obj_ang_vel = reward_obj_ang_vel.sum(dim=-1)
+        reward_obj_ang_vel = (reward_obj_ang_vel * dynamic_mask).sum(dim=-1) / dynamic_count
 
 
     reward_power = torch.exp(-10 * target_states["power"])
@@ -3091,7 +3099,9 @@ def compute_imitation_reward(
     )
     finger_tip_force_masked = finger_tip_force * finger_tip_weight[:, :, None]
 
-    reward_finger_tip_force = torch.exp(-1 * (1 / (torch.norm(finger_tip_force_masked, dim=-1).sum(-1) + 1e-5)))
+    # 更平滑的指尖力奖励，随力线性增长并tanh压缩
+    force_sum = torch.norm(finger_tip_force_masked, dim=-1).sum(-1)
+    reward_finger_tip_force = torch.tanh(0.5 * force_sum)
 
     # obj_vel shape: [N, K, 3] -> norm -> [N, K]
     # We need to check if ANY object exceeds limit -> [N]
@@ -3194,8 +3204,8 @@ def compute_imitation_reward(
         & (running_progress_buf >= 8)
     ) | error_buf
     reward_execute = (
-        0.6 * reward_eef_pos  # 从0.1增加到0.3，提高wrist位置跟踪的权重
-        + 0.5 * reward_eef_rot
+        1 * reward_eef_pos  # 从0.1增加到0.3，提高wrist位置跟踪的权重
+        + 1 * reward_eef_rot
         + 0.9 * reward_thumb_tip_pos
         + 0.8 * reward_index_tip_pos
         + 0.75 * reward_middle_tip_pos
@@ -3210,7 +3220,7 @@ def compute_imitation_reward(
         + 0.1 * reward_joints_vel
         + 0.1 * reward_obj_vel
         + 0.1 * reward_obj_ang_vel
-        + 20.0 * reward_finger_tip_force
+        + 30.0 * reward_finger_tip_force
         + 0.05 * reward_power
         + 0.05 * reward_wrist_power
     )

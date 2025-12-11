@@ -78,14 +78,10 @@ class Mano2Dexhand:
         self.dexhand = dexhand
         self.scene_objects = scene_objects
         self.contact_data = contact_data 
-        # 可选的接触奖励项配置
-        self.enable_contact_reward = bool(getattr(args, "enable_contact_reward", 0))
-        self.contact_reward_scale = float(getattr(args, "contact_reward_scale", 0.1))
-        self.contact_reward_match_scale = float(getattr(args, "contact_reward_match_scale", 0.2))
-        self.contact_reward_sigma = float(getattr(args, "contact_reward_sigma", 0.01))
         self.draw_all_lines = getattr(args, "draw_all_lines", 0) == 1
         self._object_points_local_cache = None
 
+        import pdb; pdb.set_trace()
         # 记录手部关节在 target_mano_joints 中的顺序，便于后续取特定关节
         self.hand_joint_order = [
             self.dexhand.to_hand(j)[0] for j in self.dexhand.body_names if self.dexhand.to_hand(j)[0] != "wrist"
@@ -223,8 +219,6 @@ class Mano2Dexhand:
         env_lower = gymapi.Vec3(-spacing, -spacing, 0.0)
         env_upper = gymapi.Vec3(spacing, spacing, spacing)
 
-        # 预处理接触点，用于奖励与可视化
-        self._contact_reward_frames = None
         # === 预计算接触点数量（用于创建 spheres） ===
         if self.contact_data is not None:
             max_contacts = 0
@@ -252,20 +246,6 @@ class Mano2Dexhand:
                 else:
                     frame_max = max(obj.get('num_contacts', 0) for obj in frame['objects'])
                 print(f"  Frame {fi}: {frame_max}")
-            # 仅在启用接触奖励时预处理接触点（避免每步重复构造 tensor）
-            if self.enable_contact_reward:
-                self._contact_reward_frames = []
-                for frame in self.contact_data["frames"]:
-                    frame_contacts = []
-                    for obj in frame["objects"]:
-                        for contact in obj.get("contacts", []):
-                            frame_contacts.append(
-                                {
-                                    "pos": torch.tensor(contact["object_contact_pos"], device=self.sim_device, dtype=torch.float32),
-                                    "hand_idx": contact.get("hand_point_idx", None),
-                                }
-                            )
-                    self._contact_reward_frames.append(frame_contacts)
         else:
             self.max_contacts_per_frame = 0
 
@@ -311,23 +291,14 @@ class Mano2Dexhand:
             self.envs.append(env)
             
             # Create DexHand
-            # collision_filter 说明：
-            # - 两个物体碰撞的条件：它们的 collision_filter 按位与结果不为 0
-            # - self.dexhand.self_collision 控制手部内部自碰撞：
-            #   * True: 使用 collision_filter=1，允许手部内部碰撞，同时也能与物体碰撞（物体也用1）
-            #   * False: 使用 collision_filter=1，禁止手部内部碰撞，但仍能与物体碰撞（物体也用1）
-            # 注意：collision_filter=0 会导致无法与任何 collision_filter=0 的物体碰撞
-            dexhand_collision_filter = 1  # 使用1而不是0，确保能与物体碰撞
             dexhand_actor = self.gym.create_actor(
                 env,
                 dexhand_asset,
                 self.dexhand_default_pose,
                 "dexhand",
                 i,
-                dexhand_collision_filter,
+                (1 if self.dexhand.self_collision else 0),
             )
-
-            import pdb; pdb.set_trace()
 
             self.gym.set_actor_dof_states(env, dexhand_actor, self.dexhand_default_dof_pos, gymapi.STATE_ALL)
             self.gym.set_actor_dof_properties(env, dexhand_actor, dexhand_dof_props)
@@ -336,11 +307,8 @@ class Mano2Dexhand:
             env_obj_handles = []
             for k, asset in enumerate(self.obj_assets):
                 obj_name = self.scene_objects[k]['name']
-                # collision_filter 说明：
-                # - 静态物体：使用 0xFFFF（全1）忽略所有碰撞
-                # - 非静态物体：使用 1，与手的 collision_filter=1 按位与结果为 1，会发生碰撞
-                # 注意：collision_filter=0 会导致无法与任何 collision_filter=0 的物体碰撞
-                collision_filter = 0xFFFF if (k < len(self.static_object_mask) and self.static_object_mask[k]) else 1
+                # 静态物体关闭碰撞（collision_filter 设为全 1）
+                collision_filter = 0xFFFF if (k < len(self.static_object_mask) and self.static_object_mask[k]) else 0
                 handle = self.gym.create_actor(
                     env, asset, gymapi.Transform(), f"{obj_name}_{i}", i, collision_filter
                 )
@@ -655,6 +623,8 @@ class Mano2Dexhand:
         target_mano_joints = (self.mujoco2gym_transf[:3, :3] @ target_mano_joints.T).T + self.mujoco2gym_transf[:3, 3]
         target_mano_joints = target_mano_joints.view(self.num_envs, -1, 3)
 
+        import pdb; pdb.set_trace()
+
         # 处理多物体轨迹，并计算 Offset
         processed_trajs = []
         for obj_info in self.scene_objects:
@@ -672,78 +642,28 @@ class Mano2Dexhand:
             print(f"  Object {k} ({obj_name}): pos=({obj_pos[0]:.4f}, {obj_pos[1]:.4f}, {obj_pos[2]:.4f})")
         print()
 
-        # === [新方案] 基于手掌朝向 + 接触锚点的初始位姿 ===
-        # 步骤1: 计算锚点 - 使用所有接触点的几何中心
-        anchor_points = []
-        palm_valid = torch.ones(self.num_envs, device=self.sim_device, dtype=torch.bool)
-
-        if self.contact_data is not None:
-            cprint("[PALM_DIR] Using contact-based anchor calculation", "cyan")
-            for env_idx in range(self.num_envs):
-                if env_idx >= len(self.contact_data["frames"]):
-                    anchor_points.append(target_wrist_pos[env_idx])
-                    continue
-
-                frame_data = self.contact_data["frames"][env_idx]
-                all_contacts = []
-                for obj in frame_data["objects"]:
-                    for contact in obj.get("contacts", []):
-                        all_contacts.append(contact["object_contact_pos"])
-
-                if len(all_contacts) > 0:
-                    anchor = np.mean(all_contacts, axis=0)
-                    anchor_points.append(torch.tensor(anchor, device=self.sim_device, dtype=torch.float32))
-                    cprint(
-                        f"[PALM_DIR] Frame {env_idx}: {len(all_contacts)} contacts, anchor=({anchor[0]:.4f}, {anchor[1]:.4f}, {anchor[2]:.4f})",
-                        "yellow",
-                    )
-                else:
-                    anchor_points.append(target_wrist_pos[env_idx])
-                    cprint(f"[PALM_DIR] Frame {env_idx}: No contacts, using wrist pos", "yellow")
+        # 计算 Offset：用“中指中间关节 -> 最近物体点”方向（再取反）来退让
+        idx_middle_mid = self._hand_joint_indices.get("middle_intermediate", None)
+        if idx_middle_mid is not None:
+            palm_pos = target_mano_joints[:, idx_middle_mid]  # 中指中间关节
         else:
-            cprint("[PALM_DIR] No contact data, using wrist positions as anchors", "yellow")
-            for env_idx in range(self.num_envs):
-                anchor_points.append(target_wrist_pos[env_idx])
+            # 兜底：仍用手心估计
+            palm_pos = (target_mano_joints[:, 3] + target_wrist_pos) / 2
+        palm_dir, palm_valid, closest_points = self._compute_palm_direction_from_objects(
+            palm_pos, processed_trajs, num_points=1024
+        )
 
-        P_anchor = torch.stack(anchor_points)  # [N, 3]
+        import pdb; pdb.set_trace()
 
-        # 步骤2: 计算手掌法线 (朝向手心)
-        idx_index_prox = self._hand_joint_indices.get("index_proximal", None)
-        idx_pinky_prox = self._hand_joint_indices.get("pinky_proximal", None)
+        # 如果点云不可用或全部无效，退回旧的关节法线方案
+        if palm_dir is None or palm_dir.numel() == 0 or not palm_valid.any():
+            palm_dir, palm_valid = self._compute_palm_direction(target_wrist_pos, target_mano_joints)
+            closest_points = torch.zeros_like(palm_pos)
 
-        if idx_index_prox is None or idx_pinky_prox is None:
-            cprint("[PALM_DIR] Cannot find index/pinky proximal joints, using default offset", "red")
-            palm_dir = torch.zeros_like(target_wrist_pos)
-            palm_dir[:, 2] = 1.0  # 默认指向手心（+Z）
-            palm_valid = torch.zeros(self.num_envs, device=self.sim_device, dtype=torch.bool)
-        else:
-            P_index_prox = target_mano_joints[:, idx_index_prox]  # [N, 3]
-            P_pinky_prox = target_mano_joints[:, idx_pinky_prox]  # [N, 3]
-
-            V1 = P_index_prox - target_wrist_pos
-            V2 = P_pinky_prox - target_wrist_pos
-            N_palm = torch.cross(V1, V2, dim=-1)
-
-            norm = torch.norm(N_palm, dim=-1, keepdim=True)
-            palm_valid = norm.squeeze(-1) > 1e-6
-            palm_dir = torch.where(palm_valid.unsqueeze(-1), N_palm / norm.clamp(min=1e-6), torch.zeros_like(N_palm))
-
-            # 通过锚点方向修正法线朝向，确保指向手心
-            anchor_dir = P_anchor - target_wrist_pos
-            flip_mask = (torch.sum(palm_dir * anchor_dir, dim=-1, keepdim=True) < 0) & palm_valid.unsqueeze(-1)
-            palm_dir = torch.where(flip_mask, -palm_dir, palm_dir)
-
-            cprint(f"[PALM_DIR] Computed palm normal for {palm_valid.sum().item()}/{self.num_envs} frames", "green")
-
-        closest_points = P_anchor  # 用于可视化
-        palm_pos = P_anchor
-
-        # 步骤3: 最终位置 - 沿手掌法线反向（手背方向）回退
-        # P_init = P_anchor - d × N_palm
         retreat_distance = 0.2
         offset = torch.where(
             palm_valid.unsqueeze(-1),
-            P_anchor - retreat_distance * palm_dir - target_wrist_pos,
+            -palm_dir * retreat_distance,  # 取最近点到手心方向的反向偏移
             torch.zeros_like(target_wrist_pos),
         )
 
@@ -878,32 +798,6 @@ class Mano2Dexhand:
                             colors_cp,
                         )
             loss = torch.mean(torch.norm(pk_joints - target_joints, dim=-1) * weight[None])
-            # === 可选接触奖励：鼓励手关节贴近接触点，匹配指定关节给予更大奖励 ===
-            if self._contact_reward_frames is not None and len(self._contact_reward_frames) > 0:
-                contact_terms = []
-                sigma = max(self.contact_reward_sigma, 1e-6)
-                max_env = min(len(self._contact_reward_frames), pk_joints.shape[0])
-                for env_idx in range(max_env):
-                    contacts = self._contact_reward_frames[env_idx]
-                    if not contacts:
-                        continue
-                    joints_pos = pk_joints[env_idx]  # [num_joints,3]
-                    for contact in contacts:
-                        contact_pos = contact["pos"]
-                        dists = torch.norm(joints_pos - contact_pos[None, :], dim=-1)
-                        min_dist = torch.min(dists)
-                        target_dist = min_dist
-                        h_idx = contact.get("hand_idx", None)
-                        if h_idx is not None and h_idx < joints_pos.shape[0]:
-                            target_dist = dists[h_idx]
-                        # 奖励采用 exp(-dist/sigma)，距离越近奖励越大
-                        bonus = self.contact_reward_scale * torch.exp(-min_dist / sigma)
-                        bonus += self.contact_reward_match_scale * torch.exp(-target_dist / sigma)
-                        # 奖励以负号加入 loss，使其距离越近总损失越小
-                        contact_terms.append(-bonus)
-                if len(contact_terms) > 0:
-                    contact_loss = torch.stack(contact_terms).mean()
-                    loss = loss + contact_loss
             opti.zero_grad()
             loss.backward()
             opti.step()
@@ -957,30 +851,6 @@ if __name__ == "__main__":
                 "type": str,
                 "default": None,
                 "help": "Path to contact data pkl file (optional, for visualization)",
-            },
-            {
-                "name": "--enable_contact_reward",
-                "type": int,
-                "default": 0,
-                "help": "1 to add contact reward term in loss, 0 to disable",
-            },
-            {
-                "name": "--contact_reward_scale",
-                "type": float,
-                "default": 0.1,
-                "help": "Reward weight for any joint touching a contact point",
-            },
-            {
-                "name": "--contact_reward_match_scale",
-                "type": float,
-                "default": 0.2,
-                "help": "Extra reward weight when the annotated joint touches the contact point",
-            },
-            {
-                "name": "--contact_reward_sigma",
-                "type": float,
-                "default": 0.01,
-                "help": "Distance falloff (m) for contact reward exp(-d/sigma)",
             },
             {
                 "name": "--max_frames",

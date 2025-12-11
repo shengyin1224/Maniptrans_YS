@@ -45,7 +45,7 @@ class ManipDataFactory:
              dtype = "favor" # 对应注册名
         elif type(index) == str and "@" in index:
             dtype = "oakink2"
-        elif type(index) == str and index.startswith("g"):
+        elif type(index) == str and index.startswith("grab"):
             dtype = "grabdemo"
         elif type(index) == str and index.startswith("v"):
             dtype = "visionpro"
