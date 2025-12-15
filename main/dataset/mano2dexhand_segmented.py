@@ -1,6 +1,7 @@
 import math
 import os
 import pickle
+import copy
 import imageio
 import xml.etree.ElementTree as ET
 from isaacgym import gymapi, gymtorch, gymutil
@@ -231,31 +232,28 @@ class Mano2Dexhand:
         self._contact_reward_frames = None
         # === 预计算接触点数量（用于创建 spheres） ===
         if self.contact_data is not None:
-            max_contacts = 0
-            # 仅考虑“每帧 num_contacts 最大的那个物体”的接触点数（已经是点对数）
-            for frame in self.contact_data['frames']:
-                if len(frame['objects']) == 0:
-                    continue
-                frame_max_contacts = max(obj.get('num_contacts', 0) for obj in frame['objects'])
-                max_contacts = max(max_contacts, frame_max_contacts)
-            # 为了避免创建过多可视化小球导致 PhysX 内存/对数超限，做可视化上限
-            MAX_CONTACT_VIS = 5  # 如需更多可调高，但可能再次触顶
-            if max_contacts > MAX_CONTACT_VIS:
-                cprint(
-                    f"[CONTACT VIS][WARN] Capping visualized contacts from {max_contacts} to {MAX_CONTACT_VIS} to avoid GPU broadphase issues.",
-                    "yellow",
-                )
-            self.max_contacts_per_frame = max(min(max_contacts, MAX_CONTACT_VIS), 1)  # 至少创建1个以避免空列表
-            self.contact_sphere_actors = []
-            cprint(f"[CONTACT VIS] Will create {self.max_contacts_per_frame} contact point spheres per environment", "cyan")
-            # 打印每一帧接触最多的物体需要标注的点数
-            print("[CONTACT VIS] Per-frame max contact points (most-contacted object per frame):")
-            for fi, frame in enumerate(self.contact_data['frames']):
-                if len(frame['objects']) == 0:
-                    frame_max = 0
-                else:
-                    frame_max = max(obj.get('num_contacts', 0) for obj in frame['objects'])
-                print(f"  Frame {fi}: {frame_max}")
+            # 可视化相关（contact spheres）在 headless 时没有意义，
+            # 而且会显著增加 actor/shape 数量，GPU pipeline 下容易触发 PhysX broadphase 崩溃。
+            if not self.headless:
+                max_contacts = 0
+                # 仅考虑“每帧 num_contacts 最大的那个物体”的接触点数（已经是点对数）
+                for frame in self.contact_data["frames"]:
+                    if len(frame["objects"]) == 0:
+                        continue
+                    frame_max_contacts = max(obj.get("num_contacts", 0) for obj in frame["objects"])
+                    max_contacts = max(max_contacts, frame_max_contacts)
+                # 为了避免创建过多可视化小球导致 PhysX 内存/对数超限，做可视化上限
+                MAX_CONTACT_VIS = 5  # 如需更多可调高，但可能再次触顶
+                if max_contacts > MAX_CONTACT_VIS:
+                    cprint(
+                        f"[CONTACT VIS][WARN] Capping visualized contacts from {max_contacts} to {MAX_CONTACT_VIS} to avoid GPU broadphase issues.",
+                        "yellow",
+                    )
+                self.max_contacts_per_frame = max(min(max_contacts, MAX_CONTACT_VIS), 1)  # 至少创建1个以避免空列表
+                self.contact_sphere_actors = []
+                cprint(f"[CONTACT VIS] Will create {self.max_contacts_per_frame} contact point spheres per environment", "cyan")
+            else:
+                self.max_contacts_per_frame = 0
             # 仅在启用接触奖励时预处理接触点（避免每步重复构造 tensor）
             if self.enable_contact_reward:
                 self._contact_reward_frames = []
@@ -288,7 +286,7 @@ class Mano2Dexhand:
             asset_options.fix_base_link = True  # 按需求保持固定
             asset_options.vhacd_enabled = True
             asset_options.vhacd_params = gymapi.VhacdParams()
-            asset_options.vhacd_params.resolution = 200000
+            asset_options.vhacd_params.resolution = 50000
             asset_options.override_com = True
             asset_options.override_inertia = True
             asset_options.disable_gravity = True
@@ -354,61 +352,64 @@ class Mano2Dexhand:
             # ==============================
 
             # Visualization Spheres
-            scene_asset_options = gymapi.AssetOptions()
-            scene_asset_options.fix_base_link = True
-            for joint_vis_id, joint_name in enumerate(self.dexhand.body_names):
-                joint_name = self.dexhand.to_hand(joint_name)[0]
-                joint_point = self.gym.create_sphere(self.sim, 0.005, scene_asset_options)
-                a = self.gym.create_actor(
-                    env, joint_point, gymapi.Transform(), f"mano_joint_{joint_vis_id}", self.num_envs + 1, 0b1
-                )
-                if "index" in joint_name:
-                    inter_c = 70
-                elif "middle" in joint_name:
-                    inter_c = 130
-                elif "ring" in joint_name:
-                    inter_c = 190
-                elif "pinky" in joint_name:
-                    inter_c = 250
-                elif "thumb" in joint_name:
-                    inter_c = 10
-                else:
-                    inter_c = 0
-                if "tip" in joint_name:
-                    c = gymapi.Vec3(inter_c / 255, 200 / 255, 200 / 255)
-                elif "proximal" in joint_name:
-                    c = gymapi.Vec3(200 / 255, inter_c / 255, 200 / 255)
-                elif "intermediate" in joint_name:
-                    c = gymapi.Vec3(200 / 255, 200 / 255, inter_c / 255)
-                else:
-                    c = gymapi.Vec3(100 / 255, 150 / 255, 200 / 255)
-                self.gym.set_rigid_body_color(env, a, 0, gymapi.MESH_VISUAL, c)
-            
-            # === 接触点可视化 Spheres（为当前环境创建） ===
-            if self.contact_data is not None and self.max_contacts_per_frame > 0:
-                env_contact_actors = []
-                env_contact_actor_env_indices = []
-                for contact_id in range(self.max_contacts_per_frame):
-                    contact_sphere = self.gym.create_sphere(self.sim, 0.008, scene_asset_options)  # 稍大一点便于观察
-                    # 初始位置设在远处（地下），后续更新时会移到正确位置
-                    init_transform = gymapi.Transform()
-                    init_transform.p = gymapi.Vec3(100, 100, -100)
-                    init_transform.r = gymapi.Quat(0, 0, 0, 1)
-                    contact_actor = self.gym.create_actor(
-                        env, contact_sphere, init_transform, 
-                        f"contact_point_{contact_id}", self.num_envs + 2, 0b1
+            # 注意：这些 sphere（mano joint / contact point）会显著增加 actor/shape 数量。
+            # 在 headless 优化时它们没有意义，且在 GPU pipeline + 大量 env 时容易触发 PhysX broadphase 崩溃（segfault）。
+            if not self.headless:
+                scene_asset_options = gymapi.AssetOptions()
+                scene_asset_options.fix_base_link = True
+                for joint_vis_id, joint_name in enumerate(self.dexhand.body_names):
+                    joint_name = self.dexhand.to_hand(joint_name)[0]
+                    joint_point = self.gym.create_sphere(self.sim, 0.005, scene_asset_options)
+                    a = self.gym.create_actor(
+                        env, joint_point, gymapi.Transform(), f"mano_joint_{joint_vis_id}", self.num_envs + 1, 0b1
                     )
-                    # 记录在当前环境内的 actor 序号（用于 tensor API 写入）
-                    env_idx_local = self.gym.get_actor_index(env, contact_actor, gymapi.DOMAIN_ENV)
-                    env_contact_actor_env_indices.append(env_idx_local)
-                    # 使用醒目的红色标记接触点
-                    contact_color = gymapi.Vec3(1.0, 0.0, 0.0)  # 红色
-                    self.gym.set_rigid_body_color(env, contact_actor, 0, gymapi.MESH_VISUAL, contact_color)
-                    env_contact_actors.append(contact_actor)
-                self.contact_sphere_actors.append(env_contact_actors)
-                if not hasattr(self, "contact_actor_env_indices"):
-                    self.contact_actor_env_indices = []
-                self.contact_actor_env_indices.append(env_contact_actor_env_indices)
+                    if "index" in joint_name:
+                        inter_c = 70
+                    elif "middle" in joint_name:
+                        inter_c = 130
+                    elif "ring" in joint_name:
+                        inter_c = 190
+                    elif "pinky" in joint_name:
+                        inter_c = 250
+                    elif "thumb" in joint_name:
+                        inter_c = 10
+                    else:
+                        inter_c = 0
+                    if "tip" in joint_name:
+                        c = gymapi.Vec3(inter_c / 255, 200 / 255, 200 / 255)
+                    elif "proximal" in joint_name:
+                        c = gymapi.Vec3(200 / 255, inter_c / 255, 200 / 255)
+                    elif "intermediate" in joint_name:
+                        c = gymapi.Vec3(200 / 255, 200 / 255, inter_c / 255)
+                    else:
+                        c = gymapi.Vec3(100 / 255, 150 / 255, 200 / 255)
+                    self.gym.set_rigid_body_color(env, a, 0, gymapi.MESH_VISUAL, c)
+                
+                # === 接触点可视化 Spheres（为当前环境创建） ===
+                if self.contact_data is not None and self.max_contacts_per_frame > 0:
+                    env_contact_actors = []
+                    env_contact_actor_env_indices = []
+                    for contact_id in range(self.max_contacts_per_frame):
+                        contact_sphere = self.gym.create_sphere(self.sim, 0.008, scene_asset_options)  # 稍大一点便于观察
+                        # 初始位置设在远处（地下），后续更新时会移到正确位置
+                        init_transform = gymapi.Transform()
+                        init_transform.p = gymapi.Vec3(100, 100, -100)
+                        init_transform.r = gymapi.Quat(0, 0, 0, 1)
+                        contact_actor = self.gym.create_actor(
+                            env, contact_sphere, init_transform, 
+                            f"contact_point_{contact_id}", self.num_envs + 2, 0b1
+                        )
+                        # 记录在当前环境内的 actor 序号（用于 tensor API 写入）
+                        env_idx_local = self.gym.get_actor_index(env, contact_actor, gymapi.DOMAIN_ENV)
+                        env_contact_actor_env_indices.append(env_idx_local)
+                        # 使用醒目的红色标记接触点
+                        contact_color = gymapi.Vec3(1.0, 0.0, 0.0)  # 红色
+                        self.gym.set_rigid_body_color(env, contact_actor, 0, gymapi.MESH_VISUAL, contact_color)
+                        env_contact_actors.append(contact_actor)
+                    self.contact_sphere_actors.append(env_contact_actors)
+                    if not hasattr(self, "contact_actor_env_indices"):
+                        self.contact_actor_env_indices = []
+                    self.contact_actor_env_indices.append(env_contact_actor_env_indices)
 
         env_ptr = self.envs[0]
         dexhand_handle = 0
@@ -587,7 +588,15 @@ class Mano2Dexhand:
         
         注意：接触点spheres作为独立actors，需要通过gym API直接设置位置
         """
-        if self.contact_data is None or not hasattr(self, 'contact_sphere_actors'):
+        # headless 下不创建可视化 spheres，直接跳过
+        if self.headless:
+            return
+        if (
+            self.contact_data is None
+            or not hasattr(self, "contact_sphere_actors")
+            or not hasattr(self, "contact_actor_env_indices")
+            or self.max_contacts_per_frame <= 0
+        ):
             return
         
         # 遍历每个环境（每个环境对应一帧）
@@ -647,7 +656,7 @@ class Mano2Dexhand:
                 )
                 self._root_state[env_idx, actor_env_idx, 7:] = 0
     
-    def fitting(self, max_iter, target_wrist_pos, target_wrist_rot, target_mano_joints):
+    def fitting(self, max_iter, target_wrist_pos, target_wrist_rot, target_mano_joints, init_state=None):
         assert target_mano_joints.shape[0] == self.num_envs
         
         # 转换 Target 到 Gym 坐标系
@@ -742,10 +751,10 @@ class Mano2Dexhand:
 
         # 步骤3: 最终位置 - 沿手掌法线反向（手背方向）回退
         # P_init = P_anchor - d × N_palm
-        retreat_distance = 0.05
+        retreat_distance = 0.6
         offset = torch.where(
             palm_valid.unsqueeze(-1),
-            - retreat_distance * palm_dir,
+            target_wrist_pos - retreat_distance * palm_dir - target_wrist_pos,
             torch.zeros_like(target_wrist_pos),
         )
 
@@ -764,6 +773,25 @@ class Mano2Dexhand:
             dtype=torch.float32,
             requires_grad=True,
         )
+
+        # === 可选：用外部提供的初始状态覆盖（支持按帧不同；NaN 表示保持默认初始化） ===
+        if init_state is not None:
+            def _apply_init(dst: torch.Tensor, init_arr):
+                if init_arr is None:
+                    return
+                init_t = torch.as_tensor(init_arr, device=dst.device, dtype=dst.dtype)
+                if init_t.shape != dst.shape:
+                    raise ValueError(f"init shape mismatch: got {tuple(init_t.shape)}, expected {tuple(dst.shape)}")
+                # 对每一行判断是否有 NaN；有 NaN 则跳过该行
+                row_has_nan = torch.isnan(init_t).any(dim=-1)
+                mask = ~row_has_nan
+                if mask.any():
+                    dst.data[mask] = init_t[mask]
+
+            _apply_init(opt_wrist_pos, init_state.get("wrist_pos", None))
+            _apply_init(opt_wrist_rot, init_state.get("wrist_rot6d", None))
+            _apply_init(opt_dof_pos, init_state.get("dof_pos", None))
+
         opti = torch.optim.Adam(
             [{"params": [opt_wrist_pos, opt_wrist_rot], "lr": 0.0008}, {"params": [opt_dof_pos], "lr": 0.0004}]
         )
@@ -882,19 +910,8 @@ class Mano2Dexhand:
             # 计算每个关节的偏差
             joint_err = torch.norm(pk_joints - target_joints, dim=-1)  # [B, J]
 
-            # Wrist 收敛门控：仅当手腕位置/姿态都在阈值内时，才对其它关节施加损失
-            wrist_pos_err = torch.norm(opt_wrist_pos - target_wrist_pos, dim=-1)  # [B]
-            wrist_rot_mat = rot6d_to_rotmat(opt_wrist_rot)                       # [B,3,3]
-            target_wrist_rot_mat = target_wrist_rot                              # [B,3,3]
-            rot_rel = torch.matmul(wrist_rot_mat.transpose(-1, -2), target_wrist_rot_mat)
-            cos_theta = (rot_rel.diagonal(offset=0, dim1=-2, dim2=-1).sum(-1) - 1) * 0.5
-            cos_theta = torch.clamp(cos_theta, -1.0, 1.0)
-            wrist_rot_err = torch.acos(cos_theta)                                # [B]
-
-            wrist_ready = (wrist_pos_err <= self.wrist_pos_tol) & (wrist_rot_err <= self.wrist_rot_tol)
-            # 构造逐样本权重：手腕始终保留，其他关节需 wrist_ready 才生效
+            # 直接使用权重，不限制wrist收敛后才优化手指
             weight_per_env = weight[None, :].repeat(pk_joints.shape[0], 1)
-            weight_per_env[:, 1:] = weight_per_env[:, 1:] * wrist_ready[:, None]
 
             loss = torch.mean(joint_err * weight_per_env)
             # === 可选接触奖励：鼓励手关节贴近接触点，匹配指定关节给予更大奖励 ===
@@ -920,9 +937,9 @@ class Mano2Dexhand:
                         bonus += self.contact_reward_match_scale * torch.exp(-target_dist / sigma)
                         # 奖励以负号加入 loss，使其距离越近总损失越小
                         contact_terms.append(-bonus)
-                if len(contact_terms) > 0 and past_loss - loss.item() < 5 * 1e-2:
-                    contact_loss = torch.stack(contact_terms).mean()
-                    loss = loss + contact_loss
+                # if len(contact_terms) > 0 and past_loss - loss.item() < 5 * 1e-2:
+                #     contact_loss = torch.stack(contact_terms).mean()
+                #     loss = loss + contact_loss
             opti.zero_grad()
             loss.backward()
             opti.step()
@@ -939,6 +956,24 @@ class Mano2Dexhand:
             "opt_dof_pos": opt_dof_pos_clamped.detach().cpu().numpy(),
             "opt_joints_pos": isaac_joints.detach().cpu().numpy(),
         }
+
+        # 清理tensor引用，避免持有已销毁sim的引用
+        if hasattr(self, '_root_state'):
+            del self._root_state
+        if hasattr(self, '_dof_state'):
+            del self._dof_state
+        if hasattr(self, '_rigid_body_state'):
+            del self._rigid_body_state
+        if hasattr(self, '_net_cf'):
+            del self._net_cf
+        if hasattr(self, 'q'):
+            del self.q
+        if hasattr(self, 'qd'):
+            del self.qd
+        if hasattr(self, '_base_state'):
+            del self._base_state
+        if hasattr(self, 'mano_joint_points'):
+            del self.mano_joint_points
 
         if not self.headless:
             self.gym.destroy_viewer(self.viewer)
@@ -1037,6 +1072,18 @@ if __name__ == "__main__":
                 "default": "render_outputs",
                 "help": "Directory to save rendered frames when using --render_pkl in headless mode",
             },
+            {
+                "name": "--stage",
+                "type": str,
+                "default": "both",
+                "help": "Which stage to run: '1' (stage1 only), '2' (stage2 only), or 'both' (default)",
+            },
+            {
+                "name": "--stage1_pkl",
+                "type": str,
+                "default": None,
+                "help": "Path to stage1 pkl file (required when --stage=2)",
+            },
         ],
     )
 
@@ -1117,7 +1164,62 @@ if __name__ == "__main__":
             gym.destroy_viewer(viewer)
         gym.destroy_sim(sim)
 
-    def run(parser, idx):
+    def _subset_demo_data_by_frames(demo_data, frame_indices):
+        """按给定帧号列表切片 demo_data，并同步切片 scene_objects 的轨迹。"""
+        if len(frame_indices) == 0:
+            raise ValueError("frame_indices is empty")
+        device = demo_data["wrist_pos"].device
+        idx_t = torch.as_tensor(frame_indices, device=device, dtype=torch.long)
+        out = dict(demo_data)
+        out["wrist_pos"] = demo_data["wrist_pos"][idx_t]
+        out["wrist_rot"] = demo_data["wrist_rot"][idx_t]
+        out["mano_joints"] = demo_data["mano_joints"][idx_t]
+        new_scene_objects = []
+        for obj in demo_data["scene_objects"]:
+            obj_new = dict(obj)
+            for k in ["trajectory", "velocity", "angular_velocity"]:
+                if k in obj_new and isinstance(obj_new[k], torch.Tensor):
+                    obj_new[k] = obj_new[k][idx_t]
+            new_scene_objects.append(obj_new)
+        out["scene_objects"] = new_scene_objects
+        return out
+
+    def _subset_contact_data_by_frames(contact_data, frame_indices):
+        """按给定帧号列表切片 contact_data，使 env_idx 与 contact_data['frames'][env_idx] 对齐。"""
+        if contact_data is None:
+            return None
+        frames = contact_data.get("frames", [])
+        new_frames = []
+        for fi in frame_indices:
+            if 0 <= fi < len(frames):
+                new_frames.append(frames[fi])
+            else:
+                new_frames.append({"frame_idx": fi, "objects": []})
+        cd = dict(contact_data)
+        cd["frames"] = new_frames
+        cd["num_frames"] = len(new_frames)
+        return cd
+
+    def _get_dump_path(dataset_type, demo_data, dexhand, idx):
+        """获取输出路径的辅助函数"""
+        if dataset_type == "oakink2":
+            return f"data/retargeting/OakInk-v2/mano2{str(dexhand)}/{os.path.split(demo_data['data_path'][0])[-1].replace('.pkl', f'@{idx[-1]}.pkl')}"
+        elif dataset_type == "humoto":
+            filename = os.path.basename(demo_data["data_path"][0])
+            return f"data/retargeting/Humoto/mano2{str(dexhand)}/{filename}"
+        elif dataset_type == "favor":
+            return f"data/retargeting/favor_pass1/mano2{str(dexhand)}/{os.path.split(demo_data['data_path'][0])[-1]}"
+        elif dataset_type == "grabdemo":
+            return f"data/retargeting/grab_demo/mano2{str(dexhand)}/{os.path.split(demo_data['data_path'][0])[-1].replace('.npy', '.pkl')}"
+        elif dataset_type == "oakink2_mirrored":
+            return f"data/retargeting/OakInk-v2-mirrored/mano2{str(dexhand)}/{os.path.split(demo_data['data_path'][0])[-1].replace('.pkl', f'@{idx[-1]}.pkl')}"
+        elif dataset_type == "favor_mirrored":
+            return f"data/retargeting/favor_pass1-mirrored/mano2{str(dexhand)}/{os.path.split(demo_data['data_path'][0])[-1]}"
+        else:
+            raise ValueError("Unsupported dataset type")
+
+    def run_stage1(parser, idx):
+        """运行第一阶段：优化无contact的帧"""
         dataset_type = ManipDataFactory.dataset_type(idx)
         demo_d = ManipDataFactory.create_data(
             manipdata_type=dataset_type,
@@ -1133,11 +1235,9 @@ if __name__ == "__main__":
         total_frames = demo_data["mano_joints"].shape[0]
         if parser.max_frames is not None and parser.max_frames > 0:
             use_frames = min(parser.max_frames, total_frames)
-            # 截断到指定帧数
             demo_data["wrist_pos"] = demo_data["wrist_pos"][:use_frames]
             demo_data["wrist_rot"] = demo_data["wrist_rot"][:use_frames]
             demo_data["mano_joints"] = demo_data["mano_joints"][:use_frames]
-            # 场景物体轨迹截断
             for obj in demo_data["scene_objects"]:
                 if "trajectory" in obj:
                     obj["trajectory"] = obj["trajectory"][:use_frames]
@@ -1145,54 +1245,574 @@ if __name__ == "__main__":
                     obj["velocity"] = obj["velocity"][:use_frames]
                 if "angular_velocity" in obj:
                     obj["angular_velocity"] = obj["angular_velocity"][:use_frames]
-            parser.num_envs = use_frames
             cprint(f"[INFO] Limiting optimization to first {use_frames} frames (total {total_frames})", "cyan")
-        else:
-            parser.num_envs = total_frames
-        scene_objects = demo_data["scene_objects"]
+
+        T = demo_data["mano_joints"].shape[0]
 
         # === 加载接触数据（如果提供） ===
-        contact_data = None
+        contact_data_full = None
         if parser.contact_data is not None and os.path.exists(parser.contact_data):
-            cprint(f"[CONTACT VIS] Loading contact data from: {parser.contact_data}", "cyan")
-            with open(parser.contact_data, 'rb') as f:
-                contact_data = pickle.load(f)
-            cprint(f"[CONTACT VIS] Loaded {contact_data['num_frames']} frames with contact data", "green")
-        
-        # === [修改] 传入 dataset_type 和 contact_data ===
-        mano2inspire = Mano2Dexhand(parser, dexhand, scene_objects, dataset_type=dataset_type, contact_data=contact_data)
-        # ==============================
+            cprint(f"[CONTACT] Loading contact data from: {parser.contact_data}", "cyan")
+            with open(parser.contact_data, "rb") as f:
+                contact_data_full = pickle.load(f)
+            cprint(f"[CONTACT] Loaded {contact_data_full.get('num_frames', len(contact_data_full.get('frames', [])))} frames", "green")
 
-        to_dump = mano2inspire.fitting(
-            parser.iter,
-            demo_data["wrist_pos"],
-            demo_data["wrist_rot"],
-            demo_data["mano_joints"].view(parser.num_envs, -1, 3),
+        # === 从第0帧开始按是否有 contact 分段 ===
+        has_contact = [False] * T
+        if contact_data_full is not None:
+            frames = contact_data_full.get("frames", [])
+            for i in range(min(T, len(frames))):
+                fr = frames[i]
+                flag = False
+                for obj in fr.get("objects", []):
+                    if obj.get("num_contacts", 0) > 0 or len(obj.get("contacts", [])) > 0:
+                        flag = True
+                        break
+                has_contact[i] = flag
+
+        def _make_segments(flags):
+            segs = []
+            if T > 0:
+                cur_flag = flags[0]
+                s0 = 0
+                for ii in range(1, T):
+                    if flags[ii] != cur_flag:
+                        segs.append((s0, ii - 1, cur_flag))
+                        s0 = ii
+                        cur_flag = flags[ii]
+                segs.append((s0, T - 1, cur_flag))
+            return segs
+
+        # 初始分段
+        segments = _make_segments(has_contact)
+
+        # === 额外规则：若"无 contact 段"长度 < 5 且前后都是 contact 段，则合并到 contact 段中 ===
+        MIN_NOCONTACT_KEEP = 5
+        changed = False
+        for si, (a, b, is_c) in enumerate(segments):
+            seg_len = b - a + 1
+            if (not is_c) and seg_len < MIN_NOCONTACT_KEEP and 0 < si < (len(segments) - 1):
+                prev_is_c = segments[si - 1][2]
+                next_is_c = segments[si + 1][2]
+                if prev_is_c and next_is_c:
+                    for fi in range(a, b + 1):
+                        has_contact[fi] = True
+                    changed = True
+
+        # 重新分段（若发生合并）
+        if changed:
+            segments = _make_segments(has_contact)
+
+        cprint("[SEG] Segments (start,end,has_contact): " + ", ".join([f"({a}-{b},{'C' if c else 'N'})" for a, b, c in segments]), "cyan")
+
+        no_contact_frames = [i for i in range(T) if not has_contact[i]]
+        contact_frames = [i for i in range(T) if has_contact[i]]
+
+        # 结果缓存（最终拼成完整 T 帧输出）
+        n_dofs = dexhand.n_dofs
+        n_joints = len(dexhand.body_names)
+        out_wrist_pos = np.full((T, 3), np.nan, dtype=np.float32)
+        out_wrist_rot_aa = np.full((T, 3), np.nan, dtype=np.float32)
+        out_dof_pos = np.full((T, n_dofs), np.nan, dtype=np.float32)
+        out_joints_pos = np.full((T, n_joints, 3), np.nan, dtype=np.float32)
+
+        # === 优化"无 contact"的帧（可一次性批量） ===
+        if len(no_contact_frames) > 0:
+            cprint(f"[STAGE1] Optimizing {len(no_contact_frames)}/{T} frames without contact ...", "cyan")
+            demo_nc = _subset_demo_data_by_frames(demo_data, no_contact_frames)
+            parser.num_envs = len(no_contact_frames)
+            mano2_nc = Mano2Dexhand(parser, dexhand, demo_nc["scene_objects"], dataset_type=dataset_type, contact_data=None)
+            dump_nc = mano2_nc.fitting(
+                parser.iter,
+                demo_nc["wrist_pos"],
+                demo_nc["wrist_rot"],
+                demo_nc["mano_joints"].view(parser.num_envs, -1, 3),
+                init_state=None,
+            )
+            for k, fi in enumerate(no_contact_frames):
+                out_wrist_pos[fi] = dump_nc["opt_wrist_pos"][k]
+                out_wrist_rot_aa[fi] = dump_nc["opt_wrist_rot"][k]
+                out_dof_pos[fi] = dump_nc["opt_dof_pos"][k]
+                out_joints_pos[fi] = dump_nc["opt_joints_pos"][k]
+            # 显式清理Stage1的实例，确保资源释放
+            del mano2_nc
+            import gc
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        else:
+            cprint("[STAGE1] No frames without contact, skip.", "yellow")
+
+        # Stage1 完成后保存
+        dump_path = _get_dump_path(dataset_type, demo_data, dexhand, idx)
+        stage1_path = dump_path.replace(".pkl", "_stage1_nocontact.pkl")
+        os.makedirs(os.path.dirname(stage1_path), exist_ok=True)
+        with open(stage1_path, "wb") as f:
+            pickle.dump(
+                {
+                    "opt_wrist_pos": out_wrist_pos,
+                    "opt_wrist_rot": out_wrist_rot_aa,
+                    "opt_dof_pos": out_dof_pos,
+                    "opt_joints_pos": out_joints_pos,
+                },
+                f,
+            )
+        cprint(f"[STAGE1] Saved intermediate to: {stage1_path}", "green")
+
+    def run_stage2(parser, idx, stage1_pkl_path):
+        """运行第二阶段：优化有contact的帧，从stage1 pkl文件加载初始状态"""
+        if stage1_pkl_path is None or not os.path.exists(stage1_pkl_path):
+            raise ValueError(f"Stage1 pkl file not found: {stage1_pkl_path}. Please run stage1 first.")
+
+        # 加载stage1的结果
+        cprint(f"[STAGE2] Loading stage1 results from: {stage1_pkl_path}", "cyan")
+        with open(stage1_pkl_path, "rb") as f:
+            stage1_data = pickle.load(f)
+        
+        out_wrist_pos = stage1_data["opt_wrist_pos"]
+        out_wrist_rot_aa = stage1_data["opt_wrist_rot"]
+        out_dof_pos = stage1_data["opt_dof_pos"]
+        out_joints_pos = stage1_data["opt_joints_pos"]
+        T = out_wrist_pos.shape[0]
+
+        dataset_type = ManipDataFactory.dataset_type(idx)
+        demo_d = ManipDataFactory.create_data(
+            manipdata_type=dataset_type,
+            side=parser.side,
+            device="cuda:0",
+            mujoco2gym_transf=torch.eye(4, device="cuda:0"),
+            dexhand=dexhand,
+            verbose=False,
         )
 
-        if dataset_type == "oakink2":
-            dump_path = f"data/retargeting/OakInk-v2/mano2{str(dexhand)}/{os.path.split(demo_data['data_path'][0])[-1].replace('.pkl', f'@{idx[-1]}.pkl')}"
-        elif dataset_type == "humoto":
-            filename = os.path.basename(demo_data['data_path'][0])
-            dump_path = f"data/retargeting/Humoto/mano2{str(dexhand)}/{filename}"
-        elif dataset_type == "favor":
-            dump_path = (
-                f"data/retargeting/favor_pass1/mano2{str(dexhand)}/{os.path.split(demo_data['data_path'][0])[-1]}"
-            )
-        elif dataset_type == "grabdemo":
-            dump_path = f"data/retargeting/grab_demo/mano2{str(dexhand)}/{os.path.split(demo_data['data_path'][0])[-1].replace('.npy', '.pkl')}"
-        elif dataset_type == "oakink2_mirrored":
-            dump_path = f"data/retargeting/OakInk-v2-mirrored/mano2{str(dexhand)}/{os.path.split(demo_data['data_path'][0])[-1].replace('.pkl', f'@{idx[-1]}.pkl')}"
-        elif dataset_type == "favor_mirrored":
-            dump_path = f"data/retargeting/favor_pass1-mirrored/mano2{str(dexhand)}/{os.path.split(demo_data['data_path'][0])[-1]}"
-        else:
-            raise ValueError("Unsupported dataset type")
+        demo_data = pack_data([demo_d[idx]], dexhand)
 
+        total_frames = demo_data["mano_joints"].shape[0]
+        if T != total_frames:
+            cprint(f"[WARN] Stage1 has {T} frames but demo has {total_frames} frames. Truncating demo to match.", "yellow")
+            demo_data["wrist_pos"] = demo_data["wrist_pos"][:T]
+            demo_data["wrist_rot"] = demo_data["wrist_rot"][:T]
+            demo_data["mano_joints"] = demo_data["mano_joints"][:T]
+            for obj in demo_data["scene_objects"]:
+                if "trajectory" in obj:
+                    obj["trajectory"] = obj["trajectory"][:T]
+                if "velocity" in obj:
+                    obj["velocity"] = obj["velocity"][:T]
+                if "angular_velocity" in obj:
+                    obj["angular_velocity"] = obj["angular_velocity"][:T]
+
+        # === 加载接触数据（如果提供） ===
+        contact_data_full = None
+        if parser.contact_data is not None and os.path.exists(parser.contact_data):
+            cprint(f"[CONTACT] Loading contact data from: {parser.contact_data}", "cyan")
+            with open(parser.contact_data, "rb") as f:
+                contact_data_full = pickle.load(f)
+            cprint(f"[CONTACT] Loaded {contact_data_full.get('num_frames', len(contact_data_full.get('frames', [])))} frames", "green")
+
+        # === 从第0帧开始按是否有 contact 分段 ===
+        has_contact = [False] * T
+        if contact_data_full is not None:
+            frames = contact_data_full.get("frames", [])
+            for i in range(min(T, len(frames))):
+                fr = frames[i]
+                flag = False
+                for obj in fr.get("objects", []):
+                    if obj.get("num_contacts", 0) > 0 or len(obj.get("contacts", [])) > 0:
+                        flag = True
+                        break
+                has_contact[i] = flag
+
+        def _make_segments(flags):
+            segs = []
+            if T > 0:
+                cur_flag = flags[0]
+                s0 = 0
+                for ii in range(1, T):
+                    if flags[ii] != cur_flag:
+                        segs.append((s0, ii - 1, cur_flag))
+                        s0 = ii
+                        cur_flag = flags[ii]
+                segs.append((s0, T - 1, cur_flag))
+            return segs
+
+        # 初始分段
+        segments = _make_segments(has_contact)
+
+        # === 额外规则：若"无 contact 段"长度 < 5 且前后都是 contact 段，则合并到 contact 段中 ===
+        MIN_NOCONTACT_KEEP = 5
+        changed = False
+        for si, (a, b, is_c) in enumerate(segments):
+            seg_len = b - a + 1
+            if (not is_c) and seg_len < MIN_NOCONTACT_KEEP and 0 < si < (len(segments) - 1):
+                prev_is_c = segments[si - 1][2]
+                next_is_c = segments[si + 1][2]
+                if prev_is_c and next_is_c:
+                    for fi in range(a, b + 1):
+                        has_contact[fi] = True
+                    changed = True
+
+        # 重新分段（若发生合并）
+        if changed:
+            segments = _make_segments(has_contact)
+
+        cprint("[SEG] Segments (start,end,has_contact): " + ", ".join([f"({a}-{b},{'C' if c else 'N'})" for a, b, c in segments]), "cyan")
+
+        contact_frames = [i for i in range(T) if has_contact[i]]
+
+        # === 优化"有 contact"的帧：初始状态来自该段上一帧的最终结果 ===
+        if len(contact_frames) > 0:
+            cprint(f"[STAGE2] Optimizing {len(contact_frames)}/{T} frames with contact (seeded by previous segment end) ...", "cyan")
+
+            demo_c = _subset_demo_data_by_frames(demo_data, contact_frames)
+            contact_data_c = _subset_contact_data_by_frames(contact_data_full, contact_frames)
+
+            frame_to_subidx = {fi: si for si, fi in enumerate(contact_frames)}
+            n_dofs = dexhand.n_dofs
+            init_wpos = np.full((len(contact_frames), 3), np.nan, dtype=np.float32)
+            init_wrot6d = np.full((len(contact_frames), 6), np.nan, dtype=np.float32)
+            init_dof = np.full((len(contact_frames), n_dofs), np.nan, dtype=np.float32)
+
+            for a, b, is_c in segments:
+                if not is_c:
+                    continue
+                prev = a - 1
+                if prev < 0:
+                    continue
+                if np.isnan(out_wrist_pos[prev]).any() or np.isnan(out_dof_pos[prev]).any() or np.isnan(out_wrist_rot_aa[prev]).any():
+                    continue
+                seed_pos = out_wrist_pos[prev]
+                seed_dof = out_dof_pos[prev]
+                # aa -> rot6d
+                seed_aa_t = torch.tensor(out_wrist_rot_aa[prev][None, :], dtype=torch.float32)
+                seed_rot6d = rotmat_to_rot6d(aa_to_rotmat(seed_aa_t)).squeeze(0).cpu().numpy().astype(np.float32)
+
+                for fi in range(a, b + 1):
+                    si = frame_to_subidx.get(fi, None)
+                    if si is None:
+                        continue
+                    init_wpos[si] = seed_pos
+                    init_wrot6d[si] = seed_rot6d
+                    init_dof[si] = seed_dof
+
+            parser.num_envs = len(contact_frames)
+            mano2_c = Mano2Dexhand(parser, dexhand, demo_c["scene_objects"], dataset_type=dataset_type, contact_data=contact_data_c)
+            dump_c = mano2_c.fitting(
+                parser.iter,
+                demo_c["wrist_pos"],
+                demo_c["wrist_rot"],
+                demo_c["mano_joints"].view(parser.num_envs, -1, 3),
+                init_state={"wrist_pos": init_wpos, "wrist_rot6d": init_wrot6d, "dof_pos": init_dof},
+            )
+
+            for k, fi in enumerate(contact_frames):
+                out_wrist_pos[fi] = dump_c["opt_wrist_pos"][k]
+                out_wrist_rot_aa[fi] = dump_c["opt_wrist_rot"][k]
+                out_dof_pos[fi] = dump_c["opt_dof_pos"][k]
+                out_joints_pos[fi] = dump_c["opt_joints_pos"][k]
+            # 显式清理Stage2的实例，确保资源释放
+            del mano2_c
+            import gc
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        else:
+            cprint("[STAGE2] No frames with contact, skip.", "yellow")
+
+        # 检查是否全部填充（允许个别 NaN：比如 contact_data 缺帧导致分段不准时）
+        missing = np.isnan(out_wrist_pos).any(axis=-1)
+        if missing.any():
+            cprint(f"[WARN] Missing {int(missing.sum())}/{T} frames in output (still NaN).", "yellow")
+
+        to_dump = {
+            "opt_wrist_pos": out_wrist_pos,
+            "opt_wrist_rot": out_wrist_rot_aa,
+            "opt_dof_pos": out_dof_pos,
+            "opt_joints_pos": out_joints_pos,
+        }
+
+        # === Stage2 完成后按原逻辑存储 ===
+        dump_path = _get_dump_path(dataset_type, demo_data, dexhand, idx)
         os.makedirs(os.path.dirname(dump_path), exist_ok=True)
         with open(dump_path, "wb") as f:
             pickle.dump(to_dump, f)
+        cprint(f"[STAGE2] Saved to: {dump_path}", "green")
+
+    def run_segmented(parser, idx):
+        dataset_type = ManipDataFactory.dataset_type(idx)
+        demo_d = ManipDataFactory.create_data(
+            manipdata_type=dataset_type,
+            side=parser.side,
+            device="cuda:0",
+            mujoco2gym_transf=torch.eye(4, device="cuda:0"),
+            dexhand=dexhand,
+            verbose=False,
+        )
+
+        demo_data = pack_data([demo_d[idx]], dexhand)
+
+        total_frames = demo_data["mano_joints"].shape[0]
+        if parser.max_frames is not None and parser.max_frames > 0:
+            use_frames = min(parser.max_frames, total_frames)
+            demo_data["wrist_pos"] = demo_data["wrist_pos"][:use_frames]
+            demo_data["wrist_rot"] = demo_data["wrist_rot"][:use_frames]
+            demo_data["mano_joints"] = demo_data["mano_joints"][:use_frames]
+            for obj in demo_data["scene_objects"]:
+                if "trajectory" in obj:
+                    obj["trajectory"] = obj["trajectory"][:use_frames]
+                if "velocity" in obj:
+                    obj["velocity"] = obj["velocity"][:use_frames]
+                if "angular_velocity" in obj:
+                    obj["angular_velocity"] = obj["angular_velocity"][:use_frames]
+            cprint(f"[INFO] Limiting optimization to first {use_frames} frames (total {total_frames})", "cyan")
+
+        T = demo_data["mano_joints"].shape[0]
+
+        # === 加载接触数据（如果提供） ===
+        contact_data_full = None
+        if parser.contact_data is not None and os.path.exists(parser.contact_data):
+            cprint(f"[CONTACT] Loading contact data from: {parser.contact_data}", "cyan")
+            with open(parser.contact_data, "rb") as f:
+                contact_data_full = pickle.load(f)
+            cprint(f"[CONTACT] Loaded {contact_data_full.get('num_frames', len(contact_data_full.get('frames', [])))} frames", "green")
+
+        # === 1) 从第0帧开始按是否有 contact 分段 ===
+        has_contact = [False] * T
+        if contact_data_full is not None:
+            frames = contact_data_full.get("frames", [])
+            for i in range(min(T, len(frames))):
+                fr = frames[i]
+                flag = False
+                for obj in fr.get("objects", []):
+                    if obj.get("num_contacts", 0) > 0 or len(obj.get("contacts", [])) > 0:
+                        flag = True
+                        break
+                has_contact[i] = flag
+
+        def _make_segments(flags):
+            segs = []
+            if T > 0:
+                cur_flag = flags[0]
+                s0 = 0
+                for ii in range(1, T):
+                    if flags[ii] != cur_flag:
+                        segs.append((s0, ii - 1, cur_flag))
+                        s0 = ii
+                        cur_flag = flags[ii]
+                segs.append((s0, T - 1, cur_flag))
+            return segs
+
+        # 初始分段
+        segments = _make_segments(has_contact)
+
+        # === 额外规则：若“无 contact 段”长度 < 5 且前后都是 contact 段，则合并到 contact 段中 ===
+        MIN_NOCONTACT_KEEP = 5
+        changed = False
+        for si, (a, b, is_c) in enumerate(segments):
+            seg_len = b - a + 1
+            if (not is_c) and seg_len < MIN_NOCONTACT_KEEP and 0 < si < (len(segments) - 1):
+                prev_is_c = segments[si - 1][2]
+                next_is_c = segments[si + 1][2]
+                if prev_is_c and next_is_c:
+                    for fi in range(a, b + 1):
+                        has_contact[fi] = True
+                    changed = True
+
+        # 重新分段（若发生合并）
+        if changed:
+            segments = _make_segments(has_contact)
+
+        cprint("[SEG] Segments (start,end,has_contact): " + ", ".join([f"({a}-{b},{'C' if c else 'N'})" for a, b, c in segments]), "cyan")
+
+        no_contact_frames = [i for i in range(T) if not has_contact[i]]
+        contact_frames = [i for i in range(T) if has_contact[i]]
+
+        # 结果缓存（最终拼成完整 T 帧输出）
+        n_dofs = dexhand.n_dofs
+        n_joints = len(dexhand.body_names)
+        out_wrist_pos = np.full((T, 3), np.nan, dtype=np.float32)
+        out_wrist_rot_aa = np.full((T, 3), np.nan, dtype=np.float32)
+        out_dof_pos = np.full((T, n_dofs), np.nan, dtype=np.float32)
+        out_joints_pos = np.full((T, n_joints, 3), np.nan, dtype=np.float32)
+
+        # === 2) 先优化“无 contact”的帧（可一次性批量） ===
+        if len(no_contact_frames) > 0:
+            cprint(f"[STAGE1] Optimizing {len(no_contact_frames)}/{T} frames without contact ...", "cyan")
+            demo_nc = _subset_demo_data_by_frames(demo_data, no_contact_frames)
+            parser.num_envs = len(no_contact_frames)
+            mano2_nc = Mano2Dexhand(parser, dexhand, demo_nc["scene_objects"], dataset_type=dataset_type, contact_data=None)
+            dump_nc = mano2_nc.fitting(
+                parser.iter,
+                demo_nc["wrist_pos"],
+                demo_nc["wrist_rot"],
+                demo_nc["mano_joints"].view(parser.num_envs, -1, 3),
+                init_state=None,
+            )
+            for k, fi in enumerate(no_contact_frames):
+                out_wrist_pos[fi] = dump_nc["opt_wrist_pos"][k]
+                out_wrist_rot_aa[fi] = dump_nc["opt_wrist_rot"][k]
+                out_dof_pos[fi] = dump_nc["opt_dof_pos"][k]
+                out_joints_pos[fi] = dump_nc["opt_joints_pos"][k]
+            # 显式清理Stage1的实例，确保资源释放
+            del mano2_nc
+            import gc
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            # 按你的第2点：Stage1 完成后先保存一次（格式同原输出）
+            if dataset_type == "oakink2":
+                dump_path = f"data/retargeting/OakInk-v2/mano2{str(dexhand)}/{os.path.split(demo_data['data_path'][0])[-1].replace('.pkl', f'@{idx[-1]}.pkl')}"
+            elif dataset_type == "humoto":
+                filename = os.path.basename(demo_data["data_path"][0])
+                dump_path = f"data/retargeting/Humoto/mano2{str(dexhand)}/{filename}"
+            elif dataset_type == "favor":
+                dump_path = f"data/retargeting/favor_pass1/mano2{str(dexhand)}/{os.path.split(demo_data['data_path'][0])[-1]}"
+            elif dataset_type == "grabdemo":
+                dump_path = f"data/retargeting/grab_demo/mano2{str(dexhand)}/{os.path.split(demo_data['data_path'][0])[-1].replace('.npy', '.pkl')}"
+            elif dataset_type == "oakink2_mirrored":
+                dump_path = f"data/retargeting/OakInk-v2-mirrored/mano2{str(dexhand)}/{os.path.split(demo_data['data_path'][0])[-1].replace('.pkl', f'@{idx[-1]}.pkl')}"
+            elif dataset_type == "favor_mirrored":
+                dump_path = f"data/retargeting/favor_pass1-mirrored/mano2{str(dexhand)}/{os.path.split(demo_data['data_path'][0])[-1]}"
+            else:
+                raise ValueError("Unsupported dataset type")
+
+            stage1_path = dump_path.replace(".pkl", "_stage1_nocontact.pkl")
+            os.makedirs(os.path.dirname(stage1_path), exist_ok=True)
+            with open(stage1_path, "wb") as f:
+                pickle.dump(
+                    {
+                        "opt_wrist_pos": out_wrist_pos,
+                        "opt_wrist_rot": out_wrist_rot_aa,
+                        "opt_dof_pos": out_dof_pos,
+                        "opt_joints_pos": out_joints_pos,
+                    },
+                    f,
+                )
+            cprint(f"[STAGE1] Saved intermediate to: {stage1_path}", "green")
+        else:
+            cprint("[STAGE1] No frames without contact, skip.", "yellow")
+
+        # === 3) 再优化“有 contact”的帧：初始状态来自该段上一帧的最终结果 ===
+        if len(contact_frames) > 0:
+            cprint(f"[STAGE2] Optimizing {len(contact_frames)}/{T} frames with contact (seeded by previous segment end) ...", "cyan")
+
+            demo_c = _subset_demo_data_by_frames(demo_data, contact_frames)
+            contact_data_c = _subset_contact_data_by_frames(contact_data_full, contact_frames)
+
+            frame_to_subidx = {fi: si for si, fi in enumerate(contact_frames)}
+            init_wpos = np.full((len(contact_frames), 3), np.nan, dtype=np.float32)
+            init_wrot6d = np.full((len(contact_frames), 6), np.nan, dtype=np.float32)
+            init_dof = np.full((len(contact_frames), n_dofs), np.nan, dtype=np.float32)
+
+            for a, b, is_c in segments:
+                if not is_c:
+                    continue
+                prev = a - 1
+                if prev < 0:
+                    continue
+                if np.isnan(out_wrist_pos[prev]).any() or np.isnan(out_dof_pos[prev]).any() or np.isnan(out_wrist_rot_aa[prev]).any():
+                    continue
+                seed_pos = out_wrist_pos[prev]
+                seed_dof = out_dof_pos[prev]
+                # aa -> rot6d
+                seed_aa_t = torch.tensor(out_wrist_rot_aa[prev][None, :], dtype=torch.float32)
+                seed_rot6d = rotmat_to_rot6d(aa_to_rotmat(seed_aa_t)).squeeze(0).cpu().numpy().astype(np.float32)
+
+                for fi in range(a, b + 1):
+                    si = frame_to_subidx.get(fi, None)
+                    if si is None:
+                        continue
+                    init_wpos[si] = seed_pos
+                    init_wrot6d[si] = seed_rot6d
+                    init_dof[si] = seed_dof
+
+            parser.num_envs = len(contact_frames)
+            mano2_c = Mano2Dexhand(parser, dexhand, demo_c["scene_objects"], dataset_type=dataset_type, contact_data=contact_data_c)
+            dump_c = mano2_c.fitting(
+                parser.iter,
+                demo_c["wrist_pos"],
+                demo_c["wrist_rot"],
+                demo_c["mano_joints"].view(parser.num_envs, -1, 3),
+                init_state={"wrist_pos": init_wpos, "wrist_rot6d": init_wrot6d, "dof_pos": init_dof},
+            )
+
+            for k, fi in enumerate(contact_frames):
+                out_wrist_pos[fi] = dump_c["opt_wrist_pos"][k]
+                out_wrist_rot_aa[fi] = dump_c["opt_wrist_rot"][k]
+                out_dof_pos[fi] = dump_c["opt_dof_pos"][k]
+                out_joints_pos[fi] = dump_c["opt_joints_pos"][k]
+            # 显式清理Stage2的实例，确保资源释放
+            del mano2_c
+            import gc
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        else:
+            cprint("[STAGE2] No frames with contact, skip.", "yellow")
+
+        # 检查是否全部填充（允许个别 NaN：比如 contact_data 缺帧导致分段不准时）
+        missing = np.isnan(out_wrist_pos).any(axis=-1)
+        if missing.any():
+            cprint(f"[WARN] Missing {int(missing.sum())}/{T} frames in output (still NaN).", "yellow")
+
+        to_dump = {
+            "opt_wrist_pos": out_wrist_pos,
+            "opt_wrist_rot": out_wrist_rot_aa,
+            "opt_dof_pos": out_dof_pos,
+            "opt_joints_pos": out_joints_pos,
+        }
+
+        # === Stage2 完成后按原逻辑存储 ===
+        dump_path = _get_dump_path(dataset_type, demo_data, dexhand, idx)
+        os.makedirs(os.path.dirname(dump_path), exist_ok=True)
+        with open(dump_path, "wb") as f:
+            pickle.dump(to_dump, f)
+        cprint(f"[STAGE2] Saved to: {dump_path}", "green")
+
+    def run_segmented(parser, idx):
+        """运行完整的两阶段流程（兼容旧代码）"""
+        stage = getattr(parser, "stage", "both").lower()
+        
+        if stage == "1":
+            run_stage1(parser, idx)
+        elif stage == "2":
+            stage1_pkl = getattr(parser, "stage1_pkl", None)
+            if stage1_pkl is None:
+                # 自动推断stage1 pkl路径
+                dataset_type = ManipDataFactory.dataset_type(idx)
+                demo_d = ManipDataFactory.create_data(
+                    manipdata_type=dataset_type,
+                    side=parser.side,
+                    device="cuda:0",
+                    mujoco2gym_transf=torch.eye(4, device="cuda:0"),
+                    dexhand=dexhand,
+                    verbose=False,
+                )
+                demo_data = pack_data([demo_d[idx]], dexhand)
+                dump_path = _get_dump_path(dataset_type, demo_data, dexhand, idx)
+                stage1_pkl = dump_path.replace(".pkl", "_stage1_nocontact.pkl")
+            run_stage2(parser, idx, stage1_pkl)
+        elif stage == "both":
+            # 先运行stage1
+            run_stage1(parser, idx)
+            # 然后运行stage2
+            dataset_type = ManipDataFactory.dataset_type(idx)
+            demo_d = ManipDataFactory.create_data(
+                manipdata_type=dataset_type,
+                side=parser.side,
+                device="cuda:0",
+                mujoco2gym_transf=torch.eye(4, device="cuda:0"),
+                dexhand=dexhand,
+                verbose=False,
+            )
+            demo_data = pack_data([demo_d[idx]], dexhand)
+            dump_path = _get_dump_path(dataset_type, demo_data, dexhand, idx)
+            stage1_pkl = dump_path.replace(".pkl", "_stage1_nocontact.pkl")
+            run_stage2(parser, idx, stage1_pkl)
+        else:
+            raise ValueError(f"Unknown stage: {stage}. Must be '1', '2', or 'both'")
 
     if _parser.render_pkl is not None:
         visualize_pkl(_parser.render_pkl, dexhand, headless=_parser.headless, output_dir=_parser.render_output_dir)
     else:
-        run(_parser, _parser.data_idx)
+        run_segmented(_parser, _parser.data_idx)
