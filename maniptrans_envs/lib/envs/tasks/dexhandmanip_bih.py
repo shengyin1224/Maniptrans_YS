@@ -894,9 +894,9 @@ class DexHandManipBiHEnv(VecTask):
             shape_props = self.gym.get_actor_rigid_shape_properties(env_ptr, handle)
             # 通常一个 actor 可能有多个 shape，这里假设统一设置
             for shape_prop in shape_props:
-                shape_prop.friction = 1.0
-                shape_prop.rolling_friction = 0.01 # 推荐加一点防止无限滚动
-                shape_prop.torsion_friction = 0.01 
+                shape_prop.friction = 2.0
+                shape_prop.rolling_friction = 0.05 # 推荐加一点防止无限滚动
+                shape_prop.torsion_friction = 0.05 
             self.gym.set_actor_rigid_shape_properties(env_ptr, handle, shape_props)
             
             # 5. 记录数据
@@ -3053,7 +3053,7 @@ def compute_imitation_reward(
     diff_obj_pos_dist = torch.where(dynamic_mask, diff_obj_pos_dist, torch.zeros_like(diff_obj_pos_dist))
     
     # 如果是多物体 [N, K]，我们对每个物体计算 Reward 然后 Sum
-    reward_obj_pos = torch.exp(-80 * diff_obj_pos_dist)
+    reward_obj_pos = torch.exp(-30 * diff_obj_pos_dist)
     if reward_obj_pos.dim() > 1:
         reward_obj_pos = (reward_obj_pos * dynamic_mask).sum(dim=-1) / dynamic_count
 
@@ -3189,7 +3189,7 @@ def compute_imitation_reward(
 
     failed_execute = (
         (
-            (obj_pos_err > 0.12 / 0.343 * scale_factor**3)  # 调整：0.08 → 0.15（基于实际误差分析：平均0.148m，95%分位数0.22m）
+            (obj_pos_err > 0.12 / 0.343 * scale_factor**2)  # 调整：0.08 → 0.15（基于实际误差分析：平均0.148m，95%分位数0.22m）
             | (diff_thumb_tip_pos_dist > 0.18 / 0.7 * scale_factor)  # 0.1125 → 0.18（提升60%，95%分位数0.183m）
             | (diff_index_tip_pos_dist > 0.20 / 0.7 * scale_factor)  # 0.12375 → 0.20（提升62%，95%分位数0.200m）
             | (diff_middle_tip_pos_dist > 0.18 / 0.7 * scale_factor)  # 0.1125 → 0.18（提升60%，95%分位数0.179m）
@@ -3197,7 +3197,7 @@ def compute_imitation_reward(
             | (diff_ring_tip_pos_dist > 0.22 / 0.7 * scale_factor)  # 0.135 → 0.22（提升63%，95%分位数0.215m）
             | (diff_level_1_pos_dist > 0.22 / 0.7 * scale_factor)  # 0.1575 → 0.22（提升40%，95%分位数0.220m）
             | (diff_level_2_pos_dist > 0.25 / 0.7 * scale_factor)  # 0.18 → 0.25（提升39%，基于Level 1的调整）
-            | (obj_rot_err > 180 / 0.343 * scale_factor**3)  # 上调：90° → 180°（基于实际误差分析：平均151°，95%分位数178°）
+            | (obj_rot_err > 180 / 0.343 * scale_factor**2)  # 上调：90° → 180°（基于实际误差分析：平均151°，95%分位数178°）
         )
         & (running_progress_buf >= 8)
     ) | error_buf
@@ -3214,14 +3214,14 @@ def compute_imitation_reward(
         + 0.6 * reward_ring_tip_pos
         + 0.5 * reward_level_1_pos
         + 0.3 * reward_level_2_pos
-        + 5.0 * reward_obj_pos
-        + 1.0 * reward_obj_rot
+        + 10.0 * reward_obj_pos
+        + 5.0 * reward_obj_rot
         + 0.1 * reward_eef_vel
         + 0.05 * reward_eef_ang_vel
         + 0.1 * reward_joints_vel
         + 0.1 * reward_obj_vel
         + 0.1 * reward_obj_ang_vel
-        + 30.0 * reward_finger_tip_force
+        + 4.0 * reward_finger_tip_force
         + 0.05 * reward_power
         + 0.05 * reward_wrist_power
         + 1.0 * reward_contact_violation
