@@ -1,5 +1,6 @@
 from abc import ABC, abstractmethod
 import os
+import random
 from scipy.ndimage import gaussian_filter1d
 import numpy as np
 import torch
@@ -211,20 +212,68 @@ class ManipData(Dataset, ABC):
             ).T + self.mujoco2gym_transf[:3, 3]
 
         # caculate distance
-        # obj_verts_transf 已经在上面根据是否有 scene_objects 计算好了
-        # 如果没有 scene_objects，obj_verts_transf 会在上面的 else 分支中计算
-        # 如果有 scene_objects，obj_verts_transf 会使用第一个物体的 verts_transf
-        # obj_velocity 和 obj_angular_velocity 也已经在上面处理好了
+        # 计算每帧 tips 与所有物体的距离，选择五个手指距离之和最小的物体
 
         tip_list = ["thumb_tip", "index_tip", "middle_tip", "ring_tip", "pinky_tip"]
 
         tips = torch.cat(
             [data["mano_joints"][t_k][:, None] for t_k in (tip_list)],
             dim=1,
-        )
-        tips_near, _, _, _ = self.ch_dist(tips, obj_verts_transf)
-        # tips_contact = tips_near <= 0.008**2  # ? 8mm, ch_dist return square distance
-        data["tips_distance"] = torch.sqrt(tips_near)
+        )  # [T, 5, 3]
+
+        # 如果有 scene_objects，每帧独立选择距离最小的物体
+        if "scene_objects" in data and data["scene_objects"] is not None:
+            valid_objects = [obj for obj in data["scene_objects"] if obj is not None and "verts_transf" in obj]
+            if len(valid_objects) > 0:
+                # 收集所有物体的 verts_transf
+                all_obj_verts = torch.stack([obj["verts_transf"] for obj in valid_objects], dim=0)  # [N_objects, T, N_points, 3]
+
+                # 计算每个物体每帧与 tips 的距离
+                tips_distance_all = []
+                for i, obj in enumerate(valid_objects):
+                    obj_verts_transf = obj["verts_transf"]  # [T, N_points, 3]
+                    tips_near, _, _, _ = self.ch_dist(tips, obj_verts_transf)  # tips_near: [T, 5]
+                    tips_distance = torch.sqrt(tips_near)  # [T, 5]
+                    tips_distance_all.append(tips_distance)
+
+                tips_distance_all = torch.stack(tips_distance_all, dim=0)  # [N_objects, T, 5]
+
+                # 对每帧计算五个手指距离之和
+                distance_sum_per_frame = torch.sum(tips_distance_all, dim=-1)  # [N_objects, T]
+
+                # 每帧选择距离和最小的物体
+                min_obj_indices = torch.argmin(distance_sum_per_frame, dim=0)  # [T]
+
+                # 打印所有帧的最近的物体和对应的五个手指的最小距离和最大距离
+                total_frames = tips.shape[0]
+
+                print(f"\n所有帧的tips_distance对应物体:")
+                for frame_idx in range(total_frames):
+                    obj_idx = min_obj_indices[frame_idx].item()
+                    obj_name = valid_objects[obj_idx].get('name', f'object_{obj_idx}')
+                    finger_distances = tips_distance_all[obj_idx, frame_idx]  # [5]
+                    min_distance = torch.min(finger_distances).item()
+                    max_distance = torch.max(finger_distances).item()
+                    print(f"帧{frame_idx}: 物体 '{obj_name}', 五个手指最小距离: {min_distance:.6f}, 最大距离: {max_distance:.6f}")
+
+                # 根据选择的物体索引构建最终的 tips_distance
+                data["tips_distance"] = torch.zeros_like(tips_distance_all[0])  # [T, 5]
+                for t in range(tips.shape[0]):
+                    data["tips_distance"][t] = tips_distance_all[min_obj_indices[t], t]
+            else:
+                # 没有有效的物体，使用默认方法
+                obj_verts_transf = (data["obj_trajectory"][:, :3, :3] @ rs_verts_obj.T[None]).transpose(-1, -2) + data[
+                    "obj_trajectory"
+                ][:, :3, 3][:, None]
+                tips_near, _, _, _ = self.ch_dist(tips, obj_verts_transf)
+                data["tips_distance"] = torch.sqrt(tips_near)
+        else:
+            # 如果没有 scene_objects，使用原来的方法
+            obj_verts_transf = (data["obj_trajectory"][:, :3, :3] @ rs_verts_obj.T[None]).transpose(-1, -2) + data[
+                "obj_trajectory"
+            ][:, :3, 3][:, None]
+            tips_near, _, _, _ = self.ch_dist(tips, obj_verts_transf)
+            data["tips_distance"] = torch.sqrt(tips_near)
         data["wrist_velocity"] = self.compute_velocity(
             data["wrist_pos"][:, None], 1 / (120 / self.skip), guassian_filter=True
         ).squeeze(1)

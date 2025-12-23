@@ -66,7 +66,7 @@ def soft_clamp(x, lower, upper):
 
 
 class Mano2Dexhand:
-    def __init__(self, args, dexhand, scene_objects, dataset_type="oakink2", contact_data=None):
+    def __init__(self, args, dexhand, scene_objects, dataset_type="oakink2", contact_data=None, stage = None):
         """
         args: 参数
         dexhand: 机器人手模型
@@ -340,7 +340,9 @@ class Mano2Dexhand:
                 # - 静态物体：使用 0xFFFF（全1）忽略所有碰撞
                 # - 非静态物体：使用 1，与手的 collision_filter=1 按位与结果为 1，会发生碰撞
                 # 注意：collision_filter=0 会导致无法与任何 collision_filter=0 的物体碰撞
-                collision_filter = 1 if (k < len(self.static_object_mask) and self.static_object_mask[k]) else 0
+                collision_filter = 1 if ((k < len(self.static_object_mask) and self.static_object_mask[k])) or (stage == 1) else 0
+                if obj_name == "vase":
+                    print("vase:", collision_filter)
                 handle = self.gym.create_actor(
                     env, asset, gymapi.Transform(), f"{obj_name}_{i}", i, collision_filter
                 )
@@ -804,12 +806,12 @@ class Mano2Dexhand:
                 elif "middle" in k: weight.append(10)
                 elif "ring" in k: weight.append(17)
                 elif "pinky" in k: weight.append(15)
-                elif "thumb" in k: weight.append(1)
+                elif "thumb" in k: weight.append(30)
                 else: raise ValueError
             elif "proximal" in k: weight.append(5)
             elif "intermediate" in k: weight.append(5)
             else: weight.append(1)
-        weight[0] = 25.0
+        weight[0] = 40.0
         weight = torch.tensor(weight, device=self.sim_device, dtype=torch.float32)
         
         iter = 0
@@ -1287,7 +1289,7 @@ if __name__ == "__main__":
         segments = _make_segments(has_contact)
 
         # === 额外规则：若"无 contact 段"长度 < 5 且前后都是 contact 段，则合并到 contact 段中 ===
-        MIN_NOCONTACT_KEEP = 5
+        MIN_NOCONTACT_KEEP = 1
         changed = False
         for si, (a, b, is_c) in enumerate(segments):
             seg_len = b - a + 1
@@ -1321,7 +1323,7 @@ if __name__ == "__main__":
             cprint(f"[STAGE1] Optimizing {len(no_contact_frames)}/{T} frames without contact ...", "cyan")
             demo_nc = _subset_demo_data_by_frames(demo_data, no_contact_frames)
             parser.num_envs = len(no_contact_frames)
-            mano2_nc = Mano2Dexhand(parser, dexhand, demo_nc["scene_objects"], dataset_type=dataset_type, contact_data=None)
+            mano2_nc = Mano2Dexhand(parser, dexhand, demo_nc["scene_objects"], dataset_type=dataset_type, contact_data=None, stage = 1)
             dump_nc = mano2_nc.fitting(
                 parser.iter,
                 demo_nc["wrist_pos"],
@@ -1374,6 +1376,16 @@ if __name__ == "__main__":
         out_dof_pos = stage1_data["opt_dof_pos"]
         out_joints_pos = stage1_data["opt_joints_pos"]
         T = out_wrist_pos.shape[0]
+
+        # 应用 max_frames 限制
+        if parser.max_frames is not None and parser.max_frames > 0:
+            use_frames = min(parser.max_frames, T)
+            out_wrist_pos = out_wrist_pos[:use_frames]
+            out_wrist_rot_aa = out_wrist_rot_aa[:use_frames]
+            out_dof_pos = out_dof_pos[:use_frames]
+            out_joints_pos = out_joints_pos[:use_frames]
+            cprint(f"[INFO] Limiting stage2 optimization to first {use_frames} frames (total {T})", "cyan")
+            T = use_frames
 
         dataset_type = ManipDataFactory.dataset_type(idx)
         demo_d = ManipDataFactory.create_data(
@@ -1472,30 +1484,25 @@ if __name__ == "__main__":
             init_wrot6d = np.full((len(contact_frames), 6), np.nan, dtype=np.float32)
             init_dof = np.full((len(contact_frames), n_dofs), np.nan, dtype=np.float32)
 
-            for a, b, is_c in segments:
-                if not is_c:
-                    continue
-                prev = a - 1
-                if prev < 0:
-                    continue
-                if np.isnan(out_wrist_pos[prev]).any() or np.isnan(out_dof_pos[prev]).any() or np.isnan(out_wrist_rot_aa[prev]).any():
-                    continue
-                seed_pos = out_wrist_pos[prev]
-                seed_dof = out_dof_pos[prev]
-                # aa -> rot6d
-                seed_aa_t = torch.tensor(out_wrist_rot_aa[prev][None, :], dtype=torch.float32)
-                seed_rot6d = rotmat_to_rot6d(aa_to_rotmat(seed_aa_t)).squeeze(0).cpu().numpy().astype(np.float32)
-
-                for fi in range(a, b + 1):
-                    si = frame_to_subidx.get(fi, None)
-                    if si is None:
-                        continue
-                    init_wpos[si] = seed_pos
+            # 对每个contact帧，从当前idx开始查找第一阶段结果，如果没有则向前查找最近的no contact帧
+            for fi in contact_frames:
+                si = frame_to_subidx[fi]
+                # 从当前帧开始查找
+                found_idx = None
+                for check_idx in range(fi, -1, -1):
+                    if not (np.isnan(out_wrist_pos[check_idx]).any() or np.isnan(out_dof_pos[check_idx]).any() or np.isnan(out_wrist_rot_aa[check_idx]).any()):
+                        found_idx = check_idx
+                        break
+                if found_idx is not None:
+                    init_wpos[si] = out_wrist_pos[found_idx]
+                    init_dof[si] = out_dof_pos[found_idx]
+                    # aa -> rot6d
+                    seed_aa_t = torch.tensor(out_wrist_rot_aa[found_idx][None, :], dtype=torch.float32)
+                    seed_rot6d = rotmat_to_rot6d(aa_to_rotmat(seed_aa_t)).squeeze(0).cpu().numpy().astype(np.float32)
                     init_wrot6d[si] = seed_rot6d
-                    init_dof[si] = seed_dof
 
             parser.num_envs = len(contact_frames)
-            mano2_c = Mano2Dexhand(parser, dexhand, demo_c["scene_objects"], dataset_type=dataset_type, contact_data=contact_data_c)
+            mano2_c = Mano2Dexhand(parser, dexhand, demo_c["scene_objects"], dataset_type=dataset_type, contact_data=contact_data_c, stage = 2)
             dump_c = mano2_c.fitting(
                 parser.iter,
                 demo_c["wrist_pos"],
@@ -1639,7 +1646,7 @@ if __name__ == "__main__":
             cprint(f"[STAGE1] Optimizing {len(no_contact_frames)}/{T} frames without contact ...", "cyan")
             demo_nc = _subset_demo_data_by_frames(demo_data, no_contact_frames)
             parser.num_envs = len(no_contact_frames)
-            mano2_nc = Mano2Dexhand(parser, dexhand, demo_nc["scene_objects"], dataset_type=dataset_type, contact_data=None)
+            mano2_nc = Mano2Dexhand(parser, dexhand, demo_nc["scene_objects"], dataset_type=dataset_type, contact_data=None, stage = 1)
             dump_nc = mano2_nc.fitting(
                 parser.iter,
                 demo_nc["wrist_pos"],
@@ -1704,30 +1711,25 @@ if __name__ == "__main__":
             init_wrot6d = np.full((len(contact_frames), 6), np.nan, dtype=np.float32)
             init_dof = np.full((len(contact_frames), n_dofs), np.nan, dtype=np.float32)
 
-            for a, b, is_c in segments:
-                if not is_c:
-                    continue
-                prev = a - 1
-                if prev < 0:
-                    continue
-                if np.isnan(out_wrist_pos[prev]).any() or np.isnan(out_dof_pos[prev]).any() or np.isnan(out_wrist_rot_aa[prev]).any():
-                    continue
-                seed_pos = out_wrist_pos[prev]
-                seed_dof = out_dof_pos[prev]
-                # aa -> rot6d
-                seed_aa_t = torch.tensor(out_wrist_rot_aa[prev][None, :], dtype=torch.float32)
-                seed_rot6d = rotmat_to_rot6d(aa_to_rotmat(seed_aa_t)).squeeze(0).cpu().numpy().astype(np.float32)
-
-                for fi in range(a, b + 1):
-                    si = frame_to_subidx.get(fi, None)
-                    if si is None:
-                        continue
-                    init_wpos[si] = seed_pos
+            # 对每个contact帧，从当前idx开始查找第一阶段结果，如果没有则向前查找最近的no contact帧
+            for fi in contact_frames:
+                si = frame_to_subidx[fi]
+                # 从当前帧开始查找
+                found_idx = None
+                for check_idx in range(fi, -1, -1):
+                    if not (np.isnan(out_wrist_pos[check_idx]).any() or np.isnan(out_dof_pos[check_idx]).any() or np.isnan(out_wrist_rot_aa[check_idx]).any()):
+                        found_idx = check_idx
+                        break
+                if found_idx is not None:
+                    init_wpos[si] = out_wrist_pos[found_idx]
+                    init_dof[si] = out_dof_pos[found_idx]
+                    # aa -> rot6d
+                    seed_aa_t = torch.tensor(out_wrist_rot_aa[found_idx][None, :], dtype=torch.float32)
+                    seed_rot6d = rotmat_to_rot6d(aa_to_rotmat(seed_aa_t)).squeeze(0).cpu().numpy().astype(np.float32)
                     init_wrot6d[si] = seed_rot6d
-                    init_dof[si] = seed_dof
 
             parser.num_envs = len(contact_frames)
-            mano2_c = Mano2Dexhand(parser, dexhand, demo_c["scene_objects"], dataset_type=dataset_type, contact_data=contact_data_c)
+            mano2_c = Mano2Dexhand(parser, dexhand, demo_c["scene_objects"], dataset_type=dataset_type, contact_data=contact_data_c, stage = 2)
             dump_c = mano2_c.fitting(
                 parser.iter,
                 demo_c["wrist_pos"],

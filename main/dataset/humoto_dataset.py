@@ -294,7 +294,7 @@ class HumotoDatasetBase(ManipData):
             "obj_trajectory": scene_objects_info[0]["trajectory"] if scene_objects_info else torch.eye(4, device=self.device)[None],
             # 新增字段：包含所有物体
             "scene_objects": scene_objects_info,
-            
+            "wrist_rot9": wrist_rot,
             "wrist_pos": wrist_pos,
             "wrist_rot": wrist_rot,
             "mano_joints": mano_joints,

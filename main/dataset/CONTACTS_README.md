@@ -20,14 +20,25 @@
 
 ### 1. 计算接触
 
+CUDA_VISIBLE_DEVICES=0 python main/dataset/mano2dexhand_segmented.py --data_idx transfer_vase_from_utility_cart_to_shelf_then_to_utility_cart_with_both_hands-798 --side right  --dexhand inspire --iter 15000 --contact_data /home/zxlei/data/humanoid/Maniptrans_YS/data/contacts_right/humoto/contacts_transfer_vase_from_utility_cart_to_shelf_then_to_utility_cart_with_both_hands-798.pkl --draw_all_lines 0 --stage 1 --headless
+
+CUDA_VISIBLE_DEVICES=1 python main/dataset/mano2dexhand_segmented.py --data_idx transfer_vase_from_utility_cart_to_shelf_then_to_utility_cart_with_both_hands-798 --side left  --dexhand inspire --iter 15000 --contact_data /home/zxlei/data/humanoid/Maniptrans_YS/data/contacts_left/humoto/contacts_transfer_vase_from_utility_cart_to_shelf_then_to_utility_cart_with_both_hands-798.pkl --draw_all_lines 0 --stage 1 --headless
+
 基本使用：
 ```bash
 python main/dataset/compute_hand_object_contacts.py \
-    --data_idx "baking_with_spatula_mixing_bowl_and_scooping_to_tray-244" \
+    --data_idx "transfer_vase_from_utility_cart_to_shelf_then_to_utility_cart_with_both_hands-798" \
     --dexhand "inspire" \
     --side "right" \
-    --threshold 0.007 \
+    --threshold 0.005 \
     --output_dir "data/contacts_right"
+
+python main/dataset/compute_hand_object_contacts.py \
+    --data_idx "transfer_vase_from_utility_cart_to_shelf_then_to_utility_cart_with_both_hands-798" \
+    --dexhand "inspire" \
+    --side "left" \
+    --threshold 0.005 \
+    --output_dir "data/contacts_left"
 ```
 
 参数说明：

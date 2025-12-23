@@ -1757,7 +1757,7 @@ class DexHandManipBiHEnv(VecTask):
                 if level_2_failed:
                     failure_reasons.append(f"  - Level 2 关节位置误差过大: {level_2_dist:.4f} > {level_2_threshold:.4f} m")
                 if contact_violation:
-                    failure_reasons.append(f"  - 接触违规: 手指距离过近但未检测到接触")
+                    failure_reasons.append(f"  - 接触惩罚: 手指距离过近但未检测到接触")
                 if error_eef_vel:
                     failure_reasons.append(f"  - 手腕线速度异常: {eef_vel_norm:.2f} > 100 m/s")
                 if error_eef_ang_vel:
@@ -2958,7 +2958,6 @@ def ensure_multi_object(tensor: Tensor, num_envs: int, feature_dim: int) -> Tens
     return tensor
 
 
-@torch.jit.script
 def compute_imitation_reward(
     reset_buf: Tensor,
     progress_buf: Tensor,
@@ -3010,7 +3009,7 @@ def compute_imitation_reward(
     target_joints_vel = target_states["joints_vel"]
     diff_joints_vel = target_joints_vel - joints_vel
 
-    reward_eef_pos = torch.exp(-40 * diff_eef_pos_dist)
+    reward_eef_pos = torch.exp(-10 * diff_eef_pos_dist)
     reward_thumb_tip_pos = torch.exp(-100 * diff_thumb_tip_pos_dist)
     reward_index_tip_pos = torch.exp(-90 * diff_index_tip_pos_dist)
     reward_middle_tip_pos = torch.exp(-80 * diff_middle_tip_pos_dist)
@@ -3027,7 +3026,7 @@ def compute_imitation_reward(
 
     diff_eef_rot = quat_mul(target_eef_quat, quat_conjugate(current_eef_quat))
     diff_eef_rot_angle = quat_to_angle_axis(diff_eef_rot)[0]
-    reward_eef_rot = torch.exp(-1 * (diff_eef_rot_angle).abs())
+    reward_eef_rot = torch.exp(-0.8 * (diff_eef_rot_angle).abs())
 
     num_envs = current_eef_pos.shape[0]
 
@@ -3199,10 +3198,12 @@ def compute_imitation_reward(
             | (diff_level_1_pos_dist > 0.22 / 0.7 * scale_factor)  # 0.1575 → 0.22（提升40%，95%分位数0.220m）
             | (diff_level_2_pos_dist > 0.25 / 0.7 * scale_factor)  # 0.18 → 0.25（提升39%，基于Level 1的调整）
             | (obj_rot_err > 180 / 0.343 * scale_factor**3)  # 上调：90° → 180°（基于实际误差分析：平均151°，95%分位数178°）
-            | contact_violation
         )
         & (running_progress_buf >= 8)
     ) | error_buf
+    # contact_violation penalty: -1 if violation occurs, 0 otherwise (scale=1)
+    reward_contact_violation = torch.where(contact_violation, -1.0, 0.0)
+
     reward_execute = (
         1 * reward_eef_pos  # 从0.1增加到0.3，提高wrist位置跟踪的权重
         + 1 * reward_eef_rot
@@ -3223,6 +3224,7 @@ def compute_imitation_reward(
         + 30.0 * reward_finger_tip_force
         + 0.05 * reward_power
         + 0.05 * reward_wrist_power
+        + 1.0 * reward_contact_violation
     )
 
     succeeded = (
@@ -3255,6 +3257,7 @@ def compute_imitation_reward(
         "reward_power": reward_power,
         "reward_wrist_power": reward_wrist_power,
         "reward_finger_tip_force": reward_finger_tip_force,
+        "reward_contact_violation": reward_contact_violation,
     }
 
     return reward_execute, reset_buf, succeeded, failed_execute, reward_dict, error_buf
