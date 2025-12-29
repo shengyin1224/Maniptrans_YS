@@ -315,6 +315,34 @@ class VecTask(Env):
         for env_id in range(self.num_envs):
             self.extern_actor_params[env_id] = None
 
+        # === [新增] 自适应重力与摩擦力调整相关变量 ===
+        self.current_adaptive_scale_factor = 1.0  # 当前的scale factor，初始为1.0
+
+        # 从配置文件读取重力参数
+        gravity_config = self.cfg.get("task", {}).get("randomization_params", {}).get("sim_params", {}).get("gravity", {})
+        gravity_external = gravity_config.get("external_sample", {})
+        self.gravity_end_factor = gravity_config.get("end_factor", 0.4)  # 难度系数的终止值
+
+        self.gravity_base_value = self.sim_params.gravity.z  # 使用配置中的基础重力值 (-9.81)
+        self.gravity_init_value = gravity_external.get("init_value", 0.0)  # 重力初始值（通常为0）
+        self.gravity_end_value = self.gravity_base_value  # 最终重力值 = base_value（最难）
+
+        # 从配置文件读取摩擦力参数（支持多种可能的物体名称）
+        actor_params = self.cfg.get("task", {}).get("randomization_params", {}).get("actor_params", {})
+        friction_config = {}
+        for obj_key in ["manip_obj", "manip_obj_rh", "manip_obj_lh"]:
+            if obj_key in actor_params:
+                potential_config = actor_params[obj_key].get("rigid_shape_properties", {}).get("friction", {})
+                if potential_config:
+                    friction_config = potential_config
+                    break
+        
+        friction_external = friction_config.get("external_sample", {})
+        self.friction_end_factor = friction_config.get("end_factor", 0.4)  # 难度系数的终止值
+        self.friction_init_value = friction_external.get("init_value", 3.0)  # 摩擦力初始值
+        self.friction_end_value = friction_external.get("lower_bound", 1.0)  # 最终摩擦力值 = min_value（最难）
+        self.friction_min_value = friction_external.get("lower_bound", 1.0)  # 摩擦力最小值限制
+
         self.camera_handlers = [] if (display or record) else None
         self.camera_obs = [] if (display or record) else None
 
@@ -900,6 +928,32 @@ class VecTask(Env):
                     external_sample,
                 )
 
+            # === [新增] 自适应重力调整逻辑 ===
+            # 检查是否有adaptive scale factor的变化需要调整重力
+            if hasattr(self, 'current_adaptive_scale_factor'):
+                # 计算基于scale factor的重力调整
+                # scale factor越小（难度越高），重力越接近最终值
+                # 从1.0 (最容易，重力=init_value) 到 end_factor (最难，重力=end_value)
+                # 如果scale_factor < end_factor，则直接使用最难的重力
+
+                if self.current_adaptive_scale_factor >= self.gravity_end_factor:
+                    # 正常线性过渡阶段
+                    scale_range = 1.0 - self.gravity_end_factor  # 从1.0到end_factor
+                    normalized_scale = (1.0 - self.current_adaptive_scale_factor) / scale_range  # 0到1之间
+                    target_gravity = self.gravity_init_value + normalized_scale * (self.gravity_end_value - self.gravity_init_value)
+                else:
+                    # scale_factor < end_factor，直接使用最难的重力
+                    target_gravity = self.gravity_end_value
+
+                # 限制在合理范围内
+                target_gravity = max(min(self.gravity_init_value, self.gravity_end_value), min(target_gravity, max(self.gravity_init_value, self.gravity_end_value)))
+
+                # 应用重力调整
+                if abs(prop.gravity.z - target_gravity) > 1e-3:  # 有显著差异时才调整
+                    # print(f"[GRAVITY ADAPTIVE] Scale factor: {self.current_adaptive_scale_factor:.3f}, "
+                    #       f"Adjusting gravity: {prop.gravity.z:.2f} -> {target_gravity:.2f} m/s²")
+                    prop.gravity.z = target_gravity
+
             self.gym.set_sim_params(self.sim, prop)
 
         # If self.actor_params_generator is initialized: use it to
@@ -916,6 +970,62 @@ class VecTask(Env):
 
         # randomise all attributes of each actor (hand, cube etc..)
         # actor_properties are (stiffness, damping etc..)
+
+        # === [新增] 自适应摩擦力调整：对所有环境中的所有actor进行调整 ===
+        if hasattr(self, 'current_adaptive_scale_factor') and do_nonenv_randomize:
+            # 遍历所有需要调整的环境
+            for env_id in env_ids:
+                env = self.envs[env_id]
+
+                # 获取环境中所有的actor数量
+                num_actors = self.gym.get_actor_count(env)
+
+                # 遍历环境中的每个actor
+                for actor_idx in range(num_actors):
+                    # 获取actor的handle
+                    handle = self.gym.get_actor_handle(env, actor_idx)
+
+                    # 获取actor名称（用于调试）
+                    actor_name = self.gym.get_actor_name(env, handle)
+
+                    # 只对物体actor进行摩擦力调整（跳过hand等）
+                    # 所有名字里没有hand的都当作object
+                    if "hand" not in actor_name:
+                        try:
+                            # 获取rigid_shape_properties
+                            prop = self.gym.get_actor_rigid_shape_properties(env, handle)
+
+                            # 对每个shape的friction进行调整
+                            for shape_idx, shape_prop in enumerate(prop):
+                                # 计算目标摩擦力：scale_factor越小（难度越高），摩擦力越接近最终值
+                                # 从1.0 (最容易，摩擦力=init_value) 到 end_factor (最难，摩擦力=end_value)
+                                # 如果scale_factor < end_factor，则直接使用最难的摩擦力
+
+                                if self.current_adaptive_scale_factor >= self.friction_end_factor:
+                                    # 正常线性过渡阶段
+                                    scale_range = 1.0 - self.friction_end_factor  # 从1.0到end_factor
+                                    normalized_scale = (1.0 - self.current_adaptive_scale_factor) / scale_range  # 0到1之间
+                                    target_friction = self.friction_init_value + normalized_scale * (self.friction_end_value - self.friction_init_value)
+                                else:
+                                    # scale_factor < end_factor，直接使用最难的摩擦力
+                                    target_friction = self.friction_end_value
+
+                                # 限制在合理范围内（不能低于lower_bound）
+                                target_friction = max(self.friction_min_value, min(target_friction, self.friction_init_value))
+
+                                # 应用摩擦力调整
+                                if abs(shape_prop.friction - target_friction) > 1e-3:  # 有显著差异时才调整
+                                    # print(f"[FRICTION ADAPTIVE] Actor: {actor_name}, Scale factor: {self.current_adaptive_scale_factor:.3f}, "
+                                    #       f"Adjusting friction: {shape_prop.friction:.2f} -> {target_friction:.2f}")
+                                    shape_prop.friction = target_friction
+
+                            # 设置回actor
+                            self.gym.set_actor_rigid_shape_properties(env, handle, prop)
+
+                        except Exception as e:
+                            # 如果获取属性失败，跳过这个actor
+                            print(f"[WARNING] Failed to adjust friction for actor {actor_name}: {e}")
+                            continue
 
         # Loop over actors, then loop over envs, then loop over their props
         # and lastly loop over the ranges of the params
@@ -938,7 +1048,17 @@ class VecTask(Env):
                 #          prop_attrs:
                 #               {'damping': {'range': [0.3, 3.0], 'operation': 'scaling', 'distribution': 'loguniform'}
                 #               {'stiffness': {'range': [0.75, 1.5], 'operation': 'scaling', 'distribution': 'loguniform'}
+
                 for prop_name, prop_attrs in actor_properties.items():
+
+                    # [新增] 防止标准 DR 覆盖我们自定义的摩擦力逻辑
+                    if prop_name == "rigid_shape_properties" and hasattr(self, 'current_adaptive_scale_factor'):
+                        # 如果当前正在使用自适应摩擦力，跳过标准摩擦力随机化
+                        if "friction" in prop_attrs:
+                            continue
+                            del prop_attrs["friction"]
+                        
+
                     if prop_name == "color":
                         #     num_bodies = self.gym.get_actor_rigid_body_count(env, handle)
                         #     for n in range(num_bodies):
@@ -1002,6 +1122,7 @@ class VecTask(Env):
                                         self.last_step,
                                         external_sample,
                                     )
+
                                 else:
                                     set_random_properties = False
                     else:
@@ -1055,3 +1176,11 @@ class VecTask(Env):
                         raise Exception("Invalid extern_sample size")
 
         self.first_randomization = False
+
+    def set_adaptive_scale_factor(self, scale_factor):
+        """设置当前的adaptive scale factor
+
+        Args:
+            scale_factor: 当前的scale factor值
+        """
+        self.current_adaptive_scale_factor = scale_factor

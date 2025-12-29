@@ -510,7 +510,10 @@ class MyBasePlayer(object):
                 if self.print_stats:
                     cur_rewards_done = cur_rewards / done_count
                     cur_steps_done = cur_steps / done_count
+                    success_count = prev_success_buf[done_indices].sum().item()
                     print(f"reward: {cur_rewards_done:.2f} steps: {cur_steps_done:.1f}")
+                    if success_count > 0:
+                        print("success")
 
     def get_batch_size(self, obses, batch_size):
         obs_shape = self.obs_shape
