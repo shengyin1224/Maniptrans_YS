@@ -663,7 +663,26 @@ class Mano2Dexhand:
         
         # 转换 Target 到 Gym 坐标系
         target_wrist_pos = (self.mujoco2gym_transf[:3, :3] @ target_wrist_pos.T).T + self.mujoco2gym_transf[:3, 3]
+        origin_wrist_rot = aa_to_rotmat(target_wrist_rot)
         target_wrist_rot = self.mujoco2gym_transf[:3, :3] @ aa_to_rotmat(target_wrist_rot)
+
+        # [DEBUG] 读取第177到186帧的右手值
+        if self.num_envs > 186:
+            print(f"\n{'='*20} [DEBUG: Right Hand Frames 177-186] {'='*20}")
+            for i in range(145, 155):
+                p = target_wrist_pos[i].detach().cpu().numpy()
+                # 原始 Gym 坐标系下的 AA
+                r_aa = rotmat_to_aa(target_wrist_rot[i].unsqueeze(0)).squeeze(0).detach().cpu().numpy()
+                
+                # 额外再乘一次 mujoco2gym_transf 的旋转部分
+                r_double = self.mujoco2gym_transf[:3, :3] @ origin_wrist_rot[i]
+                r_aa_double = rotmat_to_aa(r_double.unsqueeze(0)).squeeze(0).detach().cpu().numpy()
+                
+                print(f"  Batch Idx {i}:")
+                print(f"    - pos: {p}")
+                print(f"    - rot (gym aa):        {r_aa}")
+                print(f"    - rot (double gym aa): {r_aa_double}")
+            print(f"{'='*60}\n")
         target_mano_joints = target_mano_joints.view(-1, 3)
         target_mano_joints = (self.mujoco2gym_transf[:3, :3] @ target_mano_joints.T).T + self.mujoco2gym_transf[:3, 3]
         target_mano_joints = target_mano_joints.view(self.num_envs, -1, 3)
@@ -769,6 +788,8 @@ class Mano2Dexhand:
         opt_wrist_rot = torch.tensor(
             rotmat_to_rot6d(target_wrist_rot), device=self.sim_device, dtype=torch.float32, requires_grad=True
         )
+        #origin_opt_wrist_rot = torch.tensor(init_state.get("wrist_rot6d"), device=self.sim_device, dtype=torch.float32)
+        origin_opt_wrist_rot = opt_wrist_rot.clone()
         opt_dof_pos = torch.tensor(
             self.dexhand_default_dof_pos["pos"][None].repeat(self.num_envs, axis=0),
             device=self.sim_device,
@@ -948,6 +969,13 @@ class Mano2Dexhand:
 
             if iter % 100 == 0:
                 cprint(f"{iter} {loss.item()}", "green")
+                # [DEBUG] 同时打印第145帧的 target r_aa 和当前优化的 opt_wrist_rot
+                if self.num_envs > 17:
+                    t_aa = rot6d_to_aa(origin_opt_wrist_rot[16:17]).squeeze(0).detach().cpu().numpy()
+                    o_aa = rot6d_to_aa(opt_wrist_rot[16:17]).squeeze(0).detach().cpu().numpy()
+                    print(f"  [Frame 145] Target r_aa: {t_aa}")
+                    print(f"  [Frame 145] Opt r_aa:    {o_aa}")
+                
                 if iter > 1 and past_loss - loss.item() < 1e-5:
                     break
                 past_loss = loss.item()
@@ -1051,10 +1079,22 @@ if __name__ == "__main__":
                 "help": "Start optimizing other joints only when wrist rotation error <= this (degrees)",
             },
             {
+                "name": "--start_frame",
+                "type": int,
+                "default": 0,
+                "help": "Start frame index for optimization",
+            },
+            {
+                "name": "--end_frame",
+                "type": int,
+                "default": -1,
+                "help": "End frame index for optimization; -1 means use all remaining frames",
+            },
+            {
                 "name": "--max_frames",
                 "type": int,
                 "default": -1,
-                "help": "Optimize only the first N frames; -1 means use all frames",
+                "help": "Limit the number of frames to optimize (legacy, use end_frame instead)",
             },
             {
                 "name": "--draw_all_lines",
@@ -1235,21 +1275,23 @@ if __name__ == "__main__":
         demo_data = pack_data([demo_d[idx]], dexhand)
 
         total_frames = demo_data["mano_joints"].shape[0]
-        if parser.max_frames is not None and parser.max_frames > 0:
-            use_frames = min(parser.max_frames, total_frames)
-            demo_data["wrist_pos"] = demo_data["wrist_pos"][:use_frames]
-            demo_data["wrist_rot"] = demo_data["wrist_rot"][:use_frames]
-            demo_data["mano_joints"] = demo_data["mano_joints"][:use_frames]
-            for obj in demo_data["scene_objects"]:
-                if "trajectory" in obj:
-                    obj["trajectory"] = obj["trajectory"][:use_frames]
-                if "velocity" in obj:
-                    obj["velocity"] = obj["velocity"][:use_frames]
-                if "angular_velocity" in obj:
-                    obj["angular_velocity"] = obj["angular_velocity"][:use_frames]
-            cprint(f"[INFO] Limiting optimization to first {use_frames} frames (total {total_frames})", "cyan")
+        
+        # Determine optimization range
+        start_f = max(0, parser.start_frame)
+        if parser.max_frames != -1:
+            end_f = min(start_f + parser.max_frames, total_frames)
+        else:
+            end_f = parser.end_frame if parser.end_frame != -1 else total_frames
+        end_f = min(end_f, total_frames)
+        
+        optimized_indices = list(range(start_f, end_f))
+        if len(optimized_indices) == 0:
+            cprint(f"[ERROR] No frames to optimize in range [{start_f}, {end_f})", "red")
+            return
+            
+        cprint(f"[INFO] Optimizing frames {start_f} to {end_f} (total {len(optimized_indices)}/{total_frames} frames)", "cyan")
 
-        T = demo_data["mano_joints"].shape[0]
+        T = total_frames
 
         # === 加载接触数据（如果提供） ===
         contact_data_full = None
@@ -1307,8 +1349,7 @@ if __name__ == "__main__":
 
         cprint("[SEG] Segments (start,end,has_contact): " + ", ".join([f"({a}-{b},{'C' if c else 'N'})" for a, b, c in segments]), "cyan")
 
-        no_contact_frames = [i for i in range(T) if not has_contact[i]]
-        contact_frames = [i for i in range(T) if has_contact[i]]
+        no_contact_frames = [i for i in optimized_indices if not has_contact[i]]
 
         # 结果缓存（最终拼成完整 T 帧输出）
         n_dofs = dexhand.n_dofs
@@ -1375,17 +1416,23 @@ if __name__ == "__main__":
         out_wrist_rot_aa = stage1_data["opt_wrist_rot"]
         out_dof_pos = stage1_data["opt_dof_pos"]
         out_joints_pos = stage1_data["opt_joints_pos"]
-        T = out_wrist_pos.shape[0]
+        total_frames = out_wrist_pos.shape[0]
 
-        # 应用 max_frames 限制
-        if parser.max_frames is not None and parser.max_frames > 0:
-            use_frames = min(parser.max_frames, T)
-            out_wrist_pos = out_wrist_pos[:use_frames]
-            out_wrist_rot_aa = out_wrist_rot_aa[:use_frames]
-            out_dof_pos = out_dof_pos[:use_frames]
-            out_joints_pos = out_joints_pos[:use_frames]
-            cprint(f"[INFO] Limiting stage2 optimization to first {use_frames} frames (total {T})", "cyan")
-            T = use_frames
+        # Determine optimization range
+        start_f = max(0, parser.start_frame)
+        if parser.max_frames != -1:
+            end_f = min(start_f + parser.max_frames, total_frames)
+        else:
+            end_f = parser.end_frame if parser.end_frame != -1 else total_frames
+        end_f = min(end_f, total_frames)
+        
+        optimized_indices = list(range(start_f, end_f))
+        if len(optimized_indices) == 0:
+            cprint(f"[ERROR] No frames to optimize in range [{start_f}, {end_f})", "red")
+            return
+            
+        cprint(f"[INFO] Optimizing frames {start_f} to {end_f} (total {len(optimized_indices)}/{total_frames} frames)", "cyan")
+        T = total_frames
 
         dataset_type = ManipDataFactory.dataset_type(idx)
         demo_d = ManipDataFactory.create_data(
@@ -1399,19 +1446,10 @@ if __name__ == "__main__":
 
         demo_data = pack_data([demo_d[idx]], dexhand)
 
-        total_frames = demo_data["mano_joints"].shape[0]
-        if T != total_frames:
-            cprint(f"[WARN] Stage1 has {T} frames but demo has {total_frames} frames. Truncating demo to match.", "yellow")
-            demo_data["wrist_pos"] = demo_data["wrist_pos"][:T]
-            demo_data["wrist_rot"] = demo_data["wrist_rot"][:T]
-            demo_data["mano_joints"] = demo_data["mano_joints"][:T]
-            for obj in demo_data["scene_objects"]:
-                if "trajectory" in obj:
-                    obj["trajectory"] = obj["trajectory"][:T]
-                if "velocity" in obj:
-                    obj["velocity"] = obj["velocity"][:T]
-                if "angular_velocity" in obj:
-                    obj["angular_velocity"] = obj["angular_velocity"][:T]
+        # Ensure demo_data has enough frames (should match stage1_data length T)
+        demo_total_frames = demo_data["mano_joints"].shape[0]
+        if T != demo_total_frames:
+            cprint(f"[WARN] Stage1 has {T} frames but demo has {demo_total_frames} frames.", "yellow")
 
         # === 加载接触数据（如果提供） ===
         contact_data_full = None
@@ -1469,7 +1507,7 @@ if __name__ == "__main__":
 
         cprint("[SEG] Segments (start,end,has_contact): " + ", ".join([f"({a}-{b},{'C' if c else 'N'})" for a, b, c in segments]), "cyan")
 
-        contact_frames = [i for i in range(T) if has_contact[i]]
+        contact_frames = [i for i in optimized_indices if has_contact[i]]
 
         # === 优化"有 contact"的帧：初始状态来自该段上一帧的最终结果 ===
         if len(contact_frames) > 0:
@@ -1480,233 +1518,6 @@ if __name__ == "__main__":
 
             frame_to_subidx = {fi: si for si, fi in enumerate(contact_frames)}
             n_dofs = dexhand.n_dofs
-            init_wpos = np.full((len(contact_frames), 3), np.nan, dtype=np.float32)
-            init_wrot6d = np.full((len(contact_frames), 6), np.nan, dtype=np.float32)
-            init_dof = np.full((len(contact_frames), n_dofs), np.nan, dtype=np.float32)
-
-            # 对每个contact帧，从当前idx开始查找第一阶段结果，如果没有则向前查找最近的no contact帧
-            for fi in contact_frames:
-                si = frame_to_subidx[fi]
-                # 从当前帧开始查找
-                found_idx = None
-                for check_idx in range(fi, -1, -1):
-                    if not (np.isnan(out_wrist_pos[check_idx]).any() or np.isnan(out_dof_pos[check_idx]).any() or np.isnan(out_wrist_rot_aa[check_idx]).any()):
-                        found_idx = check_idx
-                        break
-                if found_idx is not None:
-                    init_wpos[si] = out_wrist_pos[found_idx]
-                    init_dof[si] = out_dof_pos[found_idx]
-                    # aa -> rot6d
-                    seed_aa_t = torch.tensor(out_wrist_rot_aa[found_idx][None, :], dtype=torch.float32)
-                    seed_rot6d = rotmat_to_rot6d(aa_to_rotmat(seed_aa_t)).squeeze(0).cpu().numpy().astype(np.float32)
-                    init_wrot6d[si] = seed_rot6d
-
-            parser.num_envs = len(contact_frames)
-            mano2_c = Mano2Dexhand(parser, dexhand, demo_c["scene_objects"], dataset_type=dataset_type, contact_data=contact_data_c, stage = 2)
-            dump_c = mano2_c.fitting(
-                parser.iter,
-                demo_c["wrist_pos"],
-                demo_c["wrist_rot"],
-                demo_c["mano_joints"].view(parser.num_envs, -1, 3),
-                init_state={"wrist_pos": init_wpos, "wrist_rot6d": init_wrot6d, "dof_pos": init_dof},
-            )
-
-            for k, fi in enumerate(contact_frames):
-                out_wrist_pos[fi] = dump_c["opt_wrist_pos"][k]
-                out_wrist_rot_aa[fi] = dump_c["opt_wrist_rot"][k]
-                out_dof_pos[fi] = dump_c["opt_dof_pos"][k]
-                out_joints_pos[fi] = dump_c["opt_joints_pos"][k]
-            # 显式清理Stage2的实例，确保资源释放
-            del mano2_c
-            import gc
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        else:
-            cprint("[STAGE2] No frames with contact, skip.", "yellow")
-
-        # 检查是否全部填充（允许个别 NaN：比如 contact_data 缺帧导致分段不准时）
-        missing = np.isnan(out_wrist_pos).any(axis=-1)
-        if missing.any():
-            cprint(f"[WARN] Missing {int(missing.sum())}/{T} frames in output (still NaN).", "yellow")
-
-        to_dump = {
-            "opt_wrist_pos": out_wrist_pos,
-            "opt_wrist_rot": out_wrist_rot_aa,
-            "opt_dof_pos": out_dof_pos,
-            "opt_joints_pos": out_joints_pos,
-        }
-
-        # === Stage2 完成后按原逻辑存储 ===
-        dump_path = _get_dump_path(dataset_type, demo_data, dexhand, idx)
-        os.makedirs(os.path.dirname(dump_path), exist_ok=True)
-        with open(dump_path, "wb") as f:
-            pickle.dump(to_dump, f)
-        cprint(f"[STAGE2] Saved to: {dump_path}", "green")
-
-    def run_segmented(parser, idx):
-        dataset_type = ManipDataFactory.dataset_type(idx)
-        demo_d = ManipDataFactory.create_data(
-            manipdata_type=dataset_type,
-            side=parser.side,
-            device="cuda:0",
-            mujoco2gym_transf=torch.eye(4, device="cuda:0"),
-            dexhand=dexhand,
-            verbose=False,
-        )
-
-        demo_data = pack_data([demo_d[idx]], dexhand)
-
-        total_frames = demo_data["mano_joints"].shape[0]
-        if parser.max_frames is not None and parser.max_frames > 0:
-            use_frames = min(parser.max_frames, total_frames)
-            demo_data["wrist_pos"] = demo_data["wrist_pos"][:use_frames]
-            demo_data["wrist_rot"] = demo_data["wrist_rot"][:use_frames]
-            demo_data["mano_joints"] = demo_data["mano_joints"][:use_frames]
-            for obj in demo_data["scene_objects"]:
-                if "trajectory" in obj:
-                    obj["trajectory"] = obj["trajectory"][:use_frames]
-                if "velocity" in obj:
-                    obj["velocity"] = obj["velocity"][:use_frames]
-                if "angular_velocity" in obj:
-                    obj["angular_velocity"] = obj["angular_velocity"][:use_frames]
-            cprint(f"[INFO] Limiting optimization to first {use_frames} frames (total {total_frames})", "cyan")
-
-        T = demo_data["mano_joints"].shape[0]
-
-        # === 加载接触数据（如果提供） ===
-        contact_data_full = None
-        if parser.contact_data is not None and os.path.exists(parser.contact_data):
-            cprint(f"[CONTACT] Loading contact data from: {parser.contact_data}", "cyan")
-            with open(parser.contact_data, "rb") as f:
-                contact_data_full = pickle.load(f)
-            cprint(f"[CONTACT] Loaded {contact_data_full.get('num_frames', len(contact_data_full.get('frames', [])))} frames", "green")
-
-        # === 1) 从第0帧开始按是否有 contact 分段 ===
-        has_contact = [False] * T
-        if contact_data_full is not None:
-            frames = contact_data_full.get("frames", [])
-            for i in range(min(T, len(frames))):
-                fr = frames[i]
-                flag = False
-                for obj in fr.get("objects", []):
-                    if obj.get("num_contacts", 0) > 0 or len(obj.get("contacts", [])) > 0:
-                        flag = True
-                        break
-                has_contact[i] = flag
-
-        def _make_segments(flags):
-            segs = []
-            if T > 0:
-                cur_flag = flags[0]
-                s0 = 0
-                for ii in range(1, T):
-                    if flags[ii] != cur_flag:
-                        segs.append((s0, ii - 1, cur_flag))
-                        s0 = ii
-                        cur_flag = flags[ii]
-                segs.append((s0, T - 1, cur_flag))
-            return segs
-
-        # 初始分段
-        segments = _make_segments(has_contact)
-
-        # === 额外规则：若“无 contact 段”长度 < 5 且前后都是 contact 段，则合并到 contact 段中 ===
-        MIN_NOCONTACT_KEEP = 5
-        changed = False
-        for si, (a, b, is_c) in enumerate(segments):
-            seg_len = b - a + 1
-            if (not is_c) and seg_len < MIN_NOCONTACT_KEEP and 0 < si < (len(segments) - 1):
-                prev_is_c = segments[si - 1][2]
-                next_is_c = segments[si + 1][2]
-                if prev_is_c and next_is_c:
-                    for fi in range(a, b + 1):
-                        has_contact[fi] = True
-                    changed = True
-
-        # 重新分段（若发生合并）
-        if changed:
-            segments = _make_segments(has_contact)
-
-        cprint("[SEG] Segments (start,end,has_contact): " + ", ".join([f"({a}-{b},{'C' if c else 'N'})" for a, b, c in segments]), "cyan")
-
-        no_contact_frames = [i for i in range(T) if not has_contact[i]]
-        contact_frames = [i for i in range(T) if has_contact[i]]
-
-        # 结果缓存（最终拼成完整 T 帧输出）
-        n_dofs = dexhand.n_dofs
-        n_joints = len(dexhand.body_names)
-        out_wrist_pos = np.full((T, 3), np.nan, dtype=np.float32)
-        out_wrist_rot_aa = np.full((T, 3), np.nan, dtype=np.float32)
-        out_dof_pos = np.full((T, n_dofs), np.nan, dtype=np.float32)
-        out_joints_pos = np.full((T, n_joints, 3), np.nan, dtype=np.float32)
-
-        # === 2) 先优化“无 contact”的帧（可一次性批量） ===
-        if len(no_contact_frames) > 0:
-            cprint(f"[STAGE1] Optimizing {len(no_contact_frames)}/{T} frames without contact ...", "cyan")
-            demo_nc = _subset_demo_data_by_frames(demo_data, no_contact_frames)
-            parser.num_envs = len(no_contact_frames)
-            mano2_nc = Mano2Dexhand(parser, dexhand, demo_nc["scene_objects"], dataset_type=dataset_type, contact_data=None, stage = 1)
-            dump_nc = mano2_nc.fitting(
-                parser.iter,
-                demo_nc["wrist_pos"],
-                demo_nc["wrist_rot"],
-                demo_nc["mano_joints"].view(parser.num_envs, -1, 3),
-                init_state=None,
-            )
-            for k, fi in enumerate(no_contact_frames):
-                out_wrist_pos[fi] = dump_nc["opt_wrist_pos"][k]
-                out_wrist_rot_aa[fi] = dump_nc["opt_wrist_rot"][k]
-                out_dof_pos[fi] = dump_nc["opt_dof_pos"][k]
-                out_joints_pos[fi] = dump_nc["opt_joints_pos"][k]
-            # 显式清理Stage1的实例，确保资源释放
-            del mano2_nc
-            import gc
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
-            # 按你的第2点：Stage1 完成后先保存一次（格式同原输出）
-            if dataset_type == "oakink2":
-                dump_path = f"data/retargeting/OakInk-v2/mano2{str(dexhand)}/{os.path.split(demo_data['data_path'][0])[-1].replace('.pkl', f'@{idx[-1]}.pkl')}"
-            elif dataset_type == "humoto":
-                filename = os.path.basename(demo_data["data_path"][0])
-                dump_path = f"data/retargeting/Humoto/mano2{str(dexhand)}/{filename}"
-            elif dataset_type == "favor":
-                dump_path = f"data/retargeting/favor_pass1/mano2{str(dexhand)}/{os.path.split(demo_data['data_path'][0])[-1]}"
-            elif dataset_type == "grabdemo":
-                dump_path = f"data/retargeting/grab_demo/mano2{str(dexhand)}/{os.path.split(demo_data['data_path'][0])[-1].replace('.npy', '.pkl')}"
-            elif dataset_type == "oakink2_mirrored":
-                dump_path = f"data/retargeting/OakInk-v2-mirrored/mano2{str(dexhand)}/{os.path.split(demo_data['data_path'][0])[-1].replace('.pkl', f'@{idx[-1]}.pkl')}"
-            elif dataset_type == "favor_mirrored":
-                dump_path = f"data/retargeting/favor_pass1-mirrored/mano2{str(dexhand)}/{os.path.split(demo_data['data_path'][0])[-1]}"
-            else:
-                raise ValueError("Unsupported dataset type")
-
-            stage1_path = dump_path.replace(".pkl", "_stage1_nocontact.pkl")
-            os.makedirs(os.path.dirname(stage1_path), exist_ok=True)
-            with open(stage1_path, "wb") as f:
-                pickle.dump(
-                    {
-                        "opt_wrist_pos": out_wrist_pos,
-                        "opt_wrist_rot": out_wrist_rot_aa,
-                        "opt_dof_pos": out_dof_pos,
-                        "opt_joints_pos": out_joints_pos,
-                    },
-                    f,
-                )
-            cprint(f"[STAGE1] Saved intermediate to: {stage1_path}", "green")
-        else:
-            cprint("[STAGE1] No frames without contact, skip.", "yellow")
-
-        # === 3) 再优化“有 contact”的帧：初始状态来自该段上一帧的最终结果 ===
-        if len(contact_frames) > 0:
-            cprint(f"[STAGE2] Optimizing {len(contact_frames)}/{T} frames with contact (seeded by previous segment end) ...", "cyan")
-
-            demo_c = _subset_demo_data_by_frames(demo_data, contact_frames)
-            contact_data_c = _subset_contact_data_by_frames(contact_data_full, contact_frames)
-
-            frame_to_subidx = {fi: si for si, fi in enumerate(contact_frames)}
             init_wpos = np.full((len(contact_frames), 3), np.nan, dtype=np.float32)
             init_wrot6d = np.full((len(contact_frames), 6), np.nan, dtype=np.float32)
             init_dof = np.full((len(contact_frames), n_dofs), np.nan, dtype=np.float32)

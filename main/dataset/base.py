@@ -230,13 +230,17 @@ class ManipData(Dataset, ABC):
 
                 # 计算每个物体每帧与 tips 的距离
                 tips_distance_all = []
+                tips_idx_all = []
                 for i, obj in enumerate(valid_objects):
                     obj_verts_transf = obj["verts_transf"]  # [T, N_points, 3]
-                    tips_near, _, _, _ = self.ch_dist(tips, obj_verts_transf)  # tips_near: [T, 5]
+                    # tips_near: [T, 5], tips_idx: [T, 5] (最近点的索引)
+                    tips_near, _, tips_idx, _ = self.ch_dist(tips, obj_verts_transf)
                     tips_distance = torch.sqrt(tips_near)  # [T, 5]
                     tips_distance_all.append(tips_distance)
+                    tips_idx_all.append(tips_idx)
 
                 tips_distance_all = torch.stack(tips_distance_all, dim=0)  # [N_objects, T, 5]
+                tips_idx_all = torch.stack(tips_idx_all, dim=0)            # [N_objects, T, 5]
 
                 # 对每帧计算五个手指距离之和
                 distance_sum_per_frame = torch.sum(tips_distance_all, dim=-1)  # [N_objects, T]
@@ -247,33 +251,74 @@ class ManipData(Dataset, ABC):
                 # 打印所有帧的最近的物体和对应的五个手指的最小距离和最大距离
                 total_frames = tips.shape[0]
 
-                print(f"\n所有帧的tips_distance对应物体:")
-                for frame_idx in range(total_frames):
-                    obj_idx = min_obj_indices[frame_idx].item()
-                    obj_name = valid_objects[obj_idx].get('name', f'object_{obj_idx}')
-                    finger_distances = tips_distance_all[obj_idx, frame_idx]  # [5]
-                    min_distance = torch.min(finger_distances).item()
-                    max_distance = torch.max(finger_distances).item()
-                    print(f"帧{frame_idx}: 物体 '{obj_name}', 五个手指最小距离: {min_distance:.6f}, 最大距离: {max_distance:.6f}")
+                # print(f"\n所有帧的tips_distance对应物体:")
+                # for frame_idx in range(total_frames):
+                #     obj_idx = min_obj_indices[frame_idx].item()
+                #     obj_name = valid_objects[obj_idx].get('name', f'object_{obj_idx}')
+                #     finger_distances = tips_distance_all[obj_idx, frame_idx]  # [5]
+                #     min_distance = torch.min(finger_distances).item()
+                #     max_distance = torch.max(finger_distances).item()
+                #     print(f"帧{frame_idx}: 物体 '{obj_name}', 五个手指最小距离: {min_distance:.6f}, 最大距离: {max_distance:.6f}")
 
-                # 根据选择的物体索引构建最终的 tips_distance
+                # 根据选择的物体索引构建最终的 tips_distance 和对应的 point indices
                 data["tips_distance"] = torch.zeros_like(tips_distance_all[0])  # [T, 5]
-                for t in range(tips.shape[0]):
-                    data["tips_distance"][t] = tips_distance_all[min_obj_indices[t], t]
+                data["tips_closest_obj_idx"] = min_obj_indices.clone()          # [T]
+                data["tips_closest_pt_idx"] = torch.zeros_like(tips_idx_all[0], dtype=torch.long)  # [T, 5]
+                # 新增：记录最近点在物体局部坐标系下的位置
+                data["tips_closest_pt_local"] = torch.zeros((total_frames, 5, 3), device=self.device) # [T, 5, 3]
+                data["tips_closest_pt_world"] = torch.zeros((total_frames, 5, 3), device=self.device) # [T, 5, 3]
+
+                for t in range(total_frames):
+                    obj_idx = min_obj_indices[t]
+                    data["tips_distance"][t] = tips_distance_all[obj_idx, t]
+                    data["tips_closest_pt_idx"][t] = tips_idx_all[obj_idx, t].long()
+                    
+                    # 计算局部坐标
+                    # world_pos = (R @ local_pos) + T  =>  local_pos = R^T @ (world_pos - T)
+                    obj_traj = valid_objects[obj_idx]["trajectory"][t] # [4, 4]
+                    obj_rot_inv = obj_traj[:3, :3].T
+                    obj_pos = obj_traj[:3, 3]
+                    
+                    # 获取该物体的世界坐标系点云
+                    obj_verts_world = valid_objects[obj_idx]["verts_transf"][t] # [1000, 3]
+                    # 获取最近点的世界坐标
+                    closest_pt_world = obj_verts_world[data["tips_closest_pt_idx"][t]] # [5, 3]
+                    data["tips_closest_pt_world"][t] = closest_pt_world
+                    
+                    # 转为局部坐标
+                    data["tips_closest_pt_local"][t] = (obj_rot_inv @ (closest_pt_world - obj_pos).T).T
             else:
                 # 没有有效的物体，使用默认方法
                 obj_verts_transf = (data["obj_trajectory"][:, :3, :3] @ rs_verts_obj.T[None]).transpose(-1, -2) + data[
                     "obj_trajectory"
                 ][:, :3, 3][:, None]
-                tips_near, _, _, _ = self.ch_dist(tips, obj_verts_transf)
+                tips_near, _, tips_idx, _ = self.ch_dist(tips, obj_verts_transf)
                 data["tips_distance"] = torch.sqrt(tips_near)
+                data["tips_closest_obj_idx"] = torch.zeros(tips.shape[0], dtype=torch.long, device=self.device)
+                data["tips_closest_pt_idx"] = tips_idx.long()
+                
+                # 计算局部坐标
+                obj_rot_inv = data["obj_trajectory"][:, :3, :3].transpose(-1, -2) # [T, 3, 3]
+                obj_pos = data["obj_trajectory"][:, :3, 3] # [T, 3]
+                closest_pt_world = torch.stack([obj_verts_transf[t, tips_idx[t]] for t in range(total_frames)]) # [T, 5, 3]
+                data["tips_closest_pt_world"] = closest_pt_world
+                data["tips_closest_pt_local"] = torch.bmm(obj_rot_inv, (closest_pt_world - obj_pos.unsqueeze(1)).transpose(-1, -2)).transpose(-1, -2)
         else:
             # 如果没有 scene_objects，使用原来的方法
             obj_verts_transf = (data["obj_trajectory"][:, :3, :3] @ rs_verts_obj.T[None]).transpose(-1, -2) + data[
                 "obj_trajectory"
             ][:, :3, 3][:, None]
-            tips_near, _, _, _ = self.ch_dist(tips, obj_verts_transf)
+            tips_near, _, tips_idx, _ = self.ch_dist(tips, obj_verts_transf)
             data["tips_distance"] = torch.sqrt(tips_near)
+            data["tips_closest_obj_idx"] = torch.zeros(tips.shape[0], dtype=torch.long, device=self.device)
+            data["tips_closest_pt_idx"] = tips_idx.long()
+            
+            # 计算局部坐标
+            obj_rot_inv = data["obj_trajectory"][:, :3, :3].transpose(-1, -2) # [T, 3, 3]
+            obj_pos = data["obj_trajectory"][:, :3, 3] # [T, 3]
+            closest_pt_world = torch.stack([obj_verts_transf[t, tips_idx[t]] for t in range(total_frames)]) # [T, 5, 3]
+            data["tips_closest_pt_world"] = closest_pt_world
+            data["tips_closest_pt_local"] = torch.bmm(obj_rot_inv, (closest_pt_world - obj_pos.unsqueeze(1)).transpose(-1, -2)).transpose(-1, -2)
         data["wrist_velocity"] = self.compute_velocity(
             data["wrist_pos"][:, None], 1 / (120 / self.skip), guassian_filter=True
         ).squeeze(1)

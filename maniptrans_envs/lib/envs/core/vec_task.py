@@ -343,6 +343,14 @@ class VecTask(Env):
         self.friction_end_value = friction_external.get("lower_bound", 1.0)  # 最终摩擦力值 = min_value（最难）
         self.friction_min_value = friction_external.get("lower_bound", 1.0)  # 摩擦力最小值限制
 
+        # === [新增] PD 辅助力参数初始化 ===
+        support_force_cfg = self.cfg.get("env", {}).get("support_force", {})
+        self.support_force_kp_start = support_force_cfg.get("kp", 10.0)
+        self.support_force_kd_start = support_force_cfg.get("kd", 3.0)
+        self.support_force_end_factor = support_force_cfg.get("end_factor", 0.1)
+        self.support_force_kp = self.support_force_kp_start
+        self.support_force_kd = self.support_force_kd_start
+
         self.camera_handlers = [] if (display or record) else None
         self.camera_obs = [] if (display or record) else None
 
@@ -1184,3 +1192,18 @@ class VecTask(Env):
             scale_factor: 当前的scale factor值
         """
         self.current_adaptive_scale_factor = scale_factor
+
+        # === [新增] 更新 PD 辅助力增益 ===
+        if scale_factor >= self.support_force_end_factor:
+            # scale_factor 从 1.0 (易) 到 support_force_end_factor (难)
+            # normalized_scale 从 0.0 (易) 到 1.0 (难)
+            scale_range = 1.0 - self.support_force_end_factor
+            if scale_range <= 0:
+                scale_range = 1.0
+            normalized_scale = (1.0 - scale_factor) / scale_range
+            # 增益从 start 线性衰减至 0
+            self.support_force_kp = self.support_force_kp_start * (1.0 - normalized_scale)
+            self.support_force_kd = self.support_force_kd_start * (1.0 - normalized_scale)
+        else:
+            self.support_force_kp = 0.0
+            self.support_force_kd = 0.0

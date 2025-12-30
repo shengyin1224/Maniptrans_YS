@@ -274,7 +274,34 @@ class HumotoDatasetBase(ManipData):
         # Wrist
         wrist_name = self.bone_map["wrist"]
         wrist_pos = joint_positions_dict[wrist_name]
-        wrist_rot = bone_transforms_dict[wrist_name][:, :3, :3]
+
+        # 计算世界坐标系下的完整变换矩阵: World_Transform = Deformation_Matrix @ Rest_Matrix
+        # bone_transforms_dict 存储的是从 rest 到 posed 的变形矩阵 (Deformation Matrix)
+        wrist_rest_mat = self.human_model.bone_rest_matrices[wrist_name]
+        wrist_world_mat = torch.matmul(bone_transforms_dict[wrist_name], wrist_rest_mat[None])
+        wrist_rot = wrist_world_mat[:, :3, :3]
+
+        if self.side == 'right':
+            # === 右手 (RH) 完美方案 ===
+            # 测试结果误差: ~20度 (Correct)
+            # 逻辑: Mixamo Y->X, X->Y, Z->-Z (Fix Flip)
+            align_matrix = torch.tensor([
+                [ 0.0,  1.0,  0.0],
+                [ 1.0,  0.0,  0.0],
+                [ 0.0,  0.0, -1.0]
+            ], dtype=torch.float32, device=self.device)
+        else:
+            # === 左手 (LH) 推导方案 ===
+            # 逻辑: 基于 RH 方案绕骨骼轴(New X)旋转 180 度以适配镜像对称
+            # 变换: Mixamo Y->X, X->-Y, Z->Z
+            align_matrix = torch.tensor([
+                [ 0.0, -1.0,  0.0],
+                [ 1.0,  0.0,  0.0],
+                [ 0.0,  0.0,  1.0]
+            ], dtype=torch.float32, device=self.device)
+
+        # 必须是右乘 (Right Multiplication)！
+        wrist_rot = torch.matmul(wrist_rot, align_matrix)
 
         # Fingers
         for mano_k, humoto_k in self.bone_map.items():

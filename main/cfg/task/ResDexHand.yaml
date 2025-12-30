@@ -55,6 +55,11 @@ env:
   actionScale: 1.0
   useQuatRot: false
 
+  support_force:
+    kp: 10.0
+    kd: 3.0
+    end_factor: 0.4 # 难度系数降到这里时衰减至0
+
   # for distillation
   propDumpInfo:
     q_rh: ${ndof:${....dexhand}}

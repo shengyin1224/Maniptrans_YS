@@ -53,7 +53,7 @@ graphics_device_id: 0
 ## PhysX arguments
 num_threads: 4 # Number of worker threads per scene used by PhysX - for CPU PhysX only.
 solver_type: 1 # 0: pgs, 1: tgs
-num_subscenes: 4 # Splits the simulation into N physics scenes and runs each one in a separate thread
+num_subscenes: 0 # Splits the simulation into N physics scenes and runs each one in a separate thread
 
 # RLGames Arguments
 # test - if set, run policy in inference mode (requires setting checkpoint to load)

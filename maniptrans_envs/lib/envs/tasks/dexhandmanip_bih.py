@@ -520,6 +520,7 @@ class DexHandManipBiHEnv(VecTask):
             # 每个元素是一个 list of dicts (objects)
             
             unique_trajs = [] # [UniqueBatch, NumObjs, T, 4, 4]
+            unique_vels = []  # [UniqueBatch, NumObjs, T, 3]
             
             scene_objs_batch = packed_unique["scene_objects"]
             # 假设同一个 Batch 内物体数量一致，取最大值或第一个
@@ -527,30 +528,42 @@ class DexHandManipBiHEnv(VecTask):
             
             for scene_objs in scene_objs_batch:
                 objs_traj = []
+                objs_vel = []
                 for i in range(max_objs):
                     if i < len(scene_objs):
                         # 取出轨迹 [T, 4, 4]（已在 Gym 坐标系，因为 process_data 中已转换）
                         t = scene_objs[i]["trajectory"]
-                        # 注意：不需要再次转换，因为 ManipDataFactory.create_data 时传入了 mujoco2gym_transf
+                        
+                        # 取出速度 [T, 3]
+                        v = scene_objs[i].get("velocity", None)
+                        if v is None:
+                            # 如果没有速度，默认为 0 (或者可以通过轨迹差分计算，这里简单处理)
+                            v = torch.zeros((t.shape[0], 3), device=self.device)
+                        elif not isinstance(v, torch.Tensor):
+                            v = torch.tensor(v, device=self.device, dtype=torch.float32)
                     else:
                         # Padding
                         t = torch.eye(4, device=self.device).unsqueeze(0).repeat(packed_unique["seq_len"].max(), 1, 1)
+                        v = torch.zeros((t.shape[0], 3), device=self.device)
                     objs_traj.append(t)
+                    objs_vel.append(v)
                 
                 if objs_traj:
                     unique_trajs.append(torch.stack(objs_traj))
+                    unique_vels.append(torch.stack(objs_vel))
                 else:
                     # 空数据处理
-                    dummy = torch.eye(4, device=self.device).view(1, 1, 4, 4)
-                    unique_trajs.append(dummy)
+                    unique_trajs.append(torch.eye(4, device=self.device).view(1, 1, 4, 4))
+                    unique_vels.append(torch.zeros((1, 1, 3), device=self.device))
 
             unique_trajs_stack = torch.stack(unique_trajs) # [UniqueBatch, NumObjs, T, 4, 4]
+            unique_vels_stack = torch.stack(unique_vels)   # [UniqueBatch, NumObjs, T, 3]
             
             # 2. Broadcast 到 NumEnvs
-            return unique_trajs_stack[indices].clone()
+            return unique_trajs_stack[indices].clone(), unique_vels_stack[indices].clone()
 
-        self.rh_multi_obj_traj = prepare_multi_obj_tensor(packed_unique_rh, env_to_data_indices)
-        self.lh_multi_obj_traj = prepare_multi_obj_tensor(packed_unique_lh, env_to_data_indices)
+        self.rh_multi_obj_traj, self.rh_multi_obj_vel = prepare_multi_obj_tensor(packed_unique_rh, env_to_data_indices)
+        self.lh_multi_obj_traj, self.lh_multi_obj_vel = prepare_multi_obj_tensor(packed_unique_lh, env_to_data_indices)
         self.num_objs_per_env = self.rh_multi_obj_traj.shape[1] # 记录物体数量
 
         print("Data loading finished.")
@@ -1207,6 +1220,31 @@ class DexHandManipBiHEnv(VecTask):
         # 这里的 shape 将会是 [NumEnvs, NumObjs]
         self._global_manip_obj_rh_indices = get_actor_indices(self.objs_handles_rh)
         self._global_manip_obj_lh_indices = get_actor_indices(self.objs_handles_lh)
+        
+        # === [新增] 获取多物体的 Rigid Body 索引 (用于 apply_forces) ===
+        def get_rb_indices(handles_list_of_lists):
+            indices = []
+            max_objs = max([len(handles) for handles in handles_list_of_lists]) if handles_list_of_lists else 0
+            for i in range(self.num_envs):
+                env_ptr = self.envs[i]
+                env_indices = []
+                for handle in handles_list_of_lists[i]:
+                    # 获取该 actor 的第一个 rigid body handle (在 env 内的索引)
+                    # 假设物体只有一个 body "base" 或第一个 body 是主要的
+                    rb_idx = self.gym.get_actor_rigid_body_index(env_ptr, handle, 0, gymapi.DOMAIN_ENV)
+                    env_indices.append(rb_idx)
+                while len(env_indices) < max_objs:
+                    env_indices.append(-1)
+                indices.append(env_indices)
+            return torch.tensor(indices, dtype=torch.long, device=self.device)
+
+        self._manip_obj_rh_rb_indices = get_rb_indices(self.objs_handles_rh)
+        self._manip_obj_lh_rb_indices = get_rb_indices(self.objs_handles_lh)
+        
+        # 检查左右侧物体是否完全相同（全局）
+        self.is_scene_objects_shared = torch.all(self._manip_obj_rh_rb_indices == self._manip_obj_lh_rb_indices).item()
+        if self.is_scene_objects_shared:
+            print("[INFO] Scene objects are shared between RH and LH. Support forces will be applied once.")
         # === [修改部分结束] ===
 
         CONTACT_HISTORY_LEN = 3
@@ -1548,14 +1586,14 @@ class DexHandManipBiHEnv(VecTask):
         target_state["wrist_pos"] = cur_wrist_pos.view(self.num_envs, 3) 
 
         # 2. Wrist Rotation -> Quaternion: 确保输入 aa_to_quat 是 (N, 3)，输出是 (N, 4)
-        cur_wrist_rot = side_demo_data["opt_wrist_rot"][torch.arange(self.num_envs), cur_idx]
+        cur_wrist_rot = side_demo_data["wrist_rot"][torch.arange(self.num_envs), cur_idx]
         target_state["wrist_quat"] = aa_to_quat(cur_wrist_rot.view(self.num_envs, 3))[:, [1, 2, 3, 0]].view(self.num_envs, 4)
 
         # 3. Wrist Velocity: 强制转为 (N, 3)
-        target_state["wrist_vel"] = side_demo_data["opt_wrist_velocity"][torch.arange(self.num_envs), cur_idx].view(self.num_envs, 3)
+        target_state["wrist_vel"] = side_demo_data["wrist_velocity"][torch.arange(self.num_envs), cur_idx].view(self.num_envs, 3)
         
         # 4. Wrist Angular Velocity: 强制转为 (N, 3)
-        target_state["wrist_ang_vel"] = side_demo_data["opt_wrist_angular_velocity"][torch.arange(self.num_envs), cur_idx].view(self.num_envs, 3)
+        target_state["wrist_ang_vel"] = side_demo_data["wrist_angular_velocity"][torch.arange(self.num_envs), cur_idx].view(self.num_envs, 3)
         
         # --- 下面的代码保持原样 ---
         
@@ -1714,6 +1752,11 @@ class DexHandManipBiHEnv(VecTask):
         )
         target_state["wrist_power"] = wrist_power
 
+        # [新增] 交互关键点数据
+        target_state["tips_closest_obj_idx"] = side_demo_data["tips_closest_obj_idx"][torch.arange(self.num_envs), cur_idx]
+        target_state["tips_closest_pt_local"] = side_demo_data["tips_closest_pt_local"][torch.arange(self.num_envs), cur_idx]
+        target_state["tips_closest_pt_world"] = side_demo_data["tips_closest_pt_world"][torch.arange(self.num_envs), cur_idx]
+
         if self.training:
             last_step = self.gym.get_frame_count(self.sim)
             # === [新增] 估算当前 epoch 数 ===
@@ -1780,7 +1823,7 @@ class DexHandManipBiHEnv(VecTask):
             (self.dexhand_rh if side == "rh" else self.dexhand_lh).weight_idx,
             obj_is_static,  # 新增：静态物体信息
         )
-        
+
         # [Hack 结束] 恢复原始状态，以免影响其他逻辑
         side_states["manip_obj_pos"] = original_obj_pos
         side_states["manip_obj_quat"] = original_obj_quat
@@ -2139,16 +2182,16 @@ class DexHandManipBiHEnv(VecTask):
             expanded_idx = expanded_idx.expand(-1, -1, *remaining_shape)
             return torch.gather(data, 1, expanded_idx)
 
-        target_wrist_pos = indicing(side_demo_data["opt_wrist_pos"], cur_idx)  # [B, K, 3]
+        target_wrist_pos = indicing(side_demo_data["wrist_pos"], cur_idx)  # [B, K, 3]
         cur_wrist_pos = side_states["base_state"][:, :3]  # [B, 3]
         next_target_state["delta_wrist_pos"] = (target_wrist_pos - cur_wrist_pos[:, None]).reshape(nE, -1)
 
-        target_wrist_vel = indicing(side_demo_data["opt_wrist_velocity"], cur_idx)
+        target_wrist_vel = indicing(side_demo_data["wrist_velocity"], cur_idx)
         cur_wrist_vel = side_states["base_state"][:, 7:10]
         next_target_state["wrist_vel"] = target_wrist_vel.reshape(nE, -1)
         next_target_state["delta_wrist_vel"] = (target_wrist_vel - cur_wrist_vel[:, None]).reshape(nE, -1)
 
-        target_wrist_rot = indicing(side_demo_data["opt_wrist_rot"], cur_idx)
+        target_wrist_rot = indicing(side_demo_data["wrist_rot"], cur_idx)
         cur_wrist_rot = side_states["base_state"][:, 3:7]
 
         next_target_state["wrist_quat"] = aa_to_quat(target_wrist_rot.reshape(nE * nF, -1))[:, [1, 2, 3, 0]]
@@ -2158,7 +2201,7 @@ class DexHandManipBiHEnv(VecTask):
         ).reshape(nE, -1)
         next_target_state["wrist_quat"] = next_target_state["wrist_quat"].reshape(nE, -1)
 
-        target_wrist_ang_vel = indicing(side_demo_data["opt_wrist_angular_velocity"], cur_idx)
+        target_wrist_ang_vel = indicing(side_demo_data["wrist_angular_velocity"], cur_idx)
         cur_wrist_ang_vel = side_states["base_state"][:, 10:13]
         next_target_state["wrist_ang_vel"] = target_wrist_ang_vel.reshape(nE, -1)
         next_target_state["delta_wrist_ang_vel"] = (target_wrist_ang_vel - cur_wrist_ang_vel[:, None]).reshape(nE, -1)
@@ -2517,31 +2560,6 @@ class DexHandManipBiHEnv(VecTask):
         getattr(self, f"_{side}_base_state")[env_ids, :] = opt_hand_pose_vel
 
         
-        # [诊断代码] 检查 opt_wrist_rot 和 wrist_rot 的差异
-        with torch.no_grad():
-            # 获取当前采样的原始旋转和优化后的旋转 (Axis-Angle)
-            raw_rot_aa = side_demo_data["wrist_rot"][env_ids, seq_idx]
-            opt_rot_aa = side_demo_data["opt_wrist_rot"][env_ids, seq_idx]
-            
-            # 转为四元数 [w, x, y, z] -> [x, y, z, w]
-            raw_q = aa_to_quat(raw_rot_aa)[:, [1, 2, 3, 0]]
-            opt_q = aa_to_quat(opt_rot_aa)[:, [1, 2, 3, 0]]
-            
-            # 计算相对旋转 q_diff = q_opt * q_raw_con
-            q_diff = quat_mul(opt_q, quat_conjugate(raw_q))
-            
-            # 计算角度差 (角度公式: 2 * acos(|w|))
-            dot = q_diff[:, 3].abs().clamp(0, 1)
-            angle_diff_deg = 2.0 * torch.acos(dot) * (180.0 / np.pi)
-            
-            if env_ids[0] == 0: # 仅打印第一个环境避免刷屏
-                print(f"\n[ROTATION CHECK] Side: {side.upper()}")
-                print(f"  - Mean Angle Diff: {angle_diff_deg.mean().item():.2f}°")
-                print(f"  - Max Angle Diff:  {angle_diff_deg.max().item():.2f}°")
-                if angle_diff_deg.mean() > 30:
-                    print(f"  [WARNING] 发现巨大初始旋转差！Agent 可能在追踪一个错误的坐标系。")
-
-
         if side == "rh":
             self._q[env_ids, : self.num_dexhand_rh_dofs] = dof_pos
             self._qd[env_ids, : self.num_dexhand_rh_dofs] = dof_vel
@@ -3013,7 +3031,7 @@ class DexHandManipBiHEnv(VecTask):
             self.gym.clear_lines(self.viewer)
 
             def set_side_joint(cur_idx, side="rh"):
-                cur_wrist_pos = getattr(self, f"demo_data_{side}")["opt_wrist_pos"][torch.arange(self.num_envs), cur_idx]
+                cur_wrist_pos = getattr(self, f"demo_data_{side}")["wrist_pos"][torch.arange(self.num_envs), cur_idx]
                 cur_mano_joint_pos = getattr(self, f"demo_data_{side}")["mano_joints"][
                     torch.arange(self.num_envs), cur_idx
                 ].reshape(self.num_envs, -1, 3)
@@ -3254,6 +3272,10 @@ class DexHandManipBiHEnv(VecTask):
                 * self.apply_torque[:, self.dexhand_lh_handles[self.dexhand_lh.to_dex("wrist")[0]], :]
             )
 
+        # === [新增] 施加物体 PD 辅助力 ===
+        if self.support_force_kp > 0 or self.support_force_kd > 0:
+            self._apply_support_forces()
+
         self.gym.apply_rigid_body_force_tensors(
             self.sim,
             gymtorch.unwrap_tensor(self.apply_forces),
@@ -3264,6 +3286,58 @@ class DexHandManipBiHEnv(VecTask):
         self._pos_control[:] = self.prev_targets[:]
 
         self.gym.set_dof_position_target_tensor(self.sim, gymtorch.unwrap_tensor(self._pos_control))
+
+    def _apply_support_forces(self):
+        """
+        [新增] 动态 PD 控制器：在物理模拟前给动态物体施加辅助力 F_support
+        F_support = Kp * (pos_target - pos_current) + Kd * (vel_target - vel_current)
+        """
+        cur_idx = self.progress_buf
+        
+        # 准备索引 [N, K]
+        batch_idx = torch.arange(self.num_envs, device=self.device).view(-1, 1).expand(-1, self.num_objs_per_env)
+        obj_idx = torch.arange(self.num_objs_per_env, device=self.device).view(1, -1).expand(self.num_envs, -1)
+        
+        # 如果左右物体完全相同，只计算并施加一次（通常使用右手的目标轨迹）
+        sides = ["rh"] if getattr(self, "is_scene_objects_shared", False) else ["rh", "lh"]
+        
+        for side in sides:
+            # 1. 获取目标状态 (N, K, 3)
+            multi_obj_traj = getattr(self, f"{side}_multi_obj_traj")
+            multi_obj_vel_traj = getattr(self, f"{side}_multi_obj_vel")
+            
+            # time_idx 限制在序列长度内，防止越界
+            max_T = multi_obj_traj.shape[2]
+            time_idx = torch.clamp(cur_idx, 0, max_T - 1).view(-1, 1).expand(-1, self.num_objs_per_env)
+            
+            # 取出当前帧的目标位置和速度
+            target_pos = multi_obj_traj[batch_idx, obj_idx, time_idx][..., :3, 3]
+            target_vel = multi_obj_vel_traj[batch_idx, obj_idx, time_idx]
+            
+            # 2. 获取当前状态 (N, K, 3)
+            side_states = getattr(self, f"{side}_states")
+            current_pos = side_states["manip_obj_pos"]
+            current_vel = side_states["manip_obj_vel"]
+            
+            # 3. 计算 PD 辅助力 (Gain 由 VecTask 根据难度更新)
+            force = self.support_force_kp * (target_pos - current_pos) + \
+                    self.support_force_kd * (target_vel - current_vel)
+            
+            # 4. 掩码：只对动态物体施加
+            is_static = getattr(self, f"manip_obj_{side}_is_static")
+            force = force * (~is_static).unsqueeze(-1).float()
+            
+            # 5. 写入 apply_forces
+            rb_indices = getattr(self, f"_manip_obj_{side}_rb_indices")
+            valid_mask = (rb_indices != -1)
+            
+            # 展平有效索引并赋值
+            flat_env_idx = batch_idx[valid_mask]
+            flat_rb_idx = rb_indices[valid_mask]
+            flat_force = force[valid_mask]
+            
+            # 辅助力每步重新计算，直接赋值覆盖旧值
+            self.apply_forces[flat_env_idx, flat_rb_idx] = flat_force
 
     def post_physics_step(self):
 
@@ -3617,6 +3691,50 @@ def compute_imitation_reward(
     # contact_violation penalty: -1 if violation occurs, 0 otherwise (scale=1)
     reward_contact_violation = torch.where(contact_violation, -1.0, 0.0)
 
+    # === [新增] 手-物交互向量一致性奖励 (r_interact) ===
+    fingertip_indices = [
+        dexhand_weight_idx["thumb_tip"][0] - 1,
+        dexhand_weight_idx["index_tip"][0] - 1,
+        dexhand_weight_idx["middle_tip"][0] - 1,
+        dexhand_weight_idx["ring_tip"][0] - 1,
+        dexhand_weight_idx["pinky_tip"][0] - 1,
+    ]
+    
+    # 1. 获取参考和仿真的指尖位置 [N, 5, 3]
+    p_hand_ref = target_states["joints_pos"][:, fingertip_indices, :]
+    p_hand_sim = states["joints_state"][:, [i+1 for i in fingertip_indices], :3] # joints_state 包含 wrist(idx 0)
+    
+    # 2. 获取参考和仿真的物体关键点位置 [N, 5, 3]
+    p_obj_ref = target_states["tips_closest_pt_world"] # [N, 5, 3]
+    
+    # 仿真关键点: 使用参考中的局部坐标，结合仿真中物体的当前位姿
+    closest_obj_idx = target_states["tips_closest_obj_idx"] # [N]
+    p_obj_local = target_states["tips_closest_pt_local"] # [N, 5, 3]
+    
+    # 提取当前被选中的物体在仿真的位姿
+    # states["manip_obj_pos"]: [N, K, 3], states["manip_obj_quat"]: [N, K, 4] (x,y,z,w)
+    N = states["base_state"].shape[0]
+    curr_obj_pos = torch.gather(states["manip_obj_pos"], 1, closest_obj_idx.view(N, 1, 1).expand(-1, 1, 3)).squeeze(1) # [N, 3]
+    curr_obj_quat = torch.gather(states["manip_obj_quat"], 1, closest_obj_idx.view(N, 1, 1).expand(-1, 1, 4)).squeeze(1) # [N, 4]
+    
+    # 将局部坐标转为仿真世界坐标
+    curr_obj_rot = quat_to_rotmat(curr_obj_quat[:, [3, 0, 1, 2]]) # [N, 3, 3]
+    p_obj_sim = torch.bmm(curr_obj_rot, p_obj_local.transpose(-1, -2)).transpose(-1, -2) + curr_obj_pos.unsqueeze(1)
+    
+    # 3. 构建相对位置向量 [N, 5, 3]
+    v_ref = p_obj_ref - p_hand_ref
+    v_sim = p_obj_sim - p_hand_sim
+    
+    # 4. 计算误差 E_interact (MSE)
+    e_interact = torch.mean(torch.norm(v_sim - v_ref, dim=-1)**2, dim=-1) # [N]
+    
+    # 5. 动态权重 lambda_dynamic
+    ref_dist = target_states["tips_distance"].mean(dim=-1) # [N]
+    lambda_dynamic = 50.0 + 100.0 * torch.exp(-20.0 * ref_dist)
+    
+    # 6. 计算最终奖励
+    reward_interact = torch.exp(-lambda_dynamic * e_interact)
+
     reward_execute = (
         1 * reward_eef_pos  # 从0.1增加到0.3，提高wrist位置跟踪的权重
         + 2 * reward_eef_rot
@@ -3638,6 +3756,7 @@ def compute_imitation_reward(
         + 0.5 * reward_power
         + 0.5 * reward_wrist_power
         + 1.0 * reward_contact_violation
+        + 2.0 * reward_interact # 新增
     )
 
     succeeded = (
@@ -3658,6 +3777,7 @@ def compute_imitation_reward(
         "reward_obj_rot": reward_obj_rot,
         "reward_obj_vel": reward_obj_vel,
         "reward_obj_ang_vel": reward_obj_ang_vel,
+        "reward_interact": reward_interact,
         "reward_joints_pos": (
             reward_thumb_tip_pos
             + reward_index_tip_pos
