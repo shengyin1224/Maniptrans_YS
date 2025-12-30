@@ -496,6 +496,21 @@ class DexHandManipBiHEnv(VecTask):
 
         self.demo_data_lh = broadcast_dict(packed_unique_lh, env_to_data_indices)
         self.demo_data_rh = broadcast_dict(packed_unique_rh, env_to_data_indices)
+
+        # [打印功能] 直接打印第177帧到186帧的 wrist-rot 和 opt-wrist-rot (取第一个环境)
+        # print("\n" + "="*50)
+        # print("[DEBUG] Printing frames 177 to 186 from loaded demo data (Env 0):")
+        # for frame_idx in range(177, 187):
+        #     print(f"--- Frame {frame_idx} ---")
+        #     for side, data_dict in [("RH", self.demo_data_rh), ("LH", self.demo_data_lh)]:
+        #         if "wrist_rot" in data_dict:
+        #             val = data_dict["wrist_rot"][0, frame_idx].cpu().numpy()
+        #             print(f"  [{side}] wrist_rot:     {val}")
+        #         if "opt_wrist_rot" in data_dict:
+        #             val = data_dict["opt_wrist_rot"][0, frame_idx].cpu().numpy()
+        #             print(f"  [{side}] opt_wrist_rot: {val}")
+        # print("="*50 + "\n")
+        # import pdb; pdb.set_trace()
         
         # === [新增] 将多物体轨迹预处理为 Tensor 以加速 Reward 计算 ===
         # 目标: 生成 self.rh_multi_obj_traj [NumEnvs, MaxObjs, T, 4, 4]
@@ -1533,14 +1548,14 @@ class DexHandManipBiHEnv(VecTask):
         target_state["wrist_pos"] = cur_wrist_pos.view(self.num_envs, 3) 
 
         # 2. Wrist Rotation -> Quaternion: 确保输入 aa_to_quat 是 (N, 3)，输出是 (N, 4)
-        cur_wrist_rot = side_demo_data["wrist_rot"][torch.arange(self.num_envs), cur_idx]
+        cur_wrist_rot = side_demo_data["opt_wrist_rot"][torch.arange(self.num_envs), cur_idx]
         target_state["wrist_quat"] = aa_to_quat(cur_wrist_rot.view(self.num_envs, 3))[:, [1, 2, 3, 0]].view(self.num_envs, 4)
 
         # 3. Wrist Velocity: 强制转为 (N, 3)
-        target_state["wrist_vel"] = side_demo_data["wrist_velocity"][torch.arange(self.num_envs), cur_idx].view(self.num_envs, 3)
+        target_state["wrist_vel"] = side_demo_data["opt_wrist_velocity"][torch.arange(self.num_envs), cur_idx].view(self.num_envs, 3)
         
         # 4. Wrist Angular Velocity: 强制转为 (N, 3)
-        target_state["wrist_ang_vel"] = side_demo_data["wrist_angular_velocity"][torch.arange(self.num_envs), cur_idx].view(self.num_envs, 3)
+        target_state["wrist_ang_vel"] = side_demo_data["opt_wrist_angular_velocity"][torch.arange(self.num_envs), cur_idx].view(self.num_envs, 3)
         
         # --- 下面的代码保持原样 ---
         
@@ -2124,16 +2139,16 @@ class DexHandManipBiHEnv(VecTask):
             expanded_idx = expanded_idx.expand(-1, -1, *remaining_shape)
             return torch.gather(data, 1, expanded_idx)
 
-        target_wrist_pos = indicing(side_demo_data["wrist_pos"], cur_idx)  # [B, K, 3]
+        target_wrist_pos = indicing(side_demo_data["opt_wrist_pos"], cur_idx)  # [B, K, 3]
         cur_wrist_pos = side_states["base_state"][:, :3]  # [B, 3]
         next_target_state["delta_wrist_pos"] = (target_wrist_pos - cur_wrist_pos[:, None]).reshape(nE, -1)
 
-        target_wrist_vel = indicing(side_demo_data["wrist_velocity"], cur_idx)
+        target_wrist_vel = indicing(side_demo_data["opt_wrist_velocity"], cur_idx)
         cur_wrist_vel = side_states["base_state"][:, 7:10]
         next_target_state["wrist_vel"] = target_wrist_vel.reshape(nE, -1)
         next_target_state["delta_wrist_vel"] = (target_wrist_vel - cur_wrist_vel[:, None]).reshape(nE, -1)
 
-        target_wrist_rot = indicing(side_demo_data["wrist_rot"], cur_idx)
+        target_wrist_rot = indicing(side_demo_data["opt_wrist_rot"], cur_idx)
         cur_wrist_rot = side_states["base_state"][:, 3:7]
 
         next_target_state["wrist_quat"] = aa_to_quat(target_wrist_rot.reshape(nE * nF, -1))[:, [1, 2, 3, 0]]
@@ -2143,7 +2158,7 @@ class DexHandManipBiHEnv(VecTask):
         ).reshape(nE, -1)
         next_target_state["wrist_quat"] = next_target_state["wrist_quat"].reshape(nE, -1)
 
-        target_wrist_ang_vel = indicing(side_demo_data["wrist_angular_velocity"], cur_idx)
+        target_wrist_ang_vel = indicing(side_demo_data["opt_wrist_angular_velocity"], cur_idx)
         cur_wrist_ang_vel = side_states["base_state"][:, 10:13]
         next_target_state["wrist_ang_vel"] = target_wrist_ang_vel.reshape(nE, -1)
         next_target_state["delta_wrist_ang_vel"] = (target_wrist_ang_vel - cur_wrist_ang_vel[:, None]).reshape(nE, -1)
@@ -2502,29 +2517,29 @@ class DexHandManipBiHEnv(VecTask):
         getattr(self, f"_{side}_base_state")[env_ids, :] = opt_hand_pose_vel
 
         
-        # # [诊断代码] 检查 opt_wrist_rot 和 wrist_rot 的差异
-        # with torch.no_grad():
-        #     # 获取当前采样的原始旋转和优化后的旋转 (Axis-Angle)
-        #     raw_rot_aa = side_demo_data["wrist_rot"][env_ids, seq_idx]
-        #     opt_rot_aa = side_demo_data["opt_wrist_rot"][env_ids, seq_idx]
+        # [诊断代码] 检查 opt_wrist_rot 和 wrist_rot 的差异
+        with torch.no_grad():
+            # 获取当前采样的原始旋转和优化后的旋转 (Axis-Angle)
+            raw_rot_aa = side_demo_data["wrist_rot"][env_ids, seq_idx]
+            opt_rot_aa = side_demo_data["opt_wrist_rot"][env_ids, seq_idx]
             
-        #     # 转为四元数 [w, x, y, z] -> [x, y, z, w]
-        #     raw_q = aa_to_quat(raw_rot_aa)[:, [1, 2, 3, 0]]
-        #     opt_q = aa_to_quat(opt_rot_aa)[:, [1, 2, 3, 0]]
+            # 转为四元数 [w, x, y, z] -> [x, y, z, w]
+            raw_q = aa_to_quat(raw_rot_aa)[:, [1, 2, 3, 0]]
+            opt_q = aa_to_quat(opt_rot_aa)[:, [1, 2, 3, 0]]
             
-        #     # 计算相对旋转 q_diff = q_opt * q_raw_con
-        #     q_diff = quat_mul(opt_q, quat_conjugate(raw_q))
+            # 计算相对旋转 q_diff = q_opt * q_raw_con
+            q_diff = quat_mul(opt_q, quat_conjugate(raw_q))
             
-        #     # 计算角度差 (角度公式: 2 * acos(|w|))
-        #     dot = q_diff[:, 3].abs().clamp(0, 1)
-        #     angle_diff_deg = 2.0 * torch.acos(dot) * (180.0 / np.pi)
+            # 计算角度差 (角度公式: 2 * acos(|w|))
+            dot = q_diff[:, 3].abs().clamp(0, 1)
+            angle_diff_deg = 2.0 * torch.acos(dot) * (180.0 / np.pi)
             
-        #     if env_ids[0] == 0: # 仅打印第一个环境避免刷屏
-        #         print(f"\n[ROTATION CHECK] Side: {side.upper()}")
-        #         print(f"  - Mean Angle Diff: {angle_diff_deg.mean().item():.2f}°")
-        #         print(f"  - Max Angle Diff:  {angle_diff_deg.max().item():.2f}°")
-        #         if angle_diff_deg.mean() > 30:
-        #             print(f"  [WARNING] 发现巨大初始旋转差！Agent 可能在追踪一个错误的坐标系。")
+            if env_ids[0] == 0: # 仅打印第一个环境避免刷屏
+                print(f"\n[ROTATION CHECK] Side: {side.upper()}")
+                print(f"  - Mean Angle Diff: {angle_diff_deg.mean().item():.2f}°")
+                print(f"  - Max Angle Diff:  {angle_diff_deg.max().item():.2f}°")
+                if angle_diff_deg.mean() > 30:
+                    print(f"  [WARNING] 发现巨大初始旋转差！Agent 可能在追踪一个错误的坐标系。")
 
 
         if side == "rh":
@@ -2998,7 +3013,7 @@ class DexHandManipBiHEnv(VecTask):
             self.gym.clear_lines(self.viewer)
 
             def set_side_joint(cur_idx, side="rh"):
-                cur_wrist_pos = getattr(self, f"demo_data_{side}")["wrist_pos"][torch.arange(self.num_envs), cur_idx]
+                cur_wrist_pos = getattr(self, f"demo_data_{side}")["opt_wrist_pos"][torch.arange(self.num_envs), cur_idx]
                 cur_mano_joint_pos = getattr(self, f"demo_data_{side}")["mano_joints"][
                     torch.arange(self.num_envs), cur_idx
                 ].reshape(self.num_envs, -1, 3)
