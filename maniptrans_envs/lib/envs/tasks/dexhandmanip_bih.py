@@ -3006,6 +3006,12 @@ class DexHandManipBiHEnv(VecTask):
             info["adaptive_difficulty/current_epoch_success_rate"] = float(self.current_epoch_success_rate)
             info["adaptive_difficulty/current_epoch_avg_steps"] = float(self.current_epoch_avg_steps)
 
+        # 添加支撑力 Kp 和 Kd 到 TensorBoard
+        if hasattr(self, 'support_force_kp'):
+            info["adaptive_difficulty/support_force_kp"] = float(self.support_force_kp)
+        if hasattr(self, 'support_force_kd'):
+            info["adaptive_difficulty/support_force_kd"] = float(self.support_force_kd)
+
         # === [新增] 添加自适应采样统计信息 ===
         if self.random_state_init and self.adaptive_sampling_bins is not None:
             # 只记录每个 bin 当下这个 epoch 的成功率 (从上个完成的 epoch 中获取)
@@ -3343,7 +3349,20 @@ class DexHandManipBiHEnv(VecTask):
             # 5. 写入 apply_forces
             rb_indices = getattr(self, f"_manip_obj_{side}_rb_indices")
             valid_mask = (rb_indices != -1)
-            
+
+            # [新增] 可视化辅助力 (黄色线段表示力的方向和大小)
+            if not self.headless:
+                for env_id in range(min(self.num_envs, 4)):  # 只画前几个环境避免卡顿
+                    env_ptr = self.envs[env_id]
+                    for obj_k in range(self.num_objs_per_env):
+                        if not is_static[env_id, obj_k]:
+                            p1 = current_pos[env_id, obj_k].cpu().numpy()
+                            # 缩放力的大小以便观察，这里假设 0.05 的缩放率
+                            p2 = p1 + force[env_id, obj_k].cpu().numpy() * 0.05
+                            line_color = np.array([1.0, 1.0, 0.0], dtype=np.float32)  # 黄色
+                            line_data = np.stack([p1, p2]).flatten().astype(np.float32)
+                            self.gym.add_lines(self.viewer, env_ptr, 1, line_data, line_color)
+
             # 展平有效索引并赋值
             flat_env_idx = batch_idx[valid_mask]
             flat_rb_idx = rb_indices[valid_mask]
