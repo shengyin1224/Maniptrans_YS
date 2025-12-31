@@ -3350,18 +3350,24 @@ class DexHandManipBiHEnv(VecTask):
             rb_indices = getattr(self, f"_manip_obj_{side}_rb_indices")
             valid_mask = (rb_indices != -1)
 
-            # [新增] 可视化辅助力 (黄色线段表示力的方向和大小)
+            # [新增] 强化版辅助力可视化 (黄色表示力，青色表示目标连线)
             if not self.headless:
                 for env_id in range(min(self.num_envs, 4)):  # 只画前几个环境避免卡顿
                     env_ptr = self.envs[env_id]
                     for obj_k in range(self.num_objs_per_env):
                         if not is_static[env_id, obj_k]:
-                            p1 = current_pos[env_id, obj_k].cpu().numpy()
-                            # 缩放力的大小以便观察，这里假设 0.05 的缩放率
-                            p2 = p1 + force[env_id, obj_k].cpu().numpy() * 0.05
-                            line_color = np.array([1.0, 1.0, 0.0], dtype=np.float32)  # 黄色
-                            line_data = np.stack([p1, p2]).flatten().astype(np.float32)
-                            self.gym.add_lines(self.viewer, env_ptr, 1, line_data, line_color)
+                            p_curr = current_pos[env_id, obj_k].cpu().numpy()
+                            p_target = target_pos[env_id, obj_k].cpu().numpy()
+                            f_val = force[env_id, obj_k].cpu().numpy()
+
+                            # 1. 绘制力矢量 (黄色，显著增长)
+                            p_force_end = p_curr + f_val * 1.0  # 缩放系数增加到 1.0
+                            yellow = np.array([1.0, 1.0, 0.0], dtype=np.float32)
+                            self.gym.add_lines(self.viewer, env_ptr, 1, np.concatenate([p_curr, p_force_end]).astype(np.float32), yellow)
+
+                            # 2. 绘制指向目标的连线 (青色)
+                            cyan = np.array([0.0, 1.0, 1.0], dtype=np.float32)
+                            self.gym.add_lines(self.viewer, env_ptr, 1, np.concatenate([p_curr, p_target]).astype(np.float32), cyan)
 
             # 展平有效索引并赋值
             flat_env_idx = batch_idx[valid_mask]
