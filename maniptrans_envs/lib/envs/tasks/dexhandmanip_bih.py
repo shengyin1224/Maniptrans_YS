@@ -103,6 +103,9 @@ class DexHandManipBiHEnv(VecTask):
         self.rollout_state_init = self.cfg["env"]["rolloutStateInit"]
         self.random_state_init = self.cfg["env"]["randomStateInit"]
 
+        self.reward_interact_scale = self.cfg["env"].get("rewardInteractScale", 2.0)
+        self.terminate_on_eef = self.cfg["env"].get("terminateOnEEF", False)
+
         # === [新增] 自适应采样相关配置 ===
         if self.random_state_init:
             # 时间片段(bin)数量，用于将轨迹分成多个片段进行采样
@@ -117,8 +120,6 @@ class DexHandManipBiHEnv(VecTask):
             self.adaptive_sampling_alpha = 0.7
             # 所有bin成功率超过此阈值才允许提升难度
             self.adaptive_sampling_all_bins_threshold = self.cfg["env"].get("adaptiveSamplingAllBinsThreshold", 0.40)
-            self.reward_interact_scale = self.cfg["env"].get("rewardInteractScale", 2.0)
-            self.terminate_on_eef = self.cfg["env"].get("terminateOnEEF", False)
 
             print(f"[ADAPTIVE SAMPLING] Enabled with {self.adaptive_sampling_bins} bins")
             print(f"  - Kernel size: {self.adaptive_sampling_kernel_size}, Lambda: {self.adaptive_sampling_lambda}")
@@ -731,7 +732,7 @@ class DexHandManipBiHEnv(VecTask):
         num_per_row = int(np.ceil(np.sqrt(self.num_envs)))
 
         # === [新增] 隐藏手部控制参数 ===
-        self.hide_hands = cfg["env"].get("hide_hands", False)
+        self.hide_hands = self.cfg["env"].get("hide_hands", False)
         if self.hide_hands:
             print("[INFO] Hands are HIDDEN (will be transparent and non-colliding).")
 
@@ -751,7 +752,8 @@ class DexHandManipBiHEnv(VecTask):
 
             # Create Robot Actors
             # 如果隐藏手部，设置碰撞掩码为 -1 (不与任何物体碰撞)
-            hand_collision_mask = -1 if self.hide_hands else (1 if self.dexhand_rh.self_collision else 0)
+            hand_collision_mask = 1 if self.hide_hands else (1 if self.dexhand_rh.self_collision else 0)
+
             
             dexhand_rh_actor = self.gym.create_actor(
                 env_ptr, dexhand_rh_asset, self.dexhand_rh_pose, "dexhand_r", i,
@@ -1010,8 +1012,12 @@ class DexHandManipBiHEnv(VecTask):
             q_xyzw = q[[1, 2, 3, 0]]  # 转换为 [x, y, z, w] 格式
             pose.r = gymapi.Quat(q_xyzw[0], q_xyzw[1], q_xyzw[2], q_xyzw[3])
 
+            if obj_name == "vase":
+                handle = self.gym.create_actor(env_ptr, asset, pose, f"{obj_name}_{side}_{k}", i, 1)
+            else:
+                handle = self.gym.create_actor(env_ptr, asset, pose, f"{obj_name}_{side}_{k}", i, 0)
             # 3. 创建 Actor
-            handle = self.gym.create_actor(env_ptr, asset, pose, f"{obj_name}_{side}_{k}", i, 0)
+            #handle = self.gym.create_actor(env_ptr, asset, pose, f"{obj_name}_{side}_{k}", i, 0)
             
             # === [修改重点] 4. 分别设置质量(Body)和摩擦力(Shape) ===
             
@@ -3877,10 +3883,11 @@ def compute_imitation_reward(
     succeeded = (
         progress_buf + 1 + 3 >= max_length
     ) & ~failed_execute  # reached the end of the trajectory, +3 for max future 3 steps
+    # [DEBUG] 修改为永远不会因为失败而重置，方便观察
     reset_buf = torch.where(
-        succeeded | failed_execute,
+        succeeded, # 只在成功时重置
         torch.ones_like(reset_buf),
-        reset_buf,
+        torch.zeros_like(reset_buf), # 失败也不重置
     )
     reward_dict = {
         "reward_eef_pos": reward_eef_pos,
