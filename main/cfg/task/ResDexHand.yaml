@@ -64,6 +64,8 @@ env:
   support_force:
     kp: ${resolve_default:10.0,${....support_force_kp}}
     kd: ${resolve_default:3.0,${....support_force_kd}}
+    kp_rot: ${resolve_default:1.0,${....support_force_kp_rot}}
+    kd_rot: ${resolve_default:0.3,${....support_force_kd_rot}}
     end_factor: ${resolve_default:0.4,${....support_force_end_factor}}
 
   # for distillation

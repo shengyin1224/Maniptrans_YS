@@ -30,6 +30,8 @@ adaptive_sampling_all_bins_threshold: ''
 adaptive_stuck_threshold: ''
 support_force_kp: ''
 support_force_kd: ''
+support_force_kp_rot: ''
+support_force_kd_rot: ''
 support_force_end_factor: ''
 actionsMovingAverage: 1.0
 
