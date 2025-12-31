@@ -347,9 +347,14 @@ class VecTask(Env):
         support_force_cfg = self.cfg.get("env", {}).get("support_force", {})
         self.support_force_kp_start = support_force_cfg.get("kp", 10.0)
         self.support_force_kd_start = support_force_cfg.get("kd", 3.0)
+        self.support_force_kp_rot_start = support_force_cfg.get("kp_rot", self.support_force_kp_start * 0.1)
+        self.support_force_kd_rot_start = support_force_cfg.get("kd_rot", self.support_force_kd_start * 0.1)
         self.support_force_end_factor = support_force_cfg.get("end_factor", 0.1)
+        
         self.support_force_kp = self.support_force_kp_start
         self.support_force_kd = self.support_force_kd_start
+        self.support_force_kp_rot = self.support_force_kp_rot_start
+        self.support_force_kd_rot = self.support_force_kd_rot_start
 
         self.camera_handlers = [] if (display or record) else None
         self.camera_obs = [] if (display or record) else None
@@ -1204,6 +1209,10 @@ class VecTask(Env):
             # 增益从 start 线性衰减至 0
             self.support_force_kp = self.support_force_kp_start * (1.0 - normalized_scale)
             self.support_force_kd = self.support_force_kd_start * (1.0 - normalized_scale)
+            self.support_force_kp_rot = self.support_force_kp_rot_start * (1.0 - normalized_scale)
+            self.support_force_kd_rot = self.support_force_kd_rot_start * (1.0 - normalized_scale)
         else:
             self.support_force_kp = 0.0
             self.support_force_kd = 0.0
+            self.support_force_kp_rot = 0.0
+            self.support_force_kd_rot = 0.0

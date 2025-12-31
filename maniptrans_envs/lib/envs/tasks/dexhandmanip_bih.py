@@ -520,11 +520,10 @@ class DexHandManipBiHEnv(VecTask):
         # 目标: 生成 self.rh_multi_obj_traj [NumEnvs, MaxObjs, T, 4, 4]
         def prepare_multi_obj_tensor(packed_unique, indices):
             # 1. 从 unique data 中提取轨迹 Tensor
-            # packed_unique['scene_objects'] 是一个 list (length=UniqueBatch)
-            # 每个元素是一个 list of dicts (objects)
             
             unique_trajs = [] # [UniqueBatch, NumObjs, T, 4, 4]
             unique_vels = []  # [UniqueBatch, NumObjs, T, 3]
+            unique_ang_vels = [] # [UniqueBatch, NumObjs, T, 3] # [新增]
             
             scene_objs_batch = packed_unique["scene_objects"]
             # 假设同一个 Batch 内物体数量一致，取最大值或第一个
@@ -533,41 +532,53 @@ class DexHandManipBiHEnv(VecTask):
             for scene_objs in scene_objs_batch:
                 objs_traj = []
                 objs_vel = []
+                objs_ang_vel = []
                 for i in range(max_objs):
                     if i < len(scene_objs):
-                        # 取出轨迹 [T, 4, 4]（已在 Gym 坐标系，因为 process_data 中已转换）
+                        # 取出轨迹 [T, 4, 4]
                         t = scene_objs[i]["trajectory"]
                         
                         # 取出速度 [T, 3]
                         v = scene_objs[i].get("velocity", None)
                         if v is None:
-                            # 如果没有速度，默认为 0 (或者可以通过轨迹差分计算，这里简单处理)
                             v = torch.zeros((t.shape[0], 3), device=self.device)
                         elif not isinstance(v, torch.Tensor):
                             v = torch.tensor(v, device=self.device, dtype=torch.float32)
+                        
+                        # [新增] 取出角速度 [T, 3]
+                        av = scene_objs[i].get("angular_velocity", None)
+                        if av is None:
+                            av = torch.zeros((t.shape[0], 3), device=self.device)
+                        elif not isinstance(av, torch.Tensor):
+                            av = torch.tensor(av, device=self.device, dtype=torch.float32)
                     else:
                         # Padding
                         t = torch.eye(4, device=self.device).unsqueeze(0).repeat(packed_unique["seq_len"].max(), 1, 1)
                         v = torch.zeros((t.shape[0], 3), device=self.device)
+                        av = torch.zeros((t.shape[0], 3), device=self.device)
                     objs_traj.append(t)
                     objs_vel.append(v)
+                    objs_ang_vel.append(av)
                 
                 if objs_traj:
                     unique_trajs.append(torch.stack(objs_traj))
                     unique_vels.append(torch.stack(objs_vel))
+                    unique_ang_vels.append(torch.stack(objs_ang_vel))
                 else:
                     # 空数据处理
                     unique_trajs.append(torch.eye(4, device=self.device).view(1, 1, 4, 4))
                     unique_vels.append(torch.zeros((1, 1, 3), device=self.device))
+                    unique_ang_vels.append(torch.zeros((1, 1, 3), device=self.device))
 
             unique_trajs_stack = torch.stack(unique_trajs) # [UniqueBatch, NumObjs, T, 4, 4]
             unique_vels_stack = torch.stack(unique_vels)   # [UniqueBatch, NumObjs, T, 3]
+            unique_ang_vels_stack = torch.stack(unique_ang_vels) # [UniqueBatch, NumObjs, T, 3]
             
             # 2. Broadcast 到 NumEnvs
-            return unique_trajs_stack[indices].clone(), unique_vels_stack[indices].clone()
+            return unique_trajs_stack[indices].clone(), unique_vels_stack[indices].clone(), unique_ang_vels_stack[indices].clone()
 
-        self.rh_multi_obj_traj, self.rh_multi_obj_vel = prepare_multi_obj_tensor(packed_unique_rh, env_to_data_indices)
-        self.lh_multi_obj_traj, self.lh_multi_obj_vel = prepare_multi_obj_tensor(packed_unique_lh, env_to_data_indices)
+        self.rh_multi_obj_traj, self.rh_multi_obj_vel, self.rh_multi_obj_ang_vel = prepare_multi_obj_tensor(packed_unique_rh, env_to_data_indices)
+        self.lh_multi_obj_traj, self.lh_multi_obj_vel, self.lh_multi_obj_ang_vel = prepare_multi_obj_tensor(packed_unique_lh, env_to_data_indices)
         self.num_objs_per_env = self.rh_multi_obj_traj.shape[1] # 记录物体数量
 
         print("Data loading finished.")
@@ -3035,6 +3046,10 @@ class DexHandManipBiHEnv(VecTask):
             info["adaptive_difficulty/support_force_kp"] = float(self.support_force_kp)
         if hasattr(self, 'support_force_kd'):
             info["adaptive_difficulty/support_force_kd"] = float(self.support_force_kd)
+        if hasattr(self, 'support_force_kp_rot'):
+            info["adaptive_difficulty/support_force_kp_rot"] = float(self.support_force_kp_rot)
+        if hasattr(self, 'support_force_kd_rot'):
+            info["adaptive_difficulty/support_force_kd_rot"] = float(self.support_force_kd_rot)
 
         # === [新增] 添加自适应采样统计信息 ===
         if self.random_state_init and self.adaptive_sampling_bins is not None:
@@ -3332,8 +3347,9 @@ class DexHandManipBiHEnv(VecTask):
 
     def _apply_support_forces(self):
         """
-        [新增] 动态 PD 控制器：在物理模拟前给动态物体施加辅助力 F_support
+        [新增] 动态 PD 控制器：在物理模拟前给动态物体施加辅助力 F_support 和扭矩 Tau_support
         F_support = Kp * (pos_target - pos_current) + Kd * (vel_target - vel_current)
+        Tau_support = Kp_rot * Error(q_tar, q_cur) + Kd_rot * (omega_tar - omega_cur)
         """
         cur_idx = self.progress_buf
         
@@ -3343,63 +3359,95 @@ class DexHandManipBiHEnv(VecTask):
         
         # 如果左右物体完全相同，只计算并施加一次（通常使用右手的目标轨迹）
         sides = ["rh"] if getattr(self, "is_scene_objects_shared", False) else ["rh", "lh"]
+
+        # 获取旋转相关的 Kp/Kd (如果未定义则默认为位置 Kp 的 0.1 倍，因为旋转单位是弧度，扭矩较敏感)
+        kp_rot = getattr(self, "support_force_kp_rot", self.support_force_kp * 0.1)
+        kd_rot = getattr(self, "support_force_kd_rot", self.support_force_kd * 0.1)
         
         for side in sides:
-            # 1. 获取目标状态 (N, K, 3)
+            # 1. 获取目标状态 (N, K, ...)
             multi_obj_traj = getattr(self, f"{side}_multi_obj_traj")
             multi_obj_vel_traj = getattr(self, f"{side}_multi_obj_vel")
+            multi_obj_ang_vel_traj = getattr(self, f"{side}_multi_obj_ang_vel")
             
-            # time_idx 限制在序列长度内，防止越界
+            # time_idx 限制在序列长度内
             max_T = multi_obj_traj.shape[2]
             time_idx = torch.clamp(cur_idx, 0, max_T - 1).view(-1, 1).expand(-1, self.num_objs_per_env)
             
-            # 取出当前帧的目标位置和速度
+            # 取出当前帧的目标位置、旋转矩阵、速度、角速度
             target_pos = multi_obj_traj[batch_idx, obj_idx, time_idx][..., :3, 3]
+            target_rot_mat = multi_obj_traj[batch_idx, obj_idx, time_idx][..., :3, :3]
+            target_quat = torch_jit_utils.matrix_to_quaternion(target_rot_mat)
             target_vel = multi_obj_vel_traj[batch_idx, obj_idx, time_idx]
+            target_ang_vel = multi_obj_ang_vel_traj[batch_idx, obj_idx, time_idx]
             
-            # 2. 获取当前状态 (N, K, 3)
+            # 2. 获取当前状态 (N, K, ...)
             side_states = getattr(self, f"{side}_states")
             current_pos = side_states["manip_obj_pos"]
+            current_quat = side_states["manip_obj_quat"]
             current_vel = side_states["manip_obj_vel"]
+            current_ang_vel = side_states["manip_obj_ang_vel"]
             
-            # 3. 计算 PD 辅助力 (Gain 由 VecTask 根据难度更新)
+            # 3. 计算 PD 辅助力
             force = self.support_force_kp * (target_pos - current_pos) + \
                     self.support_force_kd * (target_vel - current_vel)
             
-            # 4. 掩码：只对动态物体施加
+            # 4. 计算 PD 辅助扭矩
+            # 4.1 四元数误差 Error(q_tar, q_cur)
+            # q_err = q_tar * inv(q_cur)
+            q_cur_inv = quat_conjugate(current_quat)
+            q_err = quat_mul(target_quat, q_cur_inv)
+            
+            # 4.2 确保最短路径 (Shortest Path)
+            # if w < 0, q_err = -q_err
+            w_mask = (q_err[..., 3] < 0)
+            q_err[w_mask] = -q_err[w_mask]
+            
+            # 4.3 旋转向量误差 ~= 2 * q_err.xyz (小角度近似)
+            rot_err = 2.0 * q_err[..., :3]
+            
+            # 4.4 扭矩公式
+            torque = kp_rot * rot_err + kd_rot * (target_ang_vel - current_ang_vel)
+            
+            # 5. 掩码：只对动态物体施加
             is_static = getattr(self, f"manip_obj_{side}_is_static")
             force = force * (~is_static).unsqueeze(-1).float()
+            torque = torque * (~is_static).unsqueeze(-1).float()
             
-            # 5. 写入 apply_forces
-            rb_indices = getattr(self, f"_manip_obj_{side}_rb_indices")
-            valid_mask = (rb_indices != -1)
-
-            # [新增] 强化版辅助力可视化 (黄色表示力，青色表示目标连线)
+            # 6. [新增] 强化版辅助力和扭矩可视化
             if not self.headless:
-                for env_id in range(min(self.num_envs, 4)):  # 只画前几个环境避免卡顿
+                for env_id in range(min(self.num_envs, 4)): 
                     env_ptr = self.envs[env_id]
                     for obj_k in range(self.num_objs_per_env):
                         if not is_static[env_id, obj_k]:
                             p_curr = current_pos[env_id, obj_k].cpu().numpy()
                             p_target = target_pos[env_id, obj_k].cpu().numpy()
                             f_val = force[env_id, obj_k].cpu().numpy()
+                            t_val = torque[env_id, obj_k].cpu().numpy()
 
-                            # 1. 绘制力矢量 (黄色，显著增长)
-                            p_force_end = p_curr + f_val * 1.0  # 缩放系数增加到 1.0
+                            # 1. 绘制力矢量 (黄色)
+                            p_force_end = p_curr + f_val * 1.0 
                             yellow = np.array([1.0, 1.0, 0.0], dtype=np.float32)
                             self.gym.add_lines(self.viewer, env_ptr, 1, np.concatenate([p_curr, p_force_end]).astype(np.float32), yellow)
 
-                            # 2. 绘制指向目标的连线 (青色)
+                            # 2. 绘制扭矩矢量 (紫色，表示旋转轴和强度)
+                            p_torque_end = p_curr + t_val * 2.0 
+                            purple = np.array([1.0, 0.0, 1.0], dtype=np.float32)
+                            self.gym.add_lines(self.viewer, env_ptr, 1, np.concatenate([p_curr, p_torque_end]).astype(np.float32), purple)
+
+                            # 3. 绘制指向目标的连线 (青色)
                             cyan = np.array([0.0, 1.0, 1.0], dtype=np.float32)
                             self.gym.add_lines(self.viewer, env_ptr, 1, np.concatenate([p_curr, p_target]).astype(np.float32), cyan)
 
-            # 展平有效索引并赋值
+            # 7. 写入 apply_forces 和 apply_torque
+            rb_indices = getattr(self, f"_manip_obj_{side}_rb_indices")
+            valid_mask = (rb_indices != -1)
+            
             flat_env_idx = batch_idx[valid_mask]
             flat_rb_idx = rb_indices[valid_mask]
-            flat_force = force[valid_mask]
             
-            # 辅助力每步重新计算，直接赋值覆盖旧值
-            self.apply_forces[flat_env_idx, flat_rb_idx] = flat_force
+            self.apply_forces[flat_env_idx, flat_rb_idx] = force[valid_mask]
+            self.apply_torque[flat_env_idx, flat_rb_idx] = torque[valid_mask]
 
     def post_physics_step(self):
 
@@ -3751,7 +3799,7 @@ def compute_imitation_reward(
             | (diff_ring_tip_pos_dist > 0.22 / 0.7 * scale_factor)  # 0.135 → 0.22（提升63%，95%分位数0.215m）
             | (diff_level_1_pos_dist > 0.22 / 0.7 * scale_factor)  # 0.1575 → 0.22（提升40%，95%分位数0.220m）
             | (diff_level_2_pos_dist > 0.25 / 0.7 * scale_factor)  # 0.18 → 0.25（提升39%，基于Level 1的调整）
-            | (obj_rot_err > 180 / 0.343 * scale_factor**2)  # 上调：90° → 180°（基于实际误差分析：平均151°，95%分位数178°）
+            | (obj_rot_err > 70 / 0.343 * scale_factor**2)  # 上调：90° → 180°（基于实际误差分析：平均151°，95%分位数178°）
             | failed_execute_eef
         )
         & (running_progress_buf >= 8)
@@ -3811,19 +3859,19 @@ def compute_imitation_reward(
         + 0.75 * reward_middle_tip_pos
         + 0.6 * reward_pinky_tip_pos
         + 0.6 * reward_ring_tip_pos
-        + 0.5 * reward_level_1_pos
-        + 0.3 * reward_level_2_pos
-        + 5.0 * reward_obj_pos
-        + 2.0 * reward_obj_rot
-        + 0.3 * reward_eef_vel
+        + 0.1 * reward_level_1_pos
+        + 0.1 * reward_level_2_pos
+        + 6.0 * reward_obj_pos
+        + 5.0 * reward_obj_rot
+        + 0.1 * reward_eef_vel
         + 0.1 * reward_eef_ang_vel
         + 0.1 * reward_joints_vel
         + 0.1 * reward_obj_vel
         + 0.1 * reward_obj_ang_vel
-        + 3.0 * reward_finger_tip_force
+        + 15.0 * reward_finger_tip_force
         + 0.5 * reward_power
         + 0.5 * reward_wrist_power
-        + 1.0 * reward_contact_violation
+        + 0.0 * reward_contact_violation
         + reward_interact_scale * reward_interact # 新增
     )
 
