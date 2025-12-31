@@ -3371,7 +3371,12 @@ class DexHandManipBiHEnv(VecTask):
             # 取出当前帧的目标位置、旋转矩阵、速度、角速度
             target_pos = multi_obj_traj[batch_idx, obj_idx, time_idx][..., :3, 3]
             target_rot_mat = multi_obj_traj[batch_idx, obj_idx, time_idx][..., :3, :3]
-            target_quat = torch_jit_utils.matrix_to_quaternion(target_rot_mat)
+            
+            # 使用 rotmat_to_quat (来自 transform.py)，它返回 (w, x, y, z)
+            # 然后统一转换为 (x, y, z, w)
+            target_quat_wxyz = rotmat_to_quat(target_rot_mat.reshape(-1, 3, 3))
+            target_quat = target_quat_wxyz[:, [1, 2, 3, 0]].reshape(self.num_envs, self.num_objs_per_env, 4)
+            
             target_vel = multi_obj_vel_traj[batch_idx, obj_idx, time_idx]
             target_ang_vel = multi_obj_ang_vel_traj[batch_idx, obj_idx, time_idx]
             
