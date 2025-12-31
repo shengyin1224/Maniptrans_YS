@@ -649,7 +649,7 @@ class VecTask(Env):
 
                 # === [新增] 强行慢放，想多慢改多大 ===
                 # import time
-                time.sleep(0.3) # 每次渲染暂停 0.05秒，相当于变慢 3-4 倍
+                time.sleep(0.05) # 每次渲染暂停 0.05秒，相当于变慢 3-4 倍
                 # ===================================
 
                 # Wait for dt to elapse in real time.
