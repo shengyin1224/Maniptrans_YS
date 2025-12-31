@@ -719,6 +719,11 @@ class DexHandManipBiHEnv(VecTask):
         # num_per_row = int(np.sqrt(self.num_envs))
         num_per_row = int(np.ceil(np.sqrt(self.num_envs)))
 
+        # === [新增] 隐藏手部控制参数 ===
+        self.hide_hands = cfg["env"].get("hide_hands", False)
+        if self.hide_hands:
+            print("[INFO] Hands are HIDDEN (will be transparent and non-colliding).")
+
         for i in range(self.num_envs):
             env_ptr = self.gym.create_env(self.sim, env_lower, env_upper, num_per_row)
             self.envs.append(env_ptr)
@@ -734,14 +739,27 @@ class DexHandManipBiHEnv(VecTask):
                 )
 
             # Create Robot Actors
+            # 如果隐藏手部，设置碰撞掩码为 -1 (不与任何物体碰撞)
+            hand_collision_mask = -1 if self.hide_hands else (1 if self.dexhand_rh.self_collision else 0)
+            
             dexhand_rh_actor = self.gym.create_actor(
                 env_ptr, dexhand_rh_asset, self.dexhand_rh_pose, "dexhand_r", i,
-                (1 if self.dexhand_rh.self_collision else 0),
+                hand_collision_mask,
             )
             dexhand_lh_actor = self.gym.create_actor(
                 env_ptr, dexhand_lh_asset, self.dexhand_lh_pose, "dexhand_l", i,
-                (1 if self.dexhand_lh.self_collision else 0),
+                hand_collision_mask,
             )
+
+            # 如果隐藏手部，将手设为全透明
+            if self.hide_hands:
+                transparent_color = gymapi.Vec3(0, 0, 0) # 实际上由 set_rigid_body_color 的 alpha 决定更准，但这里设为黑色
+                # 遍历手的所有 rigid bodies
+                for b_idx in range(self.gym.get_actor_rigid_body_count(env_ptr, dexhand_rh_actor)):
+                    self.gym.set_rigid_body_color(env_ptr, dexhand_rh_actor, b_idx, gymapi.MESH_VISUAL, transparent_color)
+                for b_idx in range(self.gym.get_actor_rigid_body_count(env_ptr, dexhand_lh_actor)):
+                    self.gym.set_rigid_body_color(env_ptr, dexhand_lh_actor, b_idx, gymapi.MESH_VISUAL, transparent_color)
+
             # Set Props
             self.gym.enable_actor_dof_force_sensors(env_ptr, dexhand_rh_actor)
             self.gym.enable_actor_dof_force_sensors(env_ptr, dexhand_lh_actor)

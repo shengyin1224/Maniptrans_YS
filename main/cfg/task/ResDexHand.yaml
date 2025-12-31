@@ -59,6 +59,7 @@ env:
 
   actionScale: 1.0
   useQuatRot: false
+  hide_hands: ${resolve_default:False,${...hide_hands}}
 
   support_force:
     kp: ${resolve_default:10.0,${....support_force_kp}}
