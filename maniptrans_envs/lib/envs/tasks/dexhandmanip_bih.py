@@ -116,7 +116,9 @@ class DexHandManipBiHEnv(VecTask):
             # 失败率更新时的衰减因子，越接近1变化越慢
             self.adaptive_sampling_alpha = 0.7
             # 所有bin成功率超过此阈值才允许提升难度
-            self.adaptive_sampling_all_bins_threshold = 0.40
+            self.adaptive_sampling_all_bins_threshold = self.cfg["env"].get("adaptiveSamplingAllBinsThreshold", 0.40)
+            self.reward_interact_scale = self.cfg["env"].get("rewardInteractScale", 2.0)
+            self.terminate_on_eef = self.cfg["env"].get("terminateOnEEF", False)
 
             print(f"[ADAPTIVE SAMPLING] Enabled with {self.adaptive_sampling_bins} bins")
             print(f"  - Kernel size: {self.adaptive_sampling_kernel_size}, Lambda: {self.adaptive_sampling_lambda}")
@@ -137,6 +139,7 @@ class DexHandManipBiHEnv(VecTask):
             self.adaptive_step_window = self.cfg["env"].get("adaptiveStepWindow", 5)  # 连续N个epoch检查平均step
             self.adaptive_step_threshold = self.cfg["env"].get("adaptiveStepThreshold", 20)  # 平均step阈值
             self.adaptive_no_improvement_window = self.cfg["env"].get("adaptiveNoImprovementWindow", 10)  # 连续N个epoch没有提升就降低难度
+            self.adaptive_stuck_threshold = self.cfg["env"].get("adaptiveStuckThreshold", 50) # 当一个难度持续N个epoch没下降难度就立刻下降
             self.adaptive_scale_factor_min = self.cfg["env"].get("adaptiveScaleFactorMin", 0.7)  # scale_factor最小值
             self.adaptive_scale_factor_max = self.cfg["env"].get("adaptiveScaleFactorMax", 1.0)  # scale_factor最大值
             self.adaptive_scale_step = self.cfg["env"].get("adaptiveScaleStep", 0.05)  # 每次调整的步长
@@ -1822,6 +1825,8 @@ class DexHandManipBiHEnv(VecTask):
             scale_factor,
             (self.dexhand_rh if side == "rh" else self.dexhand_lh).weight_idx,
             obj_is_static,  # 新增：静态物体信息
+            self.reward_interact_scale, # 新增
+            self.terminate_on_eef, # 新增
         )
 
         # [Hack 结束] 恢复原始状态，以免影响其他逻辑
@@ -1976,9 +1981,9 @@ class DexHandManipBiHEnv(VecTask):
                     eef_ang_vel_err = torch.abs(side_states["base_state"][env_id_item, 10:13] - target_state["wrist_ang_vel"][env_id_item]).mean().item()
     
                     eef_pos_threshold = 0.16 / 0.7 * scale_factor
-                    eef_rot_threshold_deg = 60 * scale_factor
+                    eef_rot_threshold_deg = 120 * scale_factor
                     eef_vel_threshold = 3.0 / 0.7 * scale_factor
-                    eef_ang_vel_threshold = 5.0 / 0.7 * scale_factor
+                    eef_ang_vel_threshold = 12.0 / 0.7 * scale_factor
     
                     eef_pos_failed = eef_pos_err > eef_pos_threshold
                     eef_rot_failed = eef_rot_err_deg > eef_rot_threshold_deg
@@ -2008,18 +2013,18 @@ class DexHandManipBiHEnv(VecTask):
                         failure_reasons.append(f"  - Level 2 关节位置误差过大: {level_2_dist:.4f} > {level_2_threshold:.4f} m")
                     if contact_violation:
                         failure_reasons.append(f"  - 接触惩罚: 手指距离过近但未检测到接触")
-                    if eef_pos_failed:
-                        failure_reasons.append(f"  - 手腕位置误差过大: {eef_pos_err:.4f} > {eef_pos_threshold:.4f} m")
-                    if eef_rot_failed:
-                        failure_reasons.append(f"  - 手腕旋转误差过大: {eef_rot_err_deg:.2f}° > {eef_rot_threshold_deg:.2f}°")
-                    if eef_vel_failed:
-                        failure_reasons.append(f"  - 手腕线速度误差过大: {eef_vel_err:.4f} > {eef_vel_threshold:.4f} m/s")
-                    if eef_ang_vel_failed:
-                        failure_reasons.append(f"  - 手腕角速度误差过大: {eef_ang_vel_err:.4f} > {eef_ang_vel_threshold:.4f} rad/s")
+                    if eef_pos_failed and self.terminate_on_eef:
+                        failure_reasons.append(f"  - [EEF Term] 手腕位置误差过大: {eef_pos_err:.4f} > {eef_pos_threshold:.4f} m")
+                    if eef_rot_failed and self.terminate_on_eef:
+                        failure_reasons.append(f"  - [EEF Term] 手腕旋转误差过大: {eef_rot_err_deg:.2f}° > {eef_rot_threshold_deg:.2f}°")
+                    if eef_vel_failed and self.terminate_on_eef:
+                        failure_reasons.append(f"  - [EEF Term] 手腕线速度误差过大: {eef_vel_err:.4f} > {eef_vel_threshold:.4f} m/s")
+                    if eef_ang_vel_failed and self.terminate_on_eef:
+                        failure_reasons.append(f"  - [EEF Term] 手腕角速度误差过大: {eef_ang_vel_err:.4f} > {eef_ang_vel_threshold:.4f} rad/s")
                     if error_eef_vel:
-                        failure_reasons.append(f"  - 手腕线速度异常: {eef_vel_norm:.2f} > 100 m/s")
+                        failure_reasons.append(f"  - [EEF Abnormal] 手腕线速度异常: {eef_vel_norm:.2f} > 100 m/s")
                     if error_eef_ang_vel:
-                        failure_reasons.append(f"  - 手腕角速度异常: {eef_ang_vel_norm:.2f} > 200 rad/s")
+                        failure_reasons.append(f"  - [EEF Abnormal] 手腕角速度异常: {eef_ang_vel_norm:.2f} > 200 rad/s")
                     if error_joints_vel:
                         failure_reasons.append(f"  - 关节速度异常: {joints_vel_norm:.2f} > 100 m/s")
                     if error_dof_vel:
@@ -2813,25 +2818,33 @@ class DexHandManipBiHEnv(VecTask):
                         self.difficulty_increase_timer -= 1
                     
                     # 4. 检查难度下降条件
-                    # 标准 A: 所有 bin 的 EMA 成功率都超过 40%
-                    all_bins_ema_high = torch.all(ema_bin_rates > 0.40).item()
+                    # 标准 A: 所有 bin 的 EMA 成功率都超过阈值
+                    all_bins_ema_high = torch.all(ema_bin_rates > self.adaptive_sampling_all_bins_threshold).item()
                     
                     # 标准 B: 当前难度下超过 40 轮，且 40 轮平均成功率的最小值 >= 30%
                     avg_rates_at_current_scale = self.bin_success_sum_at_current_scale / self.epochs_at_current_scale
                     min_avg_rate = torch.min(avg_rates_at_current_scale).item()
                     fallback_trigger = (self.epochs_at_current_scale >= 40 and min_avg_rate >= 0.30)
                     
+                    # 标准 C: [新增] 强制下降逻辑：当一个难度持续 N 个 epoch 没下降难度就立刻下降
+                    stuck_trigger = (self.epochs_at_current_scale >= self.adaptive_stuck_threshold)
+
                     if not scale_changed:
                         if all_bins_ema_high:
                             # 标准方式触发
                             self.adaptive_global_scale_factor = max(self.adaptive_scale_factor_min, self.adaptive_global_scale_factor - 0.02)
                             scale_changed = True
-                            print(f"[ADAPTIVE] Epoch {self.adaptive_current_epoch}: Coefficient Falls (-0.02) due to all bins EMA > 40%.")
+                            print(f"[ADAPTIVE] Epoch {self.adaptive_current_epoch}: Coefficient Falls (-0.02) due to all bins EMA > {self.adaptive_sampling_all_bins_threshold*100:.1f}%.")
                         elif fallback_trigger:
                             # 兜底方式触发 (40轮平均 > 30%)
                             self.adaptive_global_scale_factor = max(self.adaptive_scale_factor_min, self.adaptive_global_scale_factor - 0.02)
                             scale_changed = True
                             print(f"[ADAPTIVE] Epoch {self.adaptive_current_epoch}: Coefficient Falls (-0.02) due to fallback trigger (40+ epochs mean success > 30%, actual min avg: {min_avg_rate*100:.1f}%).")
+                        elif stuck_trigger:
+                            # 强制下降方式触发
+                            self.adaptive_global_scale_factor = max(self.adaptive_scale_factor_min, self.adaptive_global_scale_factor - 0.02)
+                            scale_changed = True
+                            print(f"[ADAPTIVE] Epoch {self.adaptive_current_epoch}: Coefficient Falls (-0.02) due to stuck trigger ({self.epochs_at_current_scale} epochs without improvement).")
                     
                     # 调试信息打印
                     cur_rates_str = ", ".join([f"{r*100:.1f}%" for r in current_epoch_bin_rates.tolist()])
@@ -3452,9 +3465,11 @@ def compute_imitation_reward(
     scale_factor: float,
     dexhand_weight_idx: Dict[str, List[int]],
     obj_is_static: Tensor,  # [N, K] 新增：静态物体信息
+    reward_interact_scale: float = 2.0, # 新增
+    terminate_on_eef: bool = True, # 新增
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
 
-    # type: (Tensor, Tensor, Tensor, Tensor, Dict[str, Tensor], Dict[str, Tensor], Tensor, float,  Dict[str, List[int]], Tensor) -> Tuple[Tensor, Tensor, Tensor, Tensor, Dict[str, Tensor], Tensor]
+    # type: (Tensor, Tensor, Tensor, Tensor, Dict[str, Tensor], Dict[str, Tensor], Tensor, float,  Dict[str, List[int]], Tensor, float, bool) -> Tuple[Tensor, Tensor, Tensor, Tensor, Dict[str, Tensor], Tensor]
 
     # end effector pose reward
     current_eef_pos = states["base_state"][:, :3]
@@ -3670,6 +3685,13 @@ def compute_imitation_reward(
         (finger_tip_distance < 0.005) & ~tip_contact_active, dim=-1
     )
 
+    failed_execute_eef = (
+        (diff_eef_pos_dist > 0.16 / 0.7 * scale_factor)  # 手腕位置误差阈值
+        | (diff_eef_rot_angle.abs() > (120 / 180 * np.pi) * scale_factor)  # 手腕旋转误差阈值 (120度)
+        | (diff_eef_vel.abs().mean(dim=-1) > 3.0 / 0.7 * scale_factor)  # 手腕线速度误差阈值
+        | (diff_eef_ang_vel.abs().mean(dim=-1) > 12.0 / 0.7 * scale_factor)  # 手腕角速度误差阈值
+    ) if terminate_on_eef else torch.zeros_like(obj_pos_err, dtype=torch.bool)
+
     failed_execute = (
         (
             (obj_pos_err > 0.12 / 0.343 * scale_factor**2)  # 调整：0.08 → 0.15（基于实际误差分析：平均0.148m，95%分位数0.22m）
@@ -3681,10 +3703,7 @@ def compute_imitation_reward(
             | (diff_level_1_pos_dist > 0.22 / 0.7 * scale_factor)  # 0.1575 → 0.22（提升40%，95%分位数0.220m）
             | (diff_level_2_pos_dist > 0.25 / 0.7 * scale_factor)  # 0.18 → 0.25（提升39%，基于Level 1的调整）
             | (obj_rot_err > 180 / 0.343 * scale_factor**2)  # 上调：90° → 180°（基于实际误差分析：平均151°，95%分位数178°）
-            | (diff_eef_pos_dist > 0.16 / 0.7 * scale_factor)  # 修改：手腕位置误差 (0.15 -> 0.08)
-            | (diff_eef_rot_angle.abs() > (100 / 180 * np.pi) * scale_factor)  # 修改：手腕旋转误差 (120 -> 30度)
-            | (diff_eef_vel.abs().mean(dim=-1) > 3.0 / 0.7 * scale_factor)  # 新增：手腕线速度误差
-            | (diff_eef_ang_vel.abs().mean(dim=-1) > 10.0 / 0.7 * scale_factor)  # 新增：手腕角速度误差
+            | failed_execute_eef
         )
         & (running_progress_buf >= 8)
     ) | error_buf
@@ -3736,8 +3755,8 @@ def compute_imitation_reward(
     reward_interact = torch.exp(-lambda_dynamic * e_interact)
 
     reward_execute = (
-        1 * reward_eef_pos  # 从0.1增加到0.3，提高wrist位置跟踪的权重
-        + 2 * reward_eef_rot
+        0.5 * reward_eef_pos  # 从0.1增加到0.3，提高wrist位置跟踪的权重
+        + 1 * reward_eef_rot
         + 0.9 * reward_thumb_tip_pos
         + 0.8 * reward_index_tip_pos
         + 0.75 * reward_middle_tip_pos
@@ -3756,7 +3775,7 @@ def compute_imitation_reward(
         + 0.5 * reward_power
         + 0.5 * reward_wrist_power
         + 1.0 * reward_contact_violation
-        + 2.0 * reward_interact # 新增
+        + reward_interact_scale * reward_interact # 新增
     )
 
     succeeded = (

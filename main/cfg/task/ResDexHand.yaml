@@ -44,6 +44,11 @@ env:
   tightenMethod: "adaptive"  # 使用自适应难度调整
   tightenFactor: 1.0  # 初始scale_factor（可选，默认1.0）
   
+  rewardInteractScale: ${resolve_default:2.0,${...reward_interact_scale}}
+  terminateOnEEF: ${resolve_default:False,${...terminate_on_eef}}
+  adaptiveSamplingAllBinsThreshold: ${resolve_default:0.40,${...adaptive_sampling_all_bins_threshold}}
+  adaptiveStuckThreshold: ${resolve_default:50,${...adaptive_stuck_threshold}}
+  
   # 自适应难度调整参数（可选，有默认值）
   adaptiveRewardWindow: 10      # 检查reward稳定性的窗口大小（默认10轮）
   adaptiveStepWindow: 5         # 检查step的窗口大小（默认5轮）
@@ -56,9 +61,9 @@ env:
   useQuatRot: false
 
   support_force:
-    kp: 10.0
-    kd: 3.0
-    end_factor: 0.4 # 难度系数降到这里时衰减至0
+    kp: ${resolve_default:10.0,${....support_force_kp}}
+    kd: ${resolve_default:3.0,${....support_force_kd}}
+    end_factor: ${resolve_default:0.4,${....support_force_end_factor}}
 
   # for distillation
   propDumpInfo:

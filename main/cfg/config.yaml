@@ -24,6 +24,13 @@ rolloutLen: null
 rolloutBegin: null
 
 learning_rate: 5e-4
+reward_interact_scale: ''
+terminate_on_eef: ''
+adaptive_sampling_all_bins_threshold: ''
+adaptive_stuck_threshold: ''
+support_force_kp: ''
+support_force_kd: ''
+support_force_end_factor: ''
 actionsMovingAverage: 1.0
 
 usePIDControl: False
