@@ -3080,56 +3080,6 @@ class DexHandManipBiHEnv(VecTask):
         return obs, rew, done, info
 
     def pre_physics_step(self, actions):
-        # ======= VASE DEBUG START =======
-        # 在第 558 帧强制将花瓶对齐到目标位姿
-        if self.progress_buf[0] == 558:
-            print(f"\n[DEBUG] Frame 558: Forcing 'vase' actors to target pose...")
-            
-            # 1. 准备目标数据索引
-            cur_idx = self.progress_buf
-            batch_idx = torch.arange(self.num_envs, device=self.device).view(-1, 1).expand(-1, self.num_objs_per_env)
-            obj_idx = torch.arange(self.num_objs_per_env, device=self.device).view(1, -1).expand(self.num_envs, -1)
-            
-            # 获取目标状态 (假设使用右手参考轨迹)
-            multi_obj_traj = self.rh_multi_obj_traj
-            max_T = multi_obj_traj.shape[2]
-            time_idx = torch.clamp(cur_idx, 0, max_T - 1).view(-1, 1).expand(-1, self.num_objs_per_env)
-            
-            target_pos_all = multi_obj_traj[batch_idx, obj_idx, time_idx][..., :3, 3]
-            target_rot_mat_all = multi_obj_traj[batch_idx, obj_idx, time_idx][..., :3, :3]
-            
-            # 2. 遍历环境寻找名为 'vase' 的 actor
-            for env_i in range(self.num_envs):
-                env_ptr = self.envs[env_i]
-                actor_count = self.gym.get_actor_count(env_ptr)
-                
-                for a_idx in range(actor_count):
-                    actor_name = self.gym.get_actor_name(env_ptr, a_idx)
-                    
-                    if 'vase' in actor_name.lower():
-                        # 确定这个花瓶是当前环境中的第几个物体 (k)
-                        obj_k = 0 # 简化处理
-                        
-                        # 获取目标
-                        t_pos = target_pos_all[env_i, obj_k]
-                        t_rot_mat = target_rot_mat_all[env_i, obj_k]
-                        
-                        # 转换旋转矩阵到四元数 (XYZW)
-                        t_quat_wxyz = rotmat_to_quat(t_rot_mat.unsqueeze(0))
-                        t_quat = t_quat_wxyz[:, [1, 2, 3, 0]].squeeze(0)
-                        
-                        # 获取该 actor 在全局 root_state 中的索引
-                        global_actor_idx = self.gym.get_actor_index(env_ptr, a_idx, gymapi.DOMAIN_SIM)
-                        
-                        # 强制注入位姿
-                        self._root_state[env_i, global_actor_idx, 0:3] = t_pos
-                        self._root_state[env_i, global_actor_idx, 3:7] = t_quat
-                        self._root_state[env_i, global_actor_idx, 7:13] = 0 # 速度清零
-            
-            # 3. 立即应用更改
-            self.gym.set_actor_root_state_tensor(self.sim, gymtorch.unwrap_tensor(self._root_state))
-            print(f"[DEBUG] Vase forcing complete for all envs.")
-        # ======= VASE DEBUG END =======
 
         # ? >>> for visualization
         if not self.headless:
@@ -3458,11 +3408,17 @@ class DexHandManipBiHEnv(VecTask):
             w_mask = (q_err[..., 3] < 0)
             q_err[w_mask] = -q_err[w_mask]
             
-            # 4.3 旋转向量误差 ~= 2 * q_err.xyz (小角度近似)
-            rot_err = 2.0 * q_err[..., :3]
+            # 4.3 旋转向量误差 (Axis-Angle Error)
+            # 使用 atan2 计算精确的旋转向量误差，相比 2*q_xyz 在大角度下更准确
+            q_xyz = q_err[..., :3]
+            q_w = q_err[..., 3].unsqueeze(-1)
+            norm_xyz = torch.norm(q_xyz, dim=-1, keepdim=True)
+            angle = 2.0 * torch.atan2(norm_xyz, q_w)
+            # 防止除以极小值，当角度很小时退化为线性近似 2.0 * q_xyz
+            rot_err = torch.where(norm_xyz > 1e-6, (q_xyz / norm_xyz) * angle, 2.0 * q_xyz)
             
             # 4.4 扭矩公式
-            torque = kp_rot * rot_err + kd_rot * (target_ang_vel - current_ang_vel)
+            torque = kp_rot * rot_err + kd_rot * (- current_ang_vel)
             
             # 5. 掩码：只对动态物体施加
             is_static = getattr(self, f"manip_obj_{side}_is_static")
