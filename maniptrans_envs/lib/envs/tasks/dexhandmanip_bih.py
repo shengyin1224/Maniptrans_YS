@@ -3419,6 +3419,8 @@ class DexHandManipBiHEnv(VecTask):
             
             # 4.4 扭矩公式
             torque = kp_rot * rot_err + kd_rot * (- current_ang_vel)
+            max_torque = 0.1
+            torque = torch.clamp(torque, -max_torque, max_torque)
             
             # 5. 掩码：只对动态物体施加
             is_static = getattr(self, f"manip_obj_{side}_is_static")
