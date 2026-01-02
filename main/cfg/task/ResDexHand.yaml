@@ -44,7 +44,10 @@ env:
   tightenMethod: "adaptive"  # 使用自适应难度调整
   tightenFactor: 1.0  # 初始scale_factor（可选，默认1.0）
   
-  rewardInteractScale: ${resolve_default:2.0,${...reward_interact_scale}}
+  rewardInteractScale: ${resolve_default:0.2,${...reward_interact_scale}}
+  rewardObjPosScale: ${resolve_default:6.0,${...reward_obj_pos_scale}}
+  rewardObjRotScale: ${resolve_default:5.0,${...reward_obj_rot_scale}}
+  rewardFingerTipForceScale: ${resolve_default:15.0,${...reward_finger_tip_force_scale}}
   terminateOnEEF: ${resolve_default:False,${...terminate_on_eef}}
   adaptiveSamplingAllBinsThreshold: ${resolve_default:0.40,${...adaptive_sampling_all_bins_threshold}}
   adaptiveStuckThreshold: ${resolve_default:50,${...adaptive_stuck_threshold}}
@@ -53,7 +56,7 @@ env:
   adaptiveRewardWindow: 10      # 检查reward稳定性的窗口大小（默认10轮）
   adaptiveStepWindow: 5         # 检查step的窗口大小（默认5轮）
   adaptiveStepThreshold: 20     # step阈值，低于此值则降低难度（默认20步）
-  adaptiveScaleFactorMin: 0.24   # scale_factor最小值（默认0.7）
+  adaptiveScaleFactorMin: 0.38   # scale_factor最小值（默认0.7）
   adaptiveScaleFactorMax: 1.0   # scale_factor最大值（默认1.0）
   adaptiveScaleStep: 0.02       # 每次调整的步长（默认0.05）
 
@@ -67,6 +70,7 @@ env:
     kp_rot: ${resolve_default:1.0,${....support_force_kp_rot}}
     kd_rot: ${resolve_default:0.3,${....support_force_kd_rot}}
     end_factor: ${resolve_default:0.4,${....support_force_end_factor}}
+    decay_start_ratio: ${resolve_default:0.8,${....support_force_decay_start_ratio}}
 
   # for distillation
   propDumpInfo:

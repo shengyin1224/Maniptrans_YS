@@ -104,7 +104,12 @@ class DexHandManipBiHEnv(VecTask):
         self.random_state_init = self.cfg["env"]["randomStateInit"]
 
         self.reward_interact_scale = self.cfg["env"].get("rewardInteractScale", 2.0)
+        self.reward_obj_pos_scale = self.cfg["env"].get("rewardObjPosScale", 6.0)
+        self.reward_obj_rot_scale = self.cfg["env"].get("rewardObjRotScale", 5.0)
+        self.reward_finger_tip_force_scale = self.cfg["env"].get("rewardFingerTipForceScale", 15.0)
         self.terminate_on_eef = self.cfg["env"].get("terminateOnEEF", False)
+        support_force_cfg = self.cfg.get("env", {}).get("support_force", {})
+        self.support_force_decay_start_ratio = support_force_cfg.get("decay_start_ratio", 0.8)
 
         # === [新增] 自适应采样相关配置 ===
         if self.random_state_init:
@@ -1615,7 +1620,8 @@ class DexHandManipBiHEnv(VecTask):
         
         target_state = {}
         max_length = torch.clip(side_demo_data["seq_len"], 0, self.max_episode_length).float()
-        cur_idx = self.progress_buf
+        # [修复] 增加对 cur_idx 的 clamp，防止 progress_buf 超过 demo 长度导致的 indexing 报错
+        cur_idx = torch.clamp(self.progress_buf, torch.zeros_like(side_demo_data["seq_len"]), side_demo_data["seq_len"] - 1)
 
         # --- [修复核心] 机器人相关 Reward 数据提取：强制指定形状 ---
         
@@ -1862,6 +1868,9 @@ class DexHandManipBiHEnv(VecTask):
             obj_is_static,  # 新增：静态物体信息
             self.reward_interact_scale, # 新增
             self.terminate_on_eef, # 新增
+            self.reward_obj_pos_scale,
+            self.reward_obj_rot_scale,
+            self.reward_finger_tip_force_scale,
         )
 
         # [Hack 结束] 恢复原始状态，以免影响其他逻辑
@@ -1902,7 +1911,7 @@ class DexHandManipBiHEnv(VecTask):
                             obj_pos_err = 0.0  # 所有物体都是静态的
                     else:
                         obj_pos_err = dist_objs_env.item()
-                    obj_pos_threshold = 0.12 / 0.343 * scale_factor**2  # 调整：0.08 → 0.15（基于实际误差分析：平均0.148m，95%分位数0.22m）
+                    obj_pos_threshold = 0.05 / 0.343 * scale_factor**2  # 调整：0.08 → 0.15（基于实际误差分析：平均0.148m，95%分位数0.22m）
                     obj_pos_failed = obj_pos_err > obj_pos_threshold
                     
                     # 2. 物体旋转误差（修复180°问题：使用 quat_to_angle_axis，与 JIT 函数一致，排除静态物体）
@@ -1925,7 +1934,7 @@ class DexHandManipBiHEnv(VecTask):
                     else:
                         obj_rot_err = 0.0
                     # 上调阈值：90° → 180°（基于实际误差分析：平均151°，95%分位数178°）
-                    obj_rot_threshold = 180 / 0.343 * scale_factor**2
+                    obj_rot_threshold = 70 / 0.343 * scale_factor**2
                     obj_rot_failed = obj_rot_err > obj_rot_threshold
                     
                     # 3. 手指位置误差
@@ -3083,8 +3092,8 @@ class DexHandManipBiHEnv(VecTask):
 
         # ? >>> for visualization
         if not self.headless:
-
-            cur_idx = self.progress_buf
+            # [修复] 增加对 cur_idx 的 clamp，防止 progress_buf 超过 demo 长度导致的 indexing 报错
+            cur_idx = torch.clamp(self.progress_buf, torch.zeros_like(self.demo_data_rh["seq_len"]), self.demo_data_rh["seq_len"] - 1)
 
             self.gym.clear_lines(self.viewer)
 
@@ -3504,6 +3513,45 @@ class DexHandManipBiHEnv(VecTask):
             isaac_gym.set_camera_location(camera, env, cam_pos, cam_target)
         return camera
 
+    def set_adaptive_scale_factor(self, scale_factor):
+        """覆盖基类的难度调整逻辑，支持自定义的支撑力衰减逻辑"""
+        self.current_adaptive_scale_factor = scale_factor
+
+        # === [核心修改] 支撑力衰减逻辑 ===
+        # scale_factor 从 1.0 (最易) 到 self.adaptive_scale_factor_min (最难)
+        s_min = getattr(self, "adaptive_scale_factor_min", 0.7)
+        
+        # 计算支撑力开始衰减的阈值 (s_start_decay)
+        # 根据用户公式: 1 - ratio * (1 - s_min)
+        s_start_decay = 1.0 - self.support_force_decay_start_ratio * (1.0 - s_min)
+        s_end = self.support_force_end_factor # 衰减到的终止难度值
+
+        if scale_factor >= s_start_decay:
+            # 难度较低阶段，支撑力保持最大
+            self.support_force_kp = self.support_force_kp_start
+            self.support_force_kd = self.support_force_kd_start
+            self.support_force_kp_rot = self.support_force_kp_rot_start
+            self.support_force_kd_rot = self.support_force_kd_rot_start
+        elif scale_factor >= s_end:
+            # 难度进阶阶段，从 s_start_decay 到 s_end 支撑力线性衰减至 0
+            decay_range = s_start_decay - s_end
+            if decay_range > 0:
+                normalized_decay = (s_start_decay - scale_factor) / decay_range
+            else:
+                normalized_decay = 1.0
+            
+            decay_factor = 1.0 - normalized_decay
+            self.support_force_kp = self.support_force_kp_start * decay_factor
+            self.support_force_kd = self.support_force_kd_start * decay_factor
+            self.support_force_kp_rot = self.support_force_kp_rot_start * decay_factor
+            self.support_force_kd_rot = self.support_force_kd_rot_start * decay_factor
+        else:
+            # 难度超过 s_end 后，支撑力完全关闭
+            self.support_force_kp = 0.0
+            self.support_force_kd = 0.0
+            self.support_force_kp_rot = 0.0
+            self.support_force_kd_rot = 0.0
+
     def set_force_vis(self, env_ptr, part_k, has_force, side):
         self.gym.set_rigid_body_color(
             env_ptr,
@@ -3577,9 +3625,12 @@ def compute_imitation_reward(
     obj_is_static: Tensor,  # [N, K] 新增：静态物体信息
     reward_interact_scale: float = 2.0, # 新增
     terminate_on_eef: bool = True, # 新增
+    reward_obj_pos_scale: float = 6.0,
+    reward_obj_rot_scale: float = 5.0,
+    reward_finger_tip_force_scale: float = 15.0,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
 
-    # type: (Tensor, Tensor, Tensor, Tensor, Dict[str, Tensor], Dict[str, Tensor], Tensor, float,  Dict[str, List[int]], Tensor, float, bool) -> Tuple[Tensor, Tensor, Tensor, Tensor, Dict[str, Tensor], Tensor]
+    # type: (Tensor, Tensor, Tensor, Tensor, Dict[str, Tensor], Dict[str, Tensor], Tensor, float,  Dict[str, List[int]], Tensor, float, bool, float, float, float) -> Tuple[Tensor, Tensor, Tensor, Tensor, Dict[str, Tensor], Tensor]
 
     # end effector pose reward
     current_eef_pos = states["base_state"][:, :3]
@@ -3804,7 +3855,7 @@ def compute_imitation_reward(
 
     failed_execute = (
         (
-            (obj_pos_err > 0.12 / 0.343 * scale_factor**2)  # 调整：0.08 → 0.15（基于实际误差分析：平均0.148m，95%分位数0.22m）
+            (obj_pos_err > 0.05 / 0.343 * scale_factor**2)  # 调整：0.08 → 0.15（基于实际误差分析：平均0.148m，95%分位数0.22m）
             | (diff_thumb_tip_pos_dist > 0.18 / 0.7 * scale_factor)  # 0.1125 → 0.18（提升60%，95%分位数0.183m）
             | (diff_index_tip_pos_dist > 0.20 / 0.7 * scale_factor)  # 0.12375 → 0.20（提升62%，95%分位数0.200m）
             | (diff_middle_tip_pos_dist > 0.18 / 0.7 * scale_factor)  # 0.1125 → 0.18（提升60%，95%分位数0.179m）
@@ -3874,14 +3925,14 @@ def compute_imitation_reward(
         + 0.6 * reward_ring_tip_pos
         + 0.1 * reward_level_1_pos
         + 0.1 * reward_level_2_pos
-        + 6.0 * reward_obj_pos
-        + 5.0 * reward_obj_rot
+        + reward_obj_pos_scale * reward_obj_pos
+        + reward_obj_rot_scale * reward_obj_rot
         + 0.1 * reward_eef_vel
         + 0.1 * reward_eef_ang_vel
         + 0.1 * reward_joints_vel
         + 0.1 * reward_obj_vel
         + 0.1 * reward_obj_ang_vel
-        + 15.0 * reward_finger_tip_force
+        + reward_finger_tip_force_scale * reward_finger_tip_force
         + 0.5 * reward_power
         + 0.5 * reward_wrist_power
         + 0.0 * reward_contact_violation
@@ -3891,12 +3942,17 @@ def compute_imitation_reward(
     succeeded = (
         progress_buf + 1 + 3 >= max_length
     ) & ~failed_execute  # reached the end of the trajectory, +3 for max future 3 steps
-    # [DEBUG] 修改为永远不会因为失败而重置，方便观察
+    
+    # [恢复] 失败立刻重置，或到达轨迹终点/成功时重置
     reset_buf = torch.where(
-        succeeded, # 只在成功时重置
+        (progress_buf + 1 + 3 >= max_length) | succeeded | failed_execute,
         torch.ones_like(reset_buf),
-        torch.zeros_like(reset_buf), # 失败也不重置
+        torch.zeros_like(reset_buf),
     )
+    # [DEBUG] 如果用户确实想在失败时不重置（为了观察），由于我们上面已经加了 cur_idx clamp，
+    # 其实不重置也不会报错了。但通常为了训练逻辑正确，到结尾还是应该重置。
+    # 这里我们优先保证不报错。
+
     reward_dict = {
         "reward_eef_pos": reward_eef_pos,
         "reward_eef_rot": reward_eef_rot,
