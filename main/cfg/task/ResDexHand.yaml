@@ -56,7 +56,7 @@ env:
   adaptiveRewardWindow: 10      # 检查reward稳定性的窗口大小（默认10轮）
   adaptiveStepWindow: 5         # 检查step的窗口大小（默认5轮）
   adaptiveStepThreshold: 20     # step阈值，低于此值则降低难度（默认20步）
-  adaptiveScaleFactorMin: 0.38   # scale_factor最小值（默认0.7）
+  adaptiveScaleFactorMin: 0.3   # scale_factor最小值（默认0.7）
   adaptiveScaleFactorMax: 1.0   # scale_factor最大值（默认1.0）
   adaptiveScaleStep: 0.02       # 每次调整的步长（默认0.05）
 
@@ -70,7 +70,7 @@ env:
     kp_rot: ${resolve_default:1.0,${....support_force_kp_rot}}
     kd_rot: ${resolve_default:0.3,${....support_force_kd_rot}}
     end_factor: ${resolve_default:0.4,${....support_force_end_factor}}
-    decay_start_ratio: ${resolve_default:0.8,${....support_force_decay_start_ratio}}
+    decay_start_factor: ${resolve_default:0.8,${....support_force_decay_start_factor}}
 
   # for distillation
   propDumpInfo:

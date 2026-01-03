@@ -36,7 +36,7 @@ support_force_kd: ''
 support_force_kp_rot: ''
 support_force_kd_rot: ''
 support_force_end_factor: ''
-support_force_decay_start_ratio: ''
+support_force_decay_start_factor: ''
 actionsMovingAverage: 1.0
 
 usePIDControl: False

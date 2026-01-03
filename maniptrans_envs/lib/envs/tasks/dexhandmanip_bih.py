@@ -109,7 +109,7 @@ class DexHandManipBiHEnv(VecTask):
         self.reward_finger_tip_force_scale = self.cfg["env"].get("rewardFingerTipForceScale", 15.0)
         self.terminate_on_eef = self.cfg["env"].get("terminateOnEEF", False)
         support_force_cfg = self.cfg.get("env", {}).get("support_force", {})
-        self.support_force_decay_start_ratio = support_force_cfg.get("decay_start_ratio", 0.8)
+        self.support_force_decay_start_factor = support_force_cfg.get("decay_start_factor", 0.8)
 
         # === [新增] 自适应采样相关配置 ===
         if self.random_state_init:
@@ -1911,7 +1911,7 @@ class DexHandManipBiHEnv(VecTask):
                             obj_pos_err = 0.0  # 所有物体都是静态的
                     else:
                         obj_pos_err = dist_objs_env.item()
-                    obj_pos_threshold = 0.05 / 0.343 * scale_factor**2  # 调整：0.08 → 0.15（基于实际误差分析：平均0.148m，95%分位数0.22m）
+                    obj_pos_threshold = 0.2 / 0.343 * scale_factor**2  # 调整：0.08 → 0.15（基于实际误差分析：平均0.148m，95%分位数0.22m）
                     obj_pos_failed = obj_pos_err > obj_pos_threshold
                     
                     # 2. 物体旋转误差（修复180°问题：使用 quat_to_angle_axis，与 JIT 函数一致，排除静态物体）
@@ -2027,7 +2027,7 @@ class DexHandManipBiHEnv(VecTask):
                     eef_pos_threshold = 0.16 / 0.7 * scale_factor
                     eef_rot_threshold_deg = 120 * scale_factor
                     eef_vel_threshold = 3.0 / 0.7 * scale_factor
-                    eef_ang_vel_threshold = 12.0 / 0.7 * scale_factor
+                    eef_ang_vel_threshold = 14.0 / 0.7 * scale_factor
     
                     eef_pos_failed = eef_pos_err > eef_pos_threshold
                     eef_rot_failed = eef_rot_err_deg > eef_rot_threshold_deg
@@ -3518,12 +3518,9 @@ class DexHandManipBiHEnv(VecTask):
         self.current_adaptive_scale_factor = scale_factor
 
         # === [核心修改] 支撑力衰减逻辑 ===
-        # scale_factor 从 1.0 (最易) 到 self.adaptive_scale_factor_min (最难)
-        s_min = getattr(self, "adaptive_scale_factor_min", 0.7)
-        
-        # 计算支撑力开始衰减的阈值 (s_start_decay)
-        # 根据用户公式: 1 - ratio * (1 - s_min)
-        s_start_decay = 1.0 - self.support_force_decay_start_ratio * (1.0 - s_min)
+        # scale_factor 从 1.0 (最易) 到 end_factor 逐渐撤销 support force
+        # 从 1.0 到 decay_start_factor 保持最大，从 decay_start_factor 到 end_factor 线性衰减
+        s_start_decay = self.support_force_decay_start_factor
         s_end = self.support_force_end_factor # 衰减到的终止难度值
 
         if scale_factor >= s_start_decay:
@@ -3847,15 +3844,13 @@ def compute_imitation_reward(
     )
 
     failed_execute_eef = (
-        (diff_eef_pos_dist > 0.16 / 0.7 * scale_factor)  # 手腕位置误差阈值
-        | (diff_eef_rot_angle.abs() > (120 / 180 * np.pi) * scale_factor)  # 手腕旋转误差阈值 (120度)
-        | (diff_eef_vel.abs().mean(dim=-1) > 3.0 / 0.7 * scale_factor)  # 手腕线速度误差阈值
-        | (diff_eef_ang_vel.abs().mean(dim=-1) > 12.0 / 0.7 * scale_factor)  # 手腕角速度误差阈值
+        (diff_eef_vel.abs().mean(dim=-1) > 3.0 / 0.7 * scale_factor)  # 手腕线速度误差阈值
+        |  (diff_eef_ang_vel.abs().mean(dim=-1) > 14.0 / 0.7 * scale_factor)  # 手腕角速度误差阈值
     ) if terminate_on_eef else torch.zeros_like(obj_pos_err, dtype=torch.bool)
 
     failed_execute = (
         (
-            (obj_pos_err > 0.05 / 0.343 * scale_factor**2)  # 调整：0.08 → 0.15（基于实际误差分析：平均0.148m，95%分位数0.22m）
+            (obj_pos_err > 0.2 / 0.343 * scale_factor**2)  # 调整：0.08 → 0.15（基于实际误差分析：平均0.148m，95%分位数0.22m）
             | (diff_thumb_tip_pos_dist > 0.18 / 0.7 * scale_factor)  # 0.1125 → 0.18（提升60%，95%分位数0.183m）
             | (diff_index_tip_pos_dist > 0.20 / 0.7 * scale_factor)  # 0.12375 → 0.20（提升62%，95%分位数0.200m）
             | (diff_middle_tip_pos_dist > 0.18 / 0.7 * scale_factor)  # 0.1125 → 0.18（提升60%，95%分位数0.179m）
@@ -3928,13 +3923,13 @@ def compute_imitation_reward(
         + reward_obj_pos_scale * reward_obj_pos
         + reward_obj_rot_scale * reward_obj_rot
         + 0.1 * reward_eef_vel
-        + 0.1 * reward_eef_ang_vel
+        + 2 * reward_eef_ang_vel
         + 0.1 * reward_joints_vel
         + 0.1 * reward_obj_vel
         + 0.1 * reward_obj_ang_vel
         + reward_finger_tip_force_scale * reward_finger_tip_force
         + 0.5 * reward_power
-        + 0.5 * reward_wrist_power
+        + 3 * reward_wrist_power
         + 0.0 * reward_contact_violation
         + reward_interact_scale * reward_interact # 新增
     )
