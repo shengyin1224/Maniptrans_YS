@@ -44,33 +44,62 @@ env:
   tightenMethod: "adaptive"  # 使用自适应难度调整
   tightenFactor: 1.0  # 初始scale_factor（可选，默认1.0）
   
-  rewardInteractScale: ${resolve_default:0.2,${...reward_interact_scale}}
-  rewardObjPosScale: ${resolve_default:6.0,${...reward_obj_pos_scale}}
-  rewardObjRotScale: ${resolve_default:5.0,${...reward_obj_rot_scale}}
-  rewardFingerTipForceScale: ${resolve_default:15.0,${...reward_finger_tip_force_scale}}
+  rewardInteractScale: ${resolve_default:2,${...reward_interact_scale}}
+  rewardObjPosScale: ${resolve_default:15.0,${...reward_obj_pos_scale}}
+  rewardObjRotScale: ${resolve_default:15.0,${...reward_obj_rot_scale}}
+  rewardFingerTipForceScale: ${resolve_default:30.0,${...reward_finger_tip_force_scale}}
   terminateOnEEF: ${resolve_default:False,${...terminate_on_eef}}
-  adaptiveSamplingAllBinsThreshold: ${resolve_default:0.40,${...adaptive_sampling_all_bins_threshold}}
-  adaptiveStuckThreshold: ${resolve_default:50,${...adaptive_stuck_threshold}}
+  terminateObjPosThreshold: ${resolve_default:0.01785,${...terminate_obj_pos_threshold}}
+  terminateObjRotThreshold: ${resolve_default:24,${...terminate_obj_rot_threshold}}
+  terminateObjPosFinal: ${resolve_default:0.01785,${...terminate_obj_pos_final}}
+  terminateObjRotFinal: ${resolve_default:24,${...terminate_obj_rot_final}}
+  terminateThumbThreshold: ${resolve_default:0.04,${...terminate_thumb_threshold}}
+  terminateIndexThreshold: ${resolve_default:0.045,${...terminate_index_threshold}}
+  terminateMiddleThreshold: ${resolve_default:0.05,${...terminate_middle_threshold}}
+  terminatePinkyThreshold: ${resolve_default:0.06,${...terminate_pinky_threshold}}
+  terminateRingThreshold: ${resolve_default:0.06,${...terminate_ring_threshold}}
+  terminateLevel1Threshold: ${resolve_default:0.07,${...terminate_level_1_threshold}}
+  terminateLevel2Threshold: ${resolve_default:0.08,${...terminate_level_2_threshold}}
+  eefVelLimit: ${resolve_default:100.0,${...eef_vel_limit}}
+  eefAngVelLimit: ${resolve_default:200.0,${...eef_ang_vel_limit}}
+  jointsVelLimit: ${resolve_default:100.0,${...joints_vel_limit}}
+  dofVelLimit: ${resolve_default:200.0,${...dof_vel_limit}}
+  objVelLimit: ${resolve_default:100.0,${...obj_vel_limit}}
+  objAngVelLimit: ${resolve_default:200.0,${...obj_ang_vel_limit}}
+  adaptiveSamplingBins: ${resolve_default:12,${...adaptive_sampling_bins}}
+  adaptiveSamplingKernelSize: ${resolve_default:3,${...adaptive_sampling_kernel_size}}
+  adaptiveSamplingLambda: ${resolve_default:0.8,${...adaptive_sampling_lambda}}
+  adaptiveSamplingUniformRatio: ${resolve_default:0.4,${...adaptive_sampling_uniform_ratio}}
+  adaptiveSamplingAlpha: ${resolve_default:0.2,${...adaptive_sampling_alpha}}
+  adaptiveSamplingAllBinsThreshold: ${resolve_default:0.5,${...adaptive_sampling_all_bins_threshold}}
+  
+  targetEpoch: ${resolve_default:800,${...target_epoch}}
+  terminateOnContact: ${resolve_default:False,${...terminate_on_contact}}
+  noRegressionThreshold: ${resolve_default:1.5,${...no_regression_threshold}}
+  
+  adaptiveStuckThreshold: ${resolve_default:80,${...adaptive_stuck_threshold}}
   
   # 自适应难度调整参数（可选，有默认值）
-  adaptiveRewardWindow: 10      # 检查reward稳定性的窗口大小（默认10轮）
+  adaptiveSuccessWindow: ${resolve_default:5,${...adaptive_success_window}}
+  adaptiveSuccessThreshold: ${resolve_default:0.20,${...adaptive_success_threshold}}
   adaptiveStepWindow: 5         # 检查step的窗口大小（默认5轮）
   adaptiveStepThreshold: 20     # step阈值，低于此值则降低难度（默认20步）
-  adaptiveScaleFactorMin: 0.2   # scale_factor最小值（默认0.7）
+  adaptiveNoImprovementWindow: ${resolve_default:10,${...adaptive_no_improvement_window}}
+  adaptiveScaleFactorMin: 0.7   # scale_factor最小值（默认0.7）
   adaptiveScaleFactorMax: 1.0   # scale_factor最大值（默认1.0）
-  adaptiveScaleStep: 0.02       # 每次调整的步长（默认0.05）
+  adaptiveScaleStep: 0.01       # 每次调整的步长（默认0.05）
 
   actionScale: 1.0
   useQuatRot: false
   hide_hands: ${resolve_default:False,${...hide_hands}}
 
   support_force:
-    kp: ${resolve_default:10.0,${....support_force_kp}}
-    kd: ${resolve_default:3.0,${....support_force_kd}}
-    kp_rot: ${resolve_default:1.0,${....support_force_kp_rot}}
-    kd_rot: ${resolve_default:0.3,${....support_force_kd_rot}}
-    end_factor: ${resolve_default:0.4,${....support_force_end_factor}}
-    decay_start_factor: ${resolve_default:0.8,${....support_force_decay_start_factor}}
+    kp: ${resolve_default:20.0,${....support_force_kp}}
+    kd: ${resolve_default:10.0,${....support_force_kd}}
+    kp_rot: ${resolve_default:0.5,${....support_force_kp_rot}}
+    kd_rot: ${resolve_default:0.004,${....support_force_kd_rot}}
+    end_factor: ${resolve_default:0.72,${....support_force_end_factor}}
+    decay_start_factor: ${resolve_default:1.0,${....support_force_decay_start_factor}}
 
   # for distillation
   propDumpInfo:
@@ -145,7 +174,7 @@ task:
         operation: "scaling"
         schedule: "linear_decay"
         schedule_steps: 1920
-        end_factor: 0.4
+        end_factor: 0.8
         external_sample:
           type: "const_scale"
           init_value: 0
@@ -158,12 +187,12 @@ task:
             operation: "scaling"
             schedule: "linear_decay"
             schedule_steps: 1920
-            end_factor: 0.4
+            end_factor: 0.8
             external_sample:
               type: "const_scale"
               init_value: 6
               upper_bound: 6.0
-              lower_bound: 1.0
+              lower_bound: 3.0
       manip_obj_rh:
         color: True
         rigid_shape_properties:
@@ -172,12 +201,12 @@ task:
             operation: "scaling"
             schedule: "linear_decay"
             schedule_steps: 1920
-            end_factor: 0.4
+            end_factor: 0.8
             external_sample:
               type: "const_scale"
               init_value: 6
               upper_bound: 6.0
-              lower_bound: 1.0
+              lower_bound: 3.0
       manip_obj_lh:
         color: True
         rigid_shape_properties:
@@ -186,9 +215,9 @@ task:
             operation: "scaling"
             schedule: "linear_decay"
             schedule_steps: 1920
-            end_factor: 0.4
+            end_factor: 0.8
             external_sample:
               type: "const_scale"
               init_value: 6
               upper_bound: 6.0
-              lower_bound: 1.0
+              lower_bound: 3.0

@@ -10,11 +10,12 @@ __pycache__/
 
 isaacgym/
 
+events.out.tfevents.*
 
 data/dexmanipnet/*
 data/grab_demo/*
 data/OakInk-v2/*
-
+*_nocontact.pkl
 
 DexManipNet
 

@@ -666,23 +666,6 @@ class Mano2Dexhand:
         origin_wrist_rot = aa_to_rotmat(target_wrist_rot)
         target_wrist_rot = self.mujoco2gym_transf[:3, :3] @ aa_to_rotmat(target_wrist_rot)
 
-        # [DEBUG] 读取第177到186帧的右手值
-        if self.num_envs > 186:
-            print(f"\n{'='*20} [DEBUG: Right Hand Frames 177-186] {'='*20}")
-            for i in range(145, 155):
-                p = target_wrist_pos[i].detach().cpu().numpy()
-                # 原始 Gym 坐标系下的 AA
-                r_aa = rotmat_to_aa(target_wrist_rot[i].unsqueeze(0)).squeeze(0).detach().cpu().numpy()
-                
-                # 额外再乘一次 mujoco2gym_transf 的旋转部分
-                r_double = self.mujoco2gym_transf[:3, :3] @ origin_wrist_rot[i]
-                r_aa_double = rotmat_to_aa(r_double.unsqueeze(0)).squeeze(0).detach().cpu().numpy()
-                
-                print(f"  Batch Idx {i}:")
-                print(f"    - pos: {p}")
-                print(f"    - rot (gym aa):        {r_aa}")
-                print(f"    - rot (double gym aa): {r_aa_double}")
-            print(f"{'='*60}\n")
         target_mano_joints = target_mano_joints.view(-1, 3)
         target_mano_joints = (self.mujoco2gym_transf[:3, :3] @ target_mano_joints.T).T + self.mujoco2gym_transf[:3, 3]
         target_mano_joints = target_mano_joints.view(self.num_envs, -1, 3)
