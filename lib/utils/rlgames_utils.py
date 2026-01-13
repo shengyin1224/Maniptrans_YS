@@ -217,9 +217,9 @@ class RLGPUAlgoObserver(AlgoObserver):
             self.new_finished_episodes = False
 
         for k, v in self.direct_info.items():
-            self.writer.add_scalar(f"{k}/frame", v, frame)
+            #self.writer.add_scalar(f"{k}/frame", v, frame)
             self.writer.add_scalar(f"{k}/iter", v, epoch_num)
-            self.writer.add_scalar(f"{k}/time", v, total_time)
+            #self.writer.add_scalar(f"{k}/time", v, total_time)
 
 
 class MultiObserver(AlgoObserver):

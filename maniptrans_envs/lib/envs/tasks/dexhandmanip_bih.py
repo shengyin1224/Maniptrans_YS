@@ -299,6 +299,12 @@ class DexHandManipBiHEnv(VecTask):
             headless=headless,
         )
 
+        self.env_start_bin_index = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        # [新增] 记录每个环境是否发生了特定的失败
+        self.env_obj_pos_failed = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self.env_obj_rot_failed = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+
+
         # === [新增] 初始化自适应采样 tensors (在父类初始化之后，因为需要 self.device) ===
         if self.random_state_init and self.adaptive_sampling_bins is not None:
             # 初始化采样统计（记录成功和失败次数）
@@ -310,7 +316,7 @@ class DexHandManipBiHEnv(VecTask):
             self._current_bin_total = torch.zeros(self.adaptive_sampling_bins, dtype=torch.float, device=self.device)
 
             # 初始化每个环境启动时的bin索引，用于统计从启动到结束跨越的所有bin
-            self.env_start_bin_index = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+            
 
             # 初始化bin重置计数统计
             self.bin_reset_count = torch.zeros(self.adaptive_sampling_bins, dtype=torch.float, device=self.device)
@@ -322,10 +328,7 @@ class DexHandManipBiHEnv(VecTask):
             self.bin_obj_pos_pass_rate = torch.zeros(self.adaptive_sampling_bins, dtype=torch.float, device=self.device)
             self.bin_obj_rot_pass_rate = torch.zeros(self.adaptive_sampling_bins, dtype=torch.float, device=self.device)
 
-            # [新增] 记录每个环境是否发生了特定的失败
-            self.env_obj_pos_failed = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-            self.env_obj_rot_failed = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-
+            
             # 创建平滑核
             self.adaptive_sampling_kernel = torch.tensor(
                 [self.adaptive_sampling_lambda**i for i in range(self.adaptive_sampling_kernel_size)], device=self.device
@@ -344,7 +347,7 @@ class DexHandManipBiHEnv(VecTask):
             self.bin_pos_scale = torch.full((num_bins,), initial_scale, device=self.device)
             self.bin_rot_scale = torch.full((num_bins,), initial_scale, device=self.device)
             # bin_state: [num_bins, 2] where 2 is (pos, rot). 
-            # 0: Normal, 1: TrialB, 2: Aggressive, 3: Frozen, 4: Terminal
+            # 0: Normal, 1: TrialB, 2: Aggressive, 3: Frozen, 4: Terminal, 5: Pending
             self.bin_state = torch.zeros((num_bins, 2), dtype=torch.long, device=self.device)
             self.bin_epochs_at_scale = torch.zeros((num_bins, 2), dtype=torch.long, device=self.device)
             self.bin_trial_start_epoch = torch.zeros((num_bins, 2), dtype=torch.long, device=self.device)
@@ -353,9 +356,36 @@ class DexHandManipBiHEnv(VecTask):
             self.bin_best_scales = torch.full((num_bins, 2), initial_scale, device=self.device)
             self.bin_last_stable_scale = torch.full((num_bins, 2), initial_scale, device=self.device)
             self.bin_last_aggressive_rate = torch.zeros((num_bins, 2), device=self.device)
+
+            # [新增] 用于新版 adaptive_dual 逻辑的变量
+            self.bin_ema_at_start = torch.zeros((num_bins, 2), device=self.device)
+            self.bin_initial_scale_before_trial = torch.full((num_bins, 2), initial_scale, device=self.device)
+            self.bin_first_mover = torch.full((num_bins,), -1, dtype=torch.long, device=self.device) # -1: none, 0: pos, 1: rot
+            self.bin_aggressive_turn = torch.full((num_bins,), -1, dtype=torch.long, device=self.device) # -1: none, 0: pos, 1: rot
+
+            # [新增] 维持最小稳定 scale 的逻辑所需的缓冲区
+            # 记录过去 30 个 epoch 的通过率是否 > 70% (1 或 0)
+            self.bin_pos_pass_history = torch.zeros((num_bins, 30), dtype=torch.bool, device=self.device)
+            self.bin_rot_pass_history = torch.zeros((num_bins, 30), dtype=torch.bool, device=self.device)
+            # 记录过去 50 个 epoch 的综合成功率 (float)
+            self.bin_success_history_50 = torch.zeros((num_bins, 50), dtype=torch.float, device=self.device)
+            # 最小稳定 scale：初始设为较大的 1.0
+            self.bin_pos_stable_best = torch.full((num_bins,), 1.0, device=self.device)
+            self.bin_rot_stable_best = torch.full((num_bins,), 1.0, device=self.device)
+            # 当前历史记录的写入指针
+            self.bin_history_ptr_30 = 0
+            self.bin_history_ptr_50 = 0
+            self.bin_accumulated_epochs_since_reset = torch.zeros((num_bins,), dtype=torch.long, device=self.device)
+            self.bin_next_trial_starter = torch.zeros((num_bins,), dtype=torch.long, device=self.device) # 0: pos, 1: rot
+            
             # 记录回升历史，每层每个组件只能回升一次
             self.bin_scale_increase_history = [{"pos": {}, "rot": {}} for _ in range(num_bins)]
             self.adaptive_sampling_kernel = self.adaptive_sampling_kernel / self.adaptive_sampling_kernel.sum()
+            
+            # [新增] 用于冻结恢复限制和条件的变量
+            self.bin_unfreeze_history = [{"pos": {}, "rot": {}} for _ in range(num_bins)]
+            self.bin_other_scale_at_freeze = torch.full((num_bins, 2), 1.0, device=self.device)
+
             print(f"  - Aggressive sampling kernel: {self.adaptive_sampling_kernel.tolist()}, Lambda: {self.adaptive_sampling_lambda}")
 
         # dexhand_r defaults
@@ -462,6 +492,18 @@ class DexHandManipBiHEnv(VecTask):
         except Exception as e:
             print(f"[WARNING] Failed to initialize failure log file: {e}")
             self.failure_log_file = None
+
+    def _reset_bin_histories(self, bin_idx):
+        """当某个 bin 的 scale 或状态发生重大改变时，重置其通过率历史统计"""
+        if self.adaptive_sampling_bins is not None:
+            self.bin_pos_pass_history[bin_idx].fill_(False)
+            self.bin_rot_pass_history[bin_idx].fill_(False)
+            self.bin_ema_success_rates[bin_idx] = 0
+            self.bin_success_history_50[bin_idx].fill_(0)
+            self.bin_accumulated_epochs_since_reset[bin_idx] = 0
+            # 注意：不重置 bin_history_ptr_30，让它在下次写入时继续滑动覆盖，
+            # 但把内容清空可以确保短期内不会触发“稳定”判定。
+            # 也可以选择重置指针，但指针是全局的。
 
     def create_sim(self):
         self.sim_params.up_axis = gymapi.UP_AXIS_Z
@@ -1921,28 +1963,12 @@ class DexHandManipBiHEnv(VecTask):
                 scale_factor_val = self.adaptive_global_scale_factor
                 rot_scale_factor_val = self.rot_scale_factor
             elif self.tighten_method == "adaptive_dual":
-                # [核心逻辑] adaptive_dual 模式下使用 per-bin 的 scale
-                bin_pos = self.bin_pos_scale[env_bin_indices]
-                bin_rot = self.bin_rot_scale[env_bin_indices]
+                # [核心逻辑] adaptive_dual 模式下使用 per-bin 的 scale，不受全局线性衰减的强制约束
+                # 这样可以确保每个 bin 的终止判定精度（Termination）是独立自适应的
+                scale_factor = self.bin_pos_scale[env_bin_indices]
+                current_rot_scale_factor = self.bin_rot_scale[env_bin_indices]
                 
-                # 获取当前 bin 的状态
-                pos_states = self.bin_state[env_bin_indices, 0]
-                rot_states = self.bin_state[env_bin_indices, 1]
-                
-                # [新增] 在 Normal 状态下，与全局对齐：obj-pos = min(obj_pos_scale, 全局)
-                # 即使 per-bin 的系数还没降，也必须至少和全局同步
-                scale_factor = torch.where(
-                    pos_states == 0,
-                    torch.min(bin_pos, torch.full_like(bin_pos, self.adaptive_global_scale_factor)),
-                    bin_pos
-                )
-                current_rot_scale_factor = torch.where(
-                    rot_states == 0,
-                    torch.min(bin_rot, torch.full_like(bin_rot, self.rot_scale_factor)),
-                    bin_rot
-                )
-                
-                # 全局系数（重力等）遵循之前的统一系数
+                # 全局系数（用于重力补偿、支撑力等）依然遵循线性衰减计划
                 scale_factor_val = self.adaptive_global_scale_factor
                 rot_scale_factor_val = self.rot_scale_factor
             elif self.tighten_method == "epoch_curriculum":
@@ -2877,6 +2903,9 @@ class DexHandManipBiHEnv(VecTask):
                 
                 # === [新增] 更新各 bin 成功率统计，不论什么模式都执行 ===
                 if self.adaptive_sampling_bins is not None:
+                    # 累积 epoch 计数
+                    self.bin_accumulated_epochs_since_reset += 1
+
                     # 1. 计算当前 epoch 的各 bin 成功率
                     current_epoch_bin_rates = torch.where(
                         self._current_bin_total > 0,
@@ -2910,12 +2939,46 @@ class DexHandManipBiHEnv(VecTask):
                     self.bin_total_count += self._current_bin_total
                     self.bin_reset_count += self._current_bin_reset
 
+                # === [新增] 更新历史记录和最小稳定 Scale 变量 ===
+                if self.adaptive_sampling_bins is not None:
+                    # 更新 30 epoch 的通过率历史
+                    self.bin_pos_pass_history[:, self.bin_history_ptr_30] = (self.bin_obj_pos_pass_rate > 0.60)
+                    self.bin_rot_pass_history[:, self.bin_history_ptr_30] = (self.bin_obj_rot_pass_rate > 0.60)
+                    self.bin_history_ptr_30 = (self.bin_history_ptr_30 + 1) % 30
+                    
+                    # 更新 50 epoch 的成功率历史
+                    self.bin_success_history_50[:, self.bin_history_ptr_50] = self.current_epoch_bin_rates
+                    self.bin_history_ptr_50 = (self.bin_history_ptr_50 + 1) % 50
+
+                    # [修改] 计算 30 epoch 内的平均成功率 (取最近 30 个)
+                    indices = torch.tensor([(self.bin_history_ptr_50 - 1 - k) % 50 for k in range(30)], device=self.device)
+                    bin_success_avg_30 = self.bin_success_history_50.index_select(1, indices).mean(dim=1)
+
+                    # [修改] Best Scale 判定条件：(累积满 30 epoch 且 30 epoch 平均成功率 > 45%) 或 EMA > 50%
+                    avg_30_ok = (self.bin_accumulated_epochs_since_reset >= 30) & (bin_success_avg_30 > 0.45)
+                    pos_stable_mask = avg_30_ok | (self.bin_ema_success_rates > 0.50)
+                    rot_stable_mask = pos_stable_mask
+
+                    # pos
+                    current_pos_scales = self.bin_pos_scale
+                    # [修改] 更新条件：除了满足稳定条件外，如果当前 epoch 表现极好 (>50%) 且比历史最好更小，也允许更新 best_stable
+                    # 这样可以防止在未满 35 epoch 时发生回退导致跳回 1.0 的问题
+                    update_pos_mask = (pos_stable_mask | (self.current_epoch_bin_rates > 0.55)) & (current_pos_scales < self.bin_pos_stable_best)
+                    self.bin_pos_stable_best[update_pos_mask] = current_pos_scales[update_pos_mask]
+                    
+                    # rot
+                    current_rot_scales = self.bin_rot_scale
+                    update_rot_mask = (rot_stable_mask | (self.current_epoch_bin_rates > 0.55)) & (current_rot_scales < self.bin_rot_stable_best)
+                    self.bin_rot_stable_best[update_rot_mask] = current_rot_scales[update_rot_mask]
+
                 # 评估并调整难度
                 scale_changed = False
                 
                 # === [新增] 处理 epoch_curriculum 模式的系数更新 ===
-                if self.tighten_method == "epoch_curriculum":
-                    progress = current_epoch / self.target_epoch
+                if self.tighten_method in ["epoch_curriculum", "adaptive_dual"]:
+                    # [修改] 如果是 adaptive_dual，强制 600 epoch 线性降到 0.7；否则使用配置的 target_epoch
+                    cur_target_epoch = 1800 if self.tighten_method == "adaptive_dual" else self.target_epoch
+                    progress = current_epoch / cur_target_epoch
                     progress = max(0.0, min(1.0, progress))
                     # 按照 compute_reward_side 中的公式同步更新全局系数
                     new_scale = 1.0 - (1.0 - 0.7) * progress
@@ -2926,7 +2989,10 @@ class DexHandManipBiHEnv(VecTask):
                         self.rot_scale_factor = max(0.7, min(1.0, self.rot_scale_factor + delta))
                         
                         scale_changed = True
-                        print(f"[CURRICULUM] Epoch {current_epoch}: Scale updated to {new_scale:.4f}, Rot Scale to {self.rot_scale_factor:.4f}, Obj-Pos Scale: {new_scale:.4f}, Obj-Rot Scale: {self.rot_scale_factor:.4f}")
+                        if self.tighten_method == "epoch_curriculum":
+                            print(f"[CURRICULUM] Epoch {current_epoch}: Scale updated to {new_scale:.4f}, Rot Scale to {self.rot_scale_factor:.4f}, Obj-Pos Scale: {new_scale:.4f}, Obj-Rot Scale: {self.rot_scale_factor:.4f}")
+                        else:
+                            print(f"[ADAPTIVE DUAL] Epoch {current_epoch}: Global Scale decayed to {new_scale:.4f}")
 
                 # === [修改逻辑] 难度调整规则 ===
                 # Mode 3 & 4 Combined Logic
@@ -2934,14 +3000,14 @@ class DexHandManipBiHEnv(VecTask):
                     ema_bin_rates = self.bin_ema_success_rates
                     self.epochs_at_current_scale += 1
                     
-                    # [新增] Warmup 逻辑：前 20 个 epoch 不调整难度，且在之后重新从 0 开始统计
+                    # [新增] Warmup 逻辑：前 35 个 epoch 不调整难度，且在之后重新从 0 开始统计
                     if self.adaptive_difficulty_is_warming_up:
-                        if self.epochs_at_current_scale <= 20:
+                        if self.epochs_at_current_scale <= 35:
                             pos_scale_val = self.bin_pos_scale.mean().item() if self.tighten_method == "adaptive_dual" else self.adaptive_global_scale_factor
                             rot_scale_val = self.bin_rot_scale.mean().item() if self.tighten_method == "adaptive_dual" else self.rot_scale_factor
-                            print(f"[ADAPTIVE] Epoch {self.adaptive_current_epoch}: Warmup phase ({self.epochs_at_current_scale}/20). Global Scale: {self.adaptive_global_scale_factor:.4f}, Obj-Pos Scale: {pos_scale_val:.4f}, Obj-Rot Scale: {rot_scale_val:.4f}. Stats recorded for logging but no adjustment.")
+                            print(f"[ADAPTIVE] Epoch {self.adaptive_current_epoch}: Warmup phase ({self.epochs_at_current_scale}/35). Global Scale: {self.adaptive_global_scale_factor:.4f}, Obj-Pos Scale: {pos_scale_val:.4f}, Obj-Rot Scale: {rot_scale_val:.4f}. Stats recorded for logging but no adjustment.")
                         else:
-                            # 20 epoch warmup 结束，进入正式评估期
+                            # 35 epoch warmup 结束，进入正式评估期
                             self.adaptive_difficulty_is_warming_up = False
                             self.epochs_at_current_scale = 1
                             self.bin_success_sum_at_current_scale.zero_()
@@ -2977,8 +3043,9 @@ class DexHandManipBiHEnv(VecTask):
                             current_scale_key = round(float(self.adaptive_global_scale_factor), 4)
                             if self.scale_increase_counts.get(current_scale_key, 0) < 1:
                                 # [同步修改] 难度回退时，两个系数同步增加
-                                self.adaptive_global_scale_factor = min(self.adaptive_scale_factor_max, self.adaptive_global_scale_factor + 0.01)
-                                self.rot_scale_factor = min(1.0, self.rot_scale_factor + 0.01)
+                                if self.tighten_method != "adaptive_dual":
+                                    self.adaptive_global_scale_factor = min(self.adaptive_scale_factor_max, self.adaptive_global_scale_factor + 0.01)
+                                    self.rot_scale_factor = min(1.0, self.rot_scale_factor + 0.01)
                                 
                                 scale_changed = True
                                 self.difficulty_increase_timer = 5
@@ -3003,8 +3070,9 @@ class DexHandManipBiHEnv(VecTask):
                     if not scale_changed:
                         if all_bins_ema_high or fallback_trigger or stuck_trigger:
                             # [同步修改] 难度提升时，两个系数同步减小
-                            self.adaptive_global_scale_factor = max(self.adaptive_scale_factor_min, self.adaptive_global_scale_factor - 0.01)
-                            self.rot_scale_factor = max(0.7, self.rot_scale_factor - 0.01)
+                            if self.tighten_method != "adaptive_dual":
+                                self.adaptive_global_scale_factor = max(self.adaptive_scale_factor_min, self.adaptive_global_scale_factor - 0.01)
+                                self.rot_scale_factor = max(0.7, self.rot_scale_factor - 0.01)
                             
                             scale_changed = True
                             
@@ -3016,157 +3084,335 @@ class DexHandManipBiHEnv(VecTask):
                         # [Per-bin State Machine Engine]
                         num_bins = self.adaptive_sampling_bins
                         for i in range(num_bins):
-                            for c_idx, component in enumerate(["pos", "rot"]):
-                                # 获取当前组件的通过率和原始 Scale
-                                if component == "pos":
-                                    rate = self.bin_obj_pos_pass_rate[i].item()
-                                    raw_scale = self.bin_pos_scale[i].item()
-                                    global_scale = self.adaptive_global_scale_factor
-                                else:
-                                    rate = self.bin_obj_rot_pass_rate[i].item()
-                                    raw_scale = self.bin_rot_scale[i].item()
-                                    global_scale = self.rot_scale_factor
-                                
+                            # 获取 Bin 的 EMA 成功率
+                            bin_ema = self.bin_ema_success_rates[i].item()
+                            
+                            # 获取 pos 和 rot 的状态
+                            pos_state = self.bin_state[i, 0].item()
+                            rot_state = self.bin_state[i, 1].item()
+                            
+                            # 提前计算恢复条件 [修改后的阈值]
+                            # [修改] 使用 Avg_30 替代 Avg_50，且要求必须满 30 epoch
+                            avg_30_recover_ok = (self.bin_accumulated_epochs_since_reset[i] >= 30) and (bin_success_avg_30[i] >= 0.55)
+                            can_recover_base = avg_30_recover_ok
+
+                            # 0. Terminal/Frozen 恢复检测
+                            for c_idx in range(2):
                                 state = self.bin_state[i, c_idx].item()
-                                
-                                # [新增] Normal 状态下对齐全局：current_scale = min(raw_scale, 全局)
-                                # 这确保了 Normal 状态至少和全局一样难。且在全局更小时，立刻更新 per-bin 的系数
-                                if state == 0 and global_scale < raw_scale:
-                                    if component == "pos":
-                                        self.bin_pos_scale[i] = global_scale
-                                    else:
-                                        self.bin_rot_scale[i] = global_scale
-                                    raw_scale = global_scale
-                                
-                                current_scale = raw_scale
-                                
-                                self.bin_epochs_at_scale[i, c_idx] += 1
-                                current_scale_key = round(float(current_scale), 4)
+                                if state == 3 or state == 4:
+                                    component = "pos" if c_idx == 0 else "rot"
+                                    other_idx = 1 - c_idx
+                                    
+                                    # 当前自己的 scale
+                                    current_scale = self.bin_pos_scale[i].item() if c_idx == 0 else self.bin_rot_scale[i].item()
+                                    scale_key = round(float(current_scale), 4)
+                                    
+                                    other_scale = self.bin_pos_scale[i].item() if other_idx == 0 else self.bin_rot_scale[i].item()
+                                    scale_at_freeze = self.bin_other_scale_at_freeze[i, c_idx].item()
+                                    
+                                    # 检查解冻条件：阈值满足 + 另一个变量 scale 降低 + 未超过该 scale 的解冻次数限制
+                                    unfreeze_count = self.bin_unfreeze_history[i][component].get(scale_key, 0)
+                                    scale_dropped = other_scale < scale_at_freeze - 1e-5 # 容差处理
+                                    count_ok = unfreeze_count < 2
+                                    
+                                    if can_recover_base and scale_dropped and count_ok:
+                                        self.bin_state[i, c_idx] = 0 # 恢复 Normal
+                                        self.bin_epochs_at_scale[i, c_idx] = 0 # [修复] 重置在该 scale 下的停留计时
+                                        self.bin_unfreeze_history[i][component][scale_key] = unfreeze_count + 1
+                                        print(f"[ADAPTIVE DUAL] Bin {i} {component} naturally recovered at scale {scale_key:.4f} (Count {unfreeze_count+1}/2). "
+                                              f"Other scale: {other_scale:.4f} < {scale_at_freeze:.4f}. Phase -> Normal.")
+                                        self._reset_bin_histories(i)
 
-                                # --- 状态机转换逻辑 ---
+                            # 刷新局部状态变量
+                            pos_state = self.bin_state[i, 0].item()
+                            rot_state = self.bin_state[i, 1].item()
+
+                            # [重构] 提前计算解冻判定条件
+                            bin_any_scale_high = (self.bin_pos_scale[i] > 0.9) or (self.bin_rot_scale[i] > 0.9)
+                            bin_auto_unfreeze = (self.adaptive_global_scale_factor > 0.9) or bin_any_scale_high
+
+                            # 1. 终局锁死判定 (只要二者同时处于 Frozen，不论通过率直接进入 Terminal)
+                            if pos_state == 3 and rot_state == 3:
+                                if bin_auto_unfreeze:
+                                    self.bin_state[i, 0] = 0 # 恢复 Normal
+                                    self.bin_state[i, 1] = 0 # 恢复 Normal
+                                    self.bin_epochs_at_scale[i, 0] = 0
+                                    self.bin_epochs_at_scale[i, 1] = 0
+                                    print(f"[ADAPTIVE DUAL] Bin {i} both Frozen but auto unfreeze triggered. Phase -> Normal.")
+                                    self._reset_bin_histories(i)
+                                    # 刷新本地变量以便后续逻辑
+                                    pos_state, rot_state = 0, 0
+                                else:
+                                    # 进入 Terminal 时记录对手当前的 scale (虽然 Frozen 时理论上已记录，这里作为二次确认)
+                                    if self.bin_state[i, 0] != 4:
+                                        self.bin_other_scale_at_freeze[i, 0] = self.bin_rot_scale[i]
+                                    if self.bin_state[i, 1] != 4:
+                                        self.bin_other_scale_at_freeze[i, 1] = self.bin_pos_scale[i]
+                                        
+                                    self.bin_state[i, 0] = 4 # Terminal
+                                    self.bin_state[i, 1] = 4 # Terminal
+
+                                    print(f"[ADAPTIVE DUAL] Bin {i} entered TERMINAL (Both Frozen). Locked to BEST STABLE.")
+                                    self._reset_bin_histories(i)
+                                    continue # 跳过该 Bin 后续处理
+
+                            # 2. 状态机逻辑循环 (处理 pos 和 rot)
+                            components = ["pos", "rot"]
+                            starter = self.bin_next_trial_starter[i].item()
+                            order = [starter, 1 - starter]
+
+                            for c_idx in order:
+                                component = components[c_idx]
+                                other_idx = 1 - c_idx
+                                state = self.bin_state[i, c_idx].item()
+                                other_state = self.bin_state[i, other_idx].item()
                                 
-                                # 0. Frozen/Terminal 恢复检测
-                                if (state == 3 or state == 4) and rate >= 0.5:
+                                raw_scale = self.bin_pos_scale[i].item() if c_idx == 0 else self.bin_rot_scale[i].item()
+                                global_scale = self.adaptive_global_scale_factor if c_idx == 0 else self.rot_scale_factor
+                                
+                                # [修改] 自动解冻逻辑：满足全局或任一局部 scale > 0.9 时解冻
+                                if state == 3 and bin_auto_unfreeze:
                                     self.bin_state[i, c_idx] = 0 # 恢复 Normal
-                                    print(f"[ADAPTIVE DUAL] Bin {i} {component} naturally recovered (rate {rate:.2f} >= 0.5). Phase: {state} -> Normal. Obj-Pos Scale: {self.bin_pos_scale[i].item():.4f}, Obj-Rot Scale: {self.bin_rot_scale[i].item():.4f}")
-                                    state = 0
-                                
-                                if state == 0: # Normal Phase
-                                    # A阶段触发器：Stuck 或者 Rise Rejected
-                                    is_stuck = self.bin_epochs_at_scale[i, c_idx] >= self.adaptive_stuck_threshold
-                                    
-                                    # 检测回升被拒绝 (Rise Rejected)
-                                    # 当环境表现很差时，我们期望回升；但如果已经回升过了，就拒绝回升并触发 A 阶段
-                                    any_bin_low_in_epoch = torch.any(current_epoch_bin_rates < 0.20).item()
-                                    low_count_global = sum(self.low_success_history)
-                                    
-                                    expect_rise = (any_bin_low_in_epoch and self.epochs_at_current_scale <= 30 and low_count_global >= 10)
-                                    rise_already_done = self.bin_scale_increase_history[i][component].get(current_scale_key, 0) >= 1
-                                    rise_rejected = expect_rise and rise_already_done
-                                    
-                                    if (is_stuck or rise_rejected) and rate < 0.5:
-                                        # 进入 Trial Phase B (Phase A 触发)
-                                        self.bin_state[i, c_idx] = 1 # TrialB
-                                        self.bin_trial_start_epoch[i, c_idx] = self.adaptive_current_epoch
-                                        self.bin_phase_a_rate[i, c_idx] = rate
-                                        self.bin_phase_b_acc[i, c_idx] = 0.0
-                                        self.bin_last_stable_scale[i, c_idx] = current_scale
-                                        
-                                        # 立即下调难度 (Jump -0.04)
-                                        new_scale = max(0.7, current_scale - 0.04)
-                                        if component == "pos":
-                                            self.bin_pos_scale[i] = new_scale
-                                        else:
-                                            self.bin_rot_scale[i] = new_scale
-                                        
-                                        self.bin_epochs_at_scale[i, c_idx] = 0
-                                        print(f"[ADAPTIVE DUAL] Bin {i} {component} Phase A Triggered (Stuck: {is_stuck}, RiseRejected: {rise_rejected}). Rate: {rate:.2f}. Phase: Normal -> TrialB (-0.04). New Raw Scale: {new_scale:.4f}, Obj-Pos Scale: {self.bin_pos_scale[i].item():.4f}, Obj-Rot Scale: {self.bin_rot_scale[i].item():.4f}")
-                                    
-                                    elif expect_rise and not rise_already_done:
-                                        # 允许回升
-                                        new_scale = min(self.adaptive_scale_factor_max, current_scale + 0.01)
-                                        if component == "pos":
-                                            self.bin_pos_scale[i] = new_scale
-                                        else:
-                                            self.bin_rot_scale[i] = new_scale
-                                        
-                                        # 记录回升历史
-                                        self.bin_scale_increase_history[i][component][current_scale_key] = 1
-                                        self.bin_epochs_at_scale[i, c_idx] = 0
-                                        print(f"[ADAPTIVE DUAL] Bin {i} {component} Coefficient Rises (+0.01) due to low success. New Raw Scale: {new_scale:.4f}, Obj-Pos Scale: {self.bin_pos_scale[i].item():.4f}, Obj-Rot Scale: {self.bin_rot_scale[i].item():.4f}")
+                                    self.bin_epochs_at_scale[i, c_idx] = 0
+                                    print(f"[ADAPTIVE DUAL] Bin {i} {component} auto unfreeze. Phase -> Normal.")
+                                    self._reset_bin_histories(i)
+                                    state = 0 # 更新本地状态变量以便后续逻辑使用
 
-                                elif state == 1: # Trial Phase B (30 epoch 尝试期)
-                                    # 累加通过率用于后续评估
-                                    self.bin_phase_b_acc[i, c_idx] += rate
-                                    trial_duration = self.adaptive_current_epoch - self.bin_trial_start_epoch[i, c_idx]
-                                    
-                                    if trial_duration >= 30:
-                                        avg_b_rate = self.bin_phase_b_acc[i, c_idx].item() / 30.0
-                                        a_rate = self.bin_phase_a_rate[i, c_idx].item()
-                                        
-                                        if avg_b_rate >= a_rate:
-                                            # 有改善 -> 进入激进模式 (Aggressive)
-                                            self.bin_state[i, c_idx] = 2 # Aggressive
-                                            self.bin_last_aggressive_rate[i, c_idx] = rate
-                                            print(f"[ADAPTIVE DUAL] Bin {i} {component} Trial improved (B {avg_b_rate:.2f} >= A {a_rate:.2f}). Phase: TrialB -> Aggressive. Obj-Pos Scale: {self.bin_pos_scale[i].item():.4f}, Obj-Rot Scale: {self.bin_rot_scale[i].item():.4f}")
+                                # === [阶段 0: Normal] ===
+                                if state == 0:
+                                    # 对齐逻辑 (渐进)
+                                    # [修改] 增加 35 epoch 缓冲区，确保每个 scale 都有足够的评估时间
+                                    if global_scale < raw_scale and can_recover_base and self.bin_epochs_at_scale[i, c_idx] >= 35:
+                                        new_raw_scale = max(global_scale, raw_scale - 0.01)
+                                        if c_idx == 0:
+                                            self.bin_pos_scale[i] = new_raw_scale
                                         else:
-                                            # 无改善 -> 回滚并冻结 (Frozen)
-                                            self.bin_state[i, c_idx] = 3 # Frozen
-                                            revert_scale = self.bin_last_stable_scale[i, c_idx].item()
-                                            if component == "pos":
-                                                self.bin_pos_scale[i] = revert_scale
-                                            else:
-                                                self.bin_rot_scale[i] = revert_scale
-                                            print(f"[ADAPTIVE DUAL] Bin {i} {component} Trial NOT improved (B {avg_b_rate:.2f} < A {a_rate:.2f}). Phase: TrialB -> Frozen (Revert to {revert_scale:.4f}). Obj-Pos Scale: {self.bin_pos_scale[i].item():.4f}, Obj-Rot Scale: {self.bin_rot_scale[i].item():.4f}")
+                                            self.bin_rot_scale[i] = new_raw_scale
+                                        self.bin_epochs_at_scale[i, c_idx] = 0 # [修复] Scale 改变，重置计时
+                                        print(f"[ADAPTIVE DUAL] Bin {i} {component} Normal gradual descent to {new_raw_scale:.4f}")
+                                        self._reset_bin_histories(i) # [恢复] 每次 Scale 改变都重置历史，确保新 Scale 下有准确评估数据
+                                    
+                                    # 触发尝试期检查
+                                    if other_state in [0, 3, 4]:
+                                        self.bin_epochs_at_scale[i, c_idx] += 1
+                                        is_stuck = self.bin_epochs_at_scale[i, c_idx] >= self.adaptive_stuck_threshold
                                         
-                                        self.bin_epochs_at_scale[i, c_idx] = 0
+                                        any_bin_low_in_epoch = torch.any(current_epoch_bin_rates < 0.20).item()
+                                        low_count_global = sum(self.low_success_history)
+                                        expect_rise = (any_bin_low_in_epoch and self.epochs_at_current_scale <= 30 and low_count_global >= 10)
+                                        
+                                        current_scale_key = round(float(raw_scale), 4)
+                                        rise_already_done = self.bin_scale_increase_history[i][component].get(current_scale_key, 0) >= 1
+                                        rise_rejected = expect_rise and rise_already_done
+                                        
+                                        # [修改] 如果 global_scale 为 1 或者已经跑过的 epoch 数还未超过 200，那么就忽略 stuck 条件
+                                        ignore_stuck = (abs(global_scale - 1.0) < 1e-6) or (self.adaptive_current_epoch < 200)
+                                        trial_trigger = rise_rejected if ignore_stuck else (is_stuck or rise_rejected)
 
-                                elif state == 2: # Aggressive Phase (-0.01 每 50 epoch)
-                                    if rate >= 0.5:
-                                        # 达标，回到正常模式
-                                        self.bin_state[i, c_idx] = 0 # Normal
-                                        self.bin_best_scales[i, c_idx] = min(self.bin_best_scales[i, c_idx].item(), current_scale)
-                                        print(f"[ADAPTIVE DUAL] Bin {i} {component} achieved target rate {rate:.2f} >= 0.5. Phase: Aggressive -> Normal. Obj-Pos Scale: {self.bin_pos_scale[i].item():.4f}, Obj-Rot Scale: {self.bin_rot_scale[i].item():.4f}")
-                                    else:
-                                        # 激进尝试下调
-                                        if self.bin_epochs_at_scale[i, c_idx] >= 50:
-                                            prev_aggressive_rate = self.bin_last_aggressive_rate[i, c_idx].item()
-                                            if rate < prev_aggressive_rate:
-                                                # 回归：下调后反而变差，回滚并冻结
-                                                self.bin_state[i, c_idx] = 3 # Frozen
-                                                revert_scale = self.bin_last_stable_scale[i, c_idx].item()
-                                                if component == "pos":
-                                                    self.bin_pos_scale[i] = revert_scale
-                                                else:
-                                                    self.bin_rot_scale[i] = revert_scale
-                                                print(f"[ADAPTIVE DUAL] Bin {i} {component} Aggressive regression (Rate {rate:.2f} < Prev {prev_aggressive_rate:.2f}). Phase: Aggressive -> Frozen (Revert to {revert_scale:.4f}). Obj-Pos Scale: {self.bin_pos_scale[i].item():.4f}, Obj-Rot Scale: {self.bin_rot_scale[i].item():.4f}")
+                                        if trial_trigger and bin_ema < 0.3 and self.bin_epochs_at_scale[i, c_idx] >= 35:
+                                            # 轮流制：设置当前为 first_mover，并切换下一次的 starter
+                                            self.bin_state[i, c_idx] = 1 # TrialB
+                                            # [修改] 保护 Frozen 状态：如果对手是 Frozen/Terminal，保持不变；否则改为 Pending
+                                            if other_state not in [3, 4]:
+                                                self.bin_state[i, other_idx] = 5 # Pending
+
+                                            self.bin_first_mover[i] = c_idx
+                                            self.bin_next_trial_starter[i] = 1 - c_idx # 切换下一次启动者
+                                            self.bin_ema_at_start[i, c_idx] = bin_ema
+                                            self.bin_initial_scale_before_trial[i, c_idx] = raw_scale
+                                            self.bin_trial_start_epoch[i, c_idx] = self.adaptive_current_epoch
+                                            
+                                            new_scale = max(0.7, raw_scale - 0.04)
+                                            if c_idx == 0:
+                                                self.bin_pos_scale[i] = new_scale
                                             else:
-                                                # 继续激进下调
-                                                self.bin_last_stable_scale[i, c_idx] = current_scale
-                                                self.bin_last_aggressive_rate[i, c_idx] = rate
-                                                new_scale = max(0.7, current_scale - 0.01)
-                                                if component == "pos":
-                                                    self.bin_pos_scale[i] = new_scale
-                                                else:
-                                                    self.bin_rot_scale[i] = new_scale
-                                                print(f"[ADAPTIVE DUAL] Bin {i} {component} Aggressive jump -0.01. New Raw Scale: {new_scale:.4f} (Rate {rate:.2f} >= Prev {prev_aggressive_rate:.2f}). Obj-Pos Scale: {self.bin_pos_scale[i].item():.4f}, Obj-Rot Scale: {self.bin_rot_scale[i].item():.4f}")
+                                                self.bin_rot_scale[i] = new_scale
                                             
                                             self.bin_epochs_at_scale[i, c_idx] = 0
-                                
-                                # Terminal 检查 (双组件均失效且低成功率)
-                                if c_idx == 1: # 处理完 rot 后检查
-                                    pos_state = self.bin_state[i, 0].item()
-                                    rot_state = self.bin_state[i, 1].item()
-                                    pos_rate = self.bin_obj_pos_pass_rate[i].item()
-                                    rot_rate = self.bin_obj_rot_pass_rate[i].item()
-                                    
-                                    if pos_state == 3 and rot_state == 3 and pos_rate < 0.5 and rot_rate < 0.5:
-                                        self.bin_state[i, 0] = 4 # Terminal
-                                        self.bin_state[i, 1] = 4 # Terminal
-                                        # 恢复到历史上表现最好的最小 Scale
-                                        self.bin_pos_scale[i] = self.bin_best_scales[i, 0]
-                                        self.bin_rot_scale[i] = self.bin_best_scales[i, 1]
-                                        print(f"[ADAPTIVE DUAL] Bin {i} reached TERMINAL. Both failed. Locking to best: Pos {self.bin_pos_scale[i].item():.4f}, Rot {self.bin_rot_scale[i].item():.4f}")
+                                            self._reset_bin_histories(i)
+                                            msg_other = f"Other {components[other_idx]} remains {['Normal','TrialB','Aggressive','Frozen','Terminal','Pending'][other_state]}." if other_state in [3, 4] else f"Other {components[other_idx]} set to Pending."
+                                            print(f"[ADAPTIVE DUAL] Bin {i} {component} initiated Trial. {msg_other} Scale Jump -0.04.")
+                                            break
+
+                                        elif expect_rise and not rise_already_done and self.bin_epochs_at_scale[i, c_idx] >= 35:
+                                            new_scale = min(self.adaptive_scale_factor_max, raw_scale + 0.01)
+                                            if c_idx == 0:
+                                                self.bin_pos_scale[i] = new_scale
+                                            else:
+                                                self.bin_rot_scale[i] = new_scale
+                                            self.bin_scale_increase_history[i][component][current_scale_key] = 1
+                                            self.bin_epochs_at_scale[i, c_idx] = 0
+                                            self._reset_bin_histories(i) # [恢复] 每次 Scale 改变都重置历史
+                                            print(f"[ADAPTIVE DUAL] Bin {i} {component} scale rise +0.01.")
+
+                                # === [阶段 1: TrialB] ===
+                                elif state == 1:
+                                    trial_duration = self.adaptive_current_epoch - self.bin_trial_start_epoch[i, c_idx]
+                                    if trial_duration >= 35:
+                                        start_ema = self.bin_ema_at_start[i, c_idx].item()
+                                        if bin_ema >= start_ema:
+                                            self.bin_state[i, c_idx] = 2 # Aggressive
+                                            self.bin_ema_at_start[i, c_idx] = bin_ema
+                                            self.bin_epochs_at_scale[i, c_idx] = 0
+                                            
+                                            # [新增] 如果自己是后行者，且对方在 Pending，则让先行者也进入 Aggressive
+                                            first_mover = self.bin_first_mover[i].item()
+                                            if c_idx != first_mover and other_state == 5:
+                                                self.bin_state[i, other_idx] = 2 # 先行者进入 Aggressive
+                                                self.bin_ema_at_start[i, other_idx] = bin_ema 
+                                                self.bin_epochs_at_scale[i, other_idx] = 0
+                                                self.bin_aggressive_turn[i] = 0 # 默认从 pos 开始交替
+                                                print(f"[ADAPTIVE DUAL] Bin {i} Second Mover {component} Trial improved. Both entering Aggressive.")
+                                            else:
+                                                print(f"[ADAPTIVE DUAL] Bin {i} {component} Trial improved. Phase: TrialB -> Aggressive.")
+                                        else:
+                                            first_mover = self.bin_first_mover[i].item()
+                                            if c_idx == first_mover:
+                                                # [修改] 如果对手是 Frozen/Terminal，自己直接 Frozen 且不强制对手 Trial
+                                                if other_state in [3, 4]:
+                                                    self.bin_state[i, c_idx] = 3 # Frozen
+                                                    if c_idx == 0:
+                                                        self.bin_pos_scale[i] = self.bin_pos_stable_best[i]
+                                                    else:
+                                                        self.bin_rot_scale[i] = self.bin_rot_stable_best[i]
+                                                    print(f"[ADAPTIVE DUAL] Bin {i} First Mover {component} failed Trial. Other is Frozen, so First Mover becomes Frozen as well.")
+                                                else:
+                                                    self.bin_state[i, c_idx] = 5 # Pending
+                                                    self.bin_state[i, other_idx] = 1 # TrialB
+                                                    other_raw_scale = self.bin_pos_scale[i].item() if other_idx == 0 else self.bin_rot_scale[i].item()
+                                                    self.bin_initial_scale_before_trial[i, other_idx] = other_raw_scale
+                                                    self.bin_ema_at_start[i, other_idx] = bin_ema
+                                                    self.bin_trial_start_epoch[i, other_idx] = self.adaptive_current_epoch
+                                                    new_other_scale = max(0.7, other_raw_scale - 0.04)
+                                                    if other_idx == 0:
+                                                        self.bin_pos_scale[i] = new_other_scale
+                                                    else:
+                                                        self.bin_rot_scale[i] = new_other_scale
+                                                    print(f"[ADAPTIVE DUAL] Bin {i} First Mover {component} failed Trial. Now {components[other_idx]} starts Trial.")
+                                                self._reset_bin_histories(i)
+                                            else:
+                                                # 记录此时对手(c_idx)将被还原到的 scale
+                                                initial_scale_second = self.bin_initial_scale_before_trial[i, c_idx].item()
+                                                self.bin_other_scale_at_freeze[i, other_idx] = initial_scale_second
+
+                                                self.bin_state[i, other_idx] = 3 # Frozen (First mover)
+                                                self.bin_state[i, c_idx] = 0 # Normal (Second mover)
+                                                self.bin_epochs_at_scale[i, c_idx] = 0 # [修复] 重置停留计时
+                                                if other_idx == 0:
+                                                    self.bin_pos_scale[i] = self.bin_pos_stable_best[i]
+                                                else:
+                                                    self.bin_rot_scale[i] = self.bin_rot_stable_best[i]
+                                                initial_scale_second = self.bin_initial_scale_before_trial[i, c_idx].item()
+                                                if c_idx == 0:
+                                                    self.bin_pos_scale[i] = initial_scale_second
+                                                else:
+                                                    self.bin_rot_scale[i] = initial_scale_second
+                                                print(f"[ADAPTIVE DUAL] Bin {i} Second Mover {component} failed. Reverting both.")
+                                                self._reset_bin_histories(i)
+                                    break
+
+                                # === [阶段 2: Aggressive] ===
+                                elif state == 2:
+                                    # [修改] 成功判定标准：EMA >= 0.5 或 Avg_30 >= 0.45 (要求满 30 epoch)
+                                    avg_30_target_ok = (self.bin_accumulated_epochs_since_reset[i] >= 30) and (bin_success_avg_30[i] >= 0.45)
+                                    if avg_30_target_ok:
+                                        if other_state == 5:
+                                            # 记录对手(other_idx)当前的 scale
+                                            other_scale = self.bin_pos_scale[i].item() if other_idx == 0 else self.bin_rot_scale[i].item()
+                                            self.bin_other_scale_at_freeze[i, c_idx] = other_scale
+
+                                            self.bin_state[i, c_idx] = 3
+                                            self.bin_state[i, other_idx] = 0
+                                            self.bin_epochs_at_scale[i, other_idx] = 0 # [修复] 重置停留计时
+                                            print(f"[ADAPTIVE DUAL] Bin {i} {component} reached target. Phase: Aggressive -> Frozen, Other -> Normal.")
+                                        elif other_state in [3, 4]:
+                                            # [新增] 如果对手已经是锁定状态，自己成功后只把自己冻结，完全不触碰对手的状态和 scale
+                                            self.bin_other_scale_at_freeze[i, c_idx] = self.bin_pos_scale[i] if other_idx == 0 else self.bin_rot_scale[i]
+                                            self.bin_state[i, c_idx] = 3
+                                            print(f"[ADAPTIVE DUAL] Bin {i} {component} reached target. Other is already {['Frozen','Terminal'][other_state-3]}, keeping its state and scale.")
+                                        else:
+                                            # 记录双方对手当前的 scale (针对对手在 Normal, TrialB, Aggressive 的情况)
+                                            self.bin_other_scale_at_freeze[i, c_idx] = self.bin_pos_scale[i] if other_idx == 0 else self.bin_rot_scale[i]
+                                            self.bin_other_scale_at_freeze[i, other_idx] = self.bin_pos_scale[i] if c_idx == 0 else self.bin_rot_scale[i]
+
+                                            self.bin_state[i, c_idx] = 3
+                                            self.bin_state[i, other_idx] = 3
+                                            print(f"[ADAPTIVE DUAL] Bin {i} joint target reached. Both -> Frozen.")
+                                        self._reset_bin_histories(i)
+                                    else:
+                                        self.bin_epochs_at_scale[i, c_idx] += 1
+                                        if self.bin_epochs_at_scale[i, c_idx] >= 50:
+                                            start_ema = self.bin_ema_at_start[i, c_idx].item()
+                                            if bin_ema >= start_ema:
+                                                self.bin_ema_at_start[i, c_idx] = bin_ema
+                                                if other_state == 2:
+                                                    turn = self.bin_aggressive_turn[i].item()
+                                                    if turn == -1: turn = 0
+                                                    if turn == c_idx:
+                                                        new_scale = max(0.7, raw_scale - 0.01)
+                                                        if c_idx == 0:
+                                                            self.bin_pos_scale[i] = new_scale
+                                                        else:
+                                                            self.bin_rot_scale[i] = new_scale
+                                                        self.bin_aggressive_turn[i] = 1 - c_idx
+                                                        print(f"[ADAPTIVE DUAL] Bin {i} joint Aggressive: {component} decreased to {new_scale:.4f}")
+                                                        self.bin_epochs_at_scale[i, c_idx] = 0
+                                                        self._reset_bin_histories(i) # [恢复] 每次 Scale 改变都重置历史
+                                                else:
+                                                    # 只有自己激进
+                                                    new_scale = max(0.7, raw_scale - 0.01)
+                                                    if c_idx == 0:
+                                                        self.bin_pos_scale[i] = new_scale
+                                                    else:
+                                                        self.bin_rot_scale[i] = new_scale
+                                                    print(f"[ADAPTIVE DUAL] Bin {i} {component} Aggressive decrease to {new_scale:.4f}")
+                                                    self.bin_epochs_at_scale[i, c_idx] = 0
+                                                    self._reset_bin_histories(i) # [恢复] 每次 Scale 改变都重置历史
+                                            else:
+                                                first_mover = self.bin_first_mover[i].item()
+                                                if other_state == 5:
+                                                    self.bin_state[i, c_idx] = 5
+                                                    self.bin_state[i, other_idx] = 1
+                                                    other_raw_scale = self.bin_pos_scale[i].item() if other_idx == 0 else self.bin_rot_scale[i].item()
+                                                    self.bin_initial_scale_before_trial[i, other_idx] = other_raw_scale
+                                                    self.bin_ema_at_start[i, other_idx] = bin_ema
+                                                    self.bin_trial_start_epoch[i, other_idx] = self.adaptive_current_epoch
+                                                    new_other_scale = max(0.7, other_raw_scale - 0.04)
+                                                    if other_idx == 0:
+                                                        self.bin_pos_scale[i] = new_other_scale
+                                                    else:
+                                                        self.bin_rot_scale[i] = new_other_scale
+                                                    print(f"[ADAPTIVE DUAL] Bin {i} First Mover {component} worsened. Now {components[other_idx]} starts Trial.")
+                                                    self._reset_bin_histories(i)
+                                                elif other_state in [3, 4]:
+                                                    # [修改] 阶段 2 (Aggressive) 失败保护：如果对手是 Frozen/Terminal，自己直接 Frozen
+                                                    self.bin_state[i, c_idx] = 3 # Frozen
+                                                    if c_idx == 0:
+                                                        self.bin_pos_scale[i] = self.bin_pos_stable_best[i]
+                                                    else:
+                                                        self.bin_rot_scale[i] = self.bin_rot_stable_best[i]
+                                                    print(f"[ADAPTIVE DUAL] Bin {i} Aggressive First Mover {component} worsened. Other is Frozen, so First Mover becomes Frozen.")
+                                                    self._reset_bin_histories(i)
+                                                else:
+                                                    # 记录对手(1-first_mover)将被还原到的 scale
+                                                    initial_scale_other = self.bin_initial_scale_before_trial[i, 1-first_mover].item()
+                                                    self.bin_other_scale_at_freeze[i, first_mover] = initial_scale_other
+
+                                                    self.bin_state[i, first_mover] = 3
+                                                    self.bin_state[i, 1-first_mover] = 0
+                                                    self.bin_epochs_at_scale[i, 1-first_mover] = 0 # [修复] 重置停留计时
+                                                    if first_mover == 0:
+                                                        self.bin_pos_scale[i] = self.bin_pos_stable_best[i]
+                                                    else:
+                                                        self.bin_rot_scale[i] = self.bin_rot_stable_best[i]
+                                                    initial_scale_second = self.bin_initial_scale_before_trial[i, 1-first_mover].item()
+                                                    if 1-first_mover == 0:
+                                                        self.bin_pos_scale[i] = initial_scale_second
+                                                    else:
+                                                        self.bin_rot_scale[i] = initial_scale_second
+                                                    print(f"[ADAPTIVE DUAL] Bin {i} joint Aggressive worsened. Reverting both.")
+                                                    self._reset_bin_histories(i)
+                                    break
 
                     # 6. Reset general stats if difficulty changed
                     if scale_changed:
@@ -3177,8 +3423,7 @@ class DexHandManipBiHEnv(VecTask):
                         self.stuck_epoch_counter = 0
                         self.adaptive_epoch_success_rate_history.clear()
                         self.adaptive_epoch_steps_history.clear()
-                        # [新增] 重新从 warmup 期开始，不继承成功率
-                        self.bin_ema_success_rates.zero_()
+                        # [修改] global_scale 改变时不再清空 EMA，仅在 local bin scale 变化时清空
                         self.low_success_history.clear()
 
 
@@ -3348,46 +3593,54 @@ class DexHandManipBiHEnv(VecTask):
         if hasattr(self, 'support_force_kd_rot'):
             info["adaptive_difficulty/support_force_kd_rot"] = float(self.support_force_kd_rot)
 
-        # === [新增] 添加自适应采样统计信息 ===
+        # === [重构] 统一难度和采样统计信息填充 (仅按 Iteration 逻辑记录) ===
         if self.adaptive_sampling_bins is not None:
-            # 只记录每个 bin 当下这个 epoch 的成功率 (从上个完成的 epoch 中获取)
+            # 1. 基础统计 (EMA 成功率和通过率)
             if hasattr(self, 'current_epoch_bin_rates') and self.current_epoch_bin_rates is not None:
                 for i in range(self.adaptive_sampling_bins):
                     info[f"adaptive_sampling/bin_{i}_success_rate"] = float(self.current_epoch_bin_rates[i].item())
-
-            # 整体成功率 (当前 epoch 的整体表现)
-            if hasattr(self, 'current_epoch_success_rate'):
-                info["adaptive_sampling/overall_success_rate"] = float(self.current_epoch_success_rate)
             
-            if hasattr(self, 'adaptive_current_epoch') and self.adaptive_current_epoch >= 0:
-                info["adaptive_difficulty/current_epoch"] = float(self.adaptive_current_epoch)
-
-            # 添加重力和摩擦力信息到tensorboard
-            if hasattr(self, 'current_epoch_gravity'):
-                info["adaptive_difficulty/current_epoch_gravity"] = float(self.current_epoch_gravity)
-            if hasattr(self, 'current_epoch_avg_friction'):
-                info["adaptive_difficulty/current_epoch_avg_friction"] = float(self.current_epoch_avg_friction)
-
-            # 添加Bin Obj-Pos和Obj-Rot Pass Rates到tensorboard
             if hasattr(self, 'bin_obj_pos_pass_rate') and self.bin_obj_pos_pass_rate is not None:
                 for i in range(self.adaptive_sampling_bins):
                     info[f"adaptive_sampling/bin_{i}_obj_pos_pass_rate"] = float(self.bin_obj_pos_pass_rate[i].item())
-
             if hasattr(self, 'bin_obj_rot_pass_rate') and self.bin_obj_rot_pass_rate is not None:
                 for i in range(self.adaptive_sampling_bins):
                     info[f"adaptive_sampling/bin_{i}_obj_rot_pass_rate"] = float(self.bin_obj_rot_pass_rate[i].item())
 
-            # === [新增] 添加每个 Bin 的 Obj-Pos 和 Obj-Rot Scale Factor ===
+            # 2. Adaptive Dual 专有数据 (Scale 和 State)
             if self.tighten_method == "adaptive_dual":
-                if hasattr(self, 'bin_pos_scale') and self.bin_pos_scale is not None:
-                    for i in range(self.adaptive_sampling_bins):
+                for i in range(self.adaptive_sampling_bins):
+                    if hasattr(self, 'bin_pos_scale'):
                         info[f"adaptive_difficulty/bin_{i}_pos_scale"] = float(self.bin_pos_scale[i].item())
-                if hasattr(self, 'bin_rot_scale') and self.bin_rot_scale is not None:
-                    for i in range(self.adaptive_sampling_bins):
+                    if hasattr(self, 'bin_rot_scale'):
                         info[f"adaptive_difficulty/bin_{i}_rot_scale"] = float(self.bin_rot_scale[i].item())
+                    if hasattr(self, 'bin_state'):
+                        info[f"adaptive_difficulty/bin_{i}_pos_state"] = float(self.bin_state[i, 0].item())
+                        info[f"adaptive_difficulty/bin_{i}_rot_state"] = float(self.bin_state[i, 1].item())
+                    
+                    # [新增] 记录每个 bin 的历史最佳稳定 scale
+                    if hasattr(self, 'bin_pos_stable_best'):
+                        info[f"adaptive_difficulty/bin_{i}_pos_stable_best"] = float(self.bin_pos_stable_best[i].item())
+                    if hasattr(self, 'bin_rot_stable_best'):
+                        info[f"adaptive_difficulty/bin_{i}_rot_stable_best"] = float(self.bin_rot_stable_best[i].item())
 
-        # === [修改] 统一设置难度系数给物理引擎 ===
-        # 优先使用 current_scale_factor，因为它在 compute_reward_side 中每帧都会根据当前模式更新
+            # 3. 总体成功率
+            if hasattr(self, 'current_epoch_success_rate'):
+                info["adaptive_sampling/overall_success_rate"] = float(self.current_epoch_success_rate)
+
+        # 4. 强制 Iteration 轴对齐
+        if hasattr(self, 'adaptive_current_epoch') and self.adaptive_current_epoch >= 0:
+            current_iter = int(self.adaptive_current_epoch)
+            info["iteration"] = current_iter
+            info["adaptive_difficulty/current_iteration"] = current_iter
+
+        # 5. 辅助信息 (重力、摩擦力等)
+        if hasattr(self, 'current_epoch_gravity'):
+            info["adaptive_difficulty/current_epoch_gravity"] = float(self.current_epoch_gravity)
+        if hasattr(self, 'current_epoch_avg_friction'):
+            info["adaptive_difficulty/current_epoch_avg_friction"] = float(self.current_epoch_avg_friction)
+
+        # === [物理引擎设置] ===
         if hasattr(self, "current_scale_factor"):
             self.set_adaptive_scale_factor(self.current_scale_factor)
         elif hasattr(self, "adaptive_global_scale_factor"):

@@ -51,7 +51,7 @@ env:
   terminateOnEEF: ${resolve_default:False,${...terminate_on_eef}}
   terminateObjPosThreshold: ${resolve_default:0.01785,${...terminate_obj_pos_threshold}}
   terminateObjRotThreshold: ${resolve_default:24,${...terminate_obj_rot_threshold}}
-  terminateObjPosFinal: ${resolve_default:0.01785,${...terminate_obj_pos_final}}
+  terminateObjPosFinal: ${resolve_default:0.02,${...terminate_obj_pos_final}}
   terminateObjRotFinal: ${resolve_default:24,${...terminate_obj_rot_final}}
   terminateThumbThreshold: ${resolve_default:0.04,${...terminate_thumb_threshold}}
   terminateIndexThreshold: ${resolve_default:0.045,${...terminate_index_threshold}}
@@ -77,7 +77,7 @@ env:
   terminateOnContact: ${resolve_default:False,${...terminate_on_contact}}
   noRegressionThreshold: ${resolve_default:1.5,${...no_regression_threshold}}
   
-  adaptiveStuckThreshold: ${resolve_default:80,${...adaptive_stuck_threshold}}
+  adaptiveStuckThreshold: ${resolve_default:60,${...adaptive_stuck_threshold}}
   
   # 自适应难度调整参数（可选，有默认值）
   adaptiveSuccessWindow: ${resolve_default:5,${...adaptive_success_window}}

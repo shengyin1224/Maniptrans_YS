@@ -9,6 +9,7 @@ __pycache__/
 *.so
 
 isaacgym/
+0105_nerv/
 
 events.out.tfevents.*
 
