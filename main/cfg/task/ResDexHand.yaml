@@ -44,11 +44,11 @@ env:
   tightenMethod: "adaptive"  # 使用自适应难度调整
   tightenFactor: 1.0  # 初始scale_factor（可选，默认1.0）
   
-  rewardInteractScale: ${resolve_default:2,${...reward_interact_scale}}
-  rewardObjPosScale: ${resolve_default:15.0,${...reward_obj_pos_scale}}
-  rewardObjRotScale: ${resolve_default:15.0,${...reward_obj_rot_scale}}
-  rewardFingerTipForceScale: ${resolve_default:30.0,${...reward_finger_tip_force_scale}}
-  terminateOnEEF: ${resolve_default:False,${...terminate_on_eef}}
+  rewardInteractScale: ${resolve_default:3,${...reward_interact_scale}}
+  rewardObjPosScale: ${resolve_default:4.0,${...reward_obj_pos_scale}}
+  rewardObjRotScale: ${resolve_default:4.0,${...reward_obj_rot_scale}}
+  rewardFingerTipForceScale: ${resolve_default:1.0,${...reward_finger_tip_force_scale}}
+  terminateOnEEF: ${resolve_default:True,${...terminate_on_eef}}
   terminateObjPosThreshold: ${resolve_default:0.01785,${...terminate_obj_pos_threshold}}
   terminateObjRotThreshold: ${resolve_default:24,${...terminate_obj_rot_threshold}}
   terminateObjPosFinal: ${resolve_default:0.02,${...terminate_obj_pos_final}}

@@ -16,6 +16,7 @@ events.out.tfevents.*
 data/dexmanipnet/*
 data/grab_demo/*
 data/OakInk-v2/*
+data/humoto/*
 *_nocontact.pkl
 
 DexManipNet

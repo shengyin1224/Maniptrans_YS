@@ -447,7 +447,7 @@ class MyBasePlayer(object):
                                 # so we don’t save the first few rollouts
                                 to_save_flag = (self.prev_done_count_sum - prev_done_count) > self.env.num_envs * 2
                                 if to_save_flag and self.save_successful_rollouts_only and successful:
-                                    rollout_grp = self.s_grp.create_group(f"rollout_{self.saved_successful_rollouts}")
+                                    rollout_grp = self.s_grp.create_group(f"rollout_{self.saved_successful_rollouts}_step_{len(rollouts[prev_done_idx])}")
                                     for k, v in rollout_to_save.items():
                                         rollout_grp.create_dataset(k, data=v)
                                     self.saved_successful_rollouts += 1

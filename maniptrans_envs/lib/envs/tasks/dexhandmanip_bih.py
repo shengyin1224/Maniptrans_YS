@@ -300,6 +300,8 @@ class DexHandManipBiHEnv(VecTask):
         )
 
         self.env_start_bin_index = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        # [新增] 初始化从最开始开始 reset 的比例 (默认为 10%)
+        self.start_from_beginning_ratio = 0.10
         # [新增] 记录每个环境是否发生了特定的失败
         self.env_obj_pos_failed = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self.env_obj_rot_failed = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
@@ -1145,10 +1147,11 @@ class DexHandManipBiHEnv(VecTask):
             q_xyzw = q[[1, 2, 3, 0]]  # 转换为 [x, y, z, w] 格式
             pose.r = gymapi.Quat(q_xyzw[0], q_xyzw[1], q_xyzw[2], q_xyzw[3])
 
-            if obj_name == "vase":
-                handle = self.gym.create_actor(env_ptr, asset, pose, f"{obj_name}_{side}_{k}", i, 1)
-            else:
-                handle = self.gym.create_actor(env_ptr, asset, pose, f"{obj_name}_{side}_{k}", i, 0)
+            # if obj_name == "vase":
+            #     handle = self.gym.create_actor(env_ptr, asset, pose, f"{obj_name}_{side}_{k}", i, 1)
+            #     import pdb; pdb.set_trace()
+            # else:
+            handle = self.gym.create_actor(env_ptr, asset, pose, f"{obj_name}_{side}_{k}", i, 0)
             # 3. 创建 Actor
             #handle = self.gym.create_actor(env_ptr, asset, pose, f"{obj_name}_{side}_{k}", i, 0)
             
@@ -1705,6 +1708,7 @@ class DexHandManipBiHEnv(VecTask):
         if not hasattr(self, "_printed_weights"):
             self._printed_weights = True
             print("\n" + "="*50)
+            print(f"[DEBUG] Current Motion Total Frames (Env 0): {self.demo_data_rh['seq_len'][0].item()}")
             print("[DEBUG] Current Object Weights (Env 0):")
             prop = self.gym.get_sim_params(self.sim)
             gravity_z = prop.gravity.z
@@ -2504,6 +2508,15 @@ class DexHandManipBiHEnv(VecTask):
                 # 为每个环境采样进度比例
                 sampled_progress_ratios, sampled_bins = self._adaptive_sampling(env_ids)
 
+                # [新增] 根据比例强制部分环境从最开始 (Bin 0) 开始 reset
+                if self.start_from_beginning_ratio > 0:
+                    num_to_reset = len(env_ids)
+                    reset_rand = torch.rand(num_to_reset, device=self.device)
+                    from_beginning_mask = reset_rand < self.start_from_beginning_ratio
+                    if from_beginning_mask.any():
+                        sampled_progress_ratios[from_beginning_mask] = 0.0
+                        sampled_bins[from_beginning_mask] = 0
+
                 # 记录采样的bin索引，用于后续统计从起点到终点跨越的所有bin
                 self.env_start_bin_index[env_ids] = sampled_bins
 
@@ -2913,6 +2926,12 @@ class DexHandManipBiHEnv(VecTask):
                         self.bin_ema_success_rates 
                     )
                     self.current_epoch_bin_rates = current_epoch_bin_rates.clone() 
+                    
+                    # [新增] 如果 global_scale 降至 0.7 之后，根据所有 bin 的成功率动态增加从头开始的比例
+                    if self.adaptive_global_scale_factor <= 0.7001:
+                        if torch.all(current_epoch_bin_rates > 0.60):
+                            self.start_from_beginning_ratio = min(1.0, self.start_from_beginning_ratio + 0.005)
+                            print(f"[ADAPTIVE RESET] All bin rates > 0.60, increasing start_from_beginning_ratio to {self.start_from_beginning_ratio:.4f}")
                     
                     # [新增] 计算当前 epoch 的各 bin obj-pos 和 obj-rot 通过率
                     self.bin_obj_pos_pass_rate = torch.where(
@@ -3483,7 +3502,7 @@ class DexHandManipBiHEnv(VecTask):
                     current_rates = current_epoch_bin_rates.tolist()
                     ema_rates = self.bin_ema_success_rates.tolist()
                     
-                    print(f"[ADAPTIVE STATS] Epoch {self.adaptive_current_epoch} (Global Scale: {self.adaptive_global_scale_factor:.4f}, Obj-Pos Scale: {self.bin_pos_scale.mean().item():.4f}, Obj-Rot Scale: {self.bin_rot_scale.mean().item():.4f}):")
+                    print(f"[ADAPTIVE STATS] Epoch {self.adaptive_current_epoch} (Global Scale: {self.adaptive_global_scale_factor:.4f}, Start Ratio: {self.start_from_beginning_ratio:.4f}, Obj-Pos Scale: {self.bin_pos_scale.mean().item():.4f}, Obj-Rot Scale: {self.bin_rot_scale.mean().item():.4f}):")
                     print(f"  - Bin Reset Counts: {bin_reset_counts}")
                     print(f"  - Bin Success Rates (Current): {[f'{r:.2f}' for r in current_rates]}")
                     print(f"  - Bin Success Rates (EMA):     {[f'{r:.2f}' for r in ema_rates]}")
@@ -4036,6 +4055,62 @@ class DexHandManipBiHEnv(VecTask):
         self.compute_observations()
         self.compute_reward(self.actions)
 
+        # [新增] 在测试模式下输出 wrist 的线速度和角速度，以及与 reference 的误差 (仅对环境 0)
+        if not self.training:
+            # 1. 获取当前索引
+            cur_idx = torch.clamp(self.progress_buf, torch.zeros_like(self.demo_data_rh["seq_len"]), self.demo_data_rh["seq_len"] - 1)
+            e0 = 0 # Env 0
+
+            # 2. 获取当前状态 (Env 0)
+            # base_state 包含: pos(3), quat(4), vel(3), ang_vel(3)
+            rh_pos = self.rh_states["base_state"][e0, :3]
+            rh_quat = self.rh_states["base_state"][e0, 3:7]
+            rh_vel = self.rh_states["base_state"][e0, 7:10]
+            rh_ang_vel = self.rh_states["base_state"][e0, 10:13]
+
+            lh_pos = self.lh_states["base_state"][e0, :3]
+            lh_quat = self.lh_states["base_state"][e0, 3:7]
+            lh_vel = self.lh_states["base_state"][e0, 7:10]
+            lh_ang_vel = self.lh_states["base_state"][e0, 10:13]
+
+            # 3. 获取目标状态 (Env 0)
+            rh_target_pos = self.demo_data_rh["wrist_pos"][e0, cur_idx[e0]]
+            rh_target_aa = self.demo_data_rh["wrist_rot"][e0, cur_idx[e0]]
+            rh_target_quat = aa_to_quat(rh_target_aa.view(1, 3))[:, [1, 2, 3, 0]].view(4)
+            rh_target_vel = self.demo_data_rh["wrist_velocity"][e0, cur_idx[e0]]
+            rh_target_ang_vel = self.demo_data_rh["wrist_angular_velocity"][e0, cur_idx[e0]]
+
+            lh_target_pos = self.demo_data_lh["wrist_pos"][e0, cur_idx[e0]]
+            lh_target_aa = self.demo_data_lh["wrist_rot"][e0, cur_idx[e0]]
+            lh_target_quat = aa_to_quat(lh_target_aa.view(1, 3))[:, [1, 2, 3, 0]].view(4)
+            lh_target_vel = self.demo_data_lh["wrist_velocity"][e0, cur_idx[e0]]
+            lh_target_ang_vel = self.demo_data_lh["wrist_angular_velocity"][e0, cur_idx[e0]]
+
+            # 4. 计算误差 (与 compute_imitation_reward 逻辑一致)
+            # Position Error (Norm)
+            rh_pos_err = torch.norm(rh_target_pos - rh_pos).item()
+            lh_pos_err = torch.norm(lh_target_pos - lh_pos).item()
+
+            # Rotation Error (Angle in degrees)
+            rh_rot_diff = quat_mul(rh_target_quat.view(1, 4), quat_conjugate(rh_quat.view(1, 4)))
+            rh_rot_err = (quat_to_angle_axis(rh_rot_diff)[0].abs() / np.pi * 180).item()
+            lh_rot_diff = quat_mul(lh_target_quat.view(1, 4), quat_conjugate(lh_quat.view(1, 4)))
+            lh_rot_err = (quat_to_angle_axis(lh_rot_diff)[0].abs() / np.pi * 180).item()
+
+            # Velocity Error (Mean Absolute Error)
+            rh_vel_err = (rh_target_vel - rh_vel).abs().mean().item()
+            lh_vel_err = (lh_target_vel - lh_vel).abs().mean().item()
+
+            # Angular Velocity Error (Mean Absolute Error)
+            rh_ang_vel_err = (rh_target_ang_vel - rh_ang_vel).abs().mean().item()
+            lh_ang_vel_err = (lh_target_ang_vel - lh_ang_vel).abs().mean().item()
+
+            print(f"Step {self.progress_buf[0].item()}:")
+            print(f"  [RH Wrist] LinVel: {rh_vel.cpu().numpy()}, AngVel: {rh_ang_vel.cpu().numpy()}")
+            print(f"             ERR: pos={rh_pos_err:.4f}m, rot={rh_rot_err:.2f}deg, vel={rh_vel_err:.4f}, ang_vel={rh_ang_vel_err:.4f}")
+            print(f"  [LH Wrist] LinVel: {lh_vel.cpu().numpy()}, AngVel: {lh_ang_vel.cpu().numpy()}")
+            print(f"             ERR: pos={lh_pos_err:.4f}m, rot={lh_rot_err:.2f}deg, vel={lh_vel_err:.4f}, ang_vel={lh_ang_vel_err:.4f}")
+
         self.progress_buf += 1
         self.running_progress_buf += 1
         self.randomize_buf += 1
@@ -4453,9 +4528,9 @@ def compute_imitation_reward(
     eef_vel_err = diff_eef_vel.abs().mean(dim=-1)
     eef_ang_vel_err = diff_eef_ang_vel.abs().mean(dim=-1)
 
-    eef_pos_threshold = 0.16 / 0.7 * scale_factor
-    eef_rot_threshold_deg = 120 * scale_factor
-    eef_vel_threshold = 3.0 / 0.7 * scale_factor
+    eef_pos_threshold = 0.08 / 0.7 * scale_factor
+    eef_rot_threshold_deg = 45 / 0.7 * scale_factor
+    eef_vel_threshold = 1.0 / 0.7 * scale_factor
     eef_ang_vel_threshold = 14.0 / 0.7 * scale_factor
 
     eef_pos_failed = eef_pos_err > eef_pos_threshold
@@ -4464,9 +4539,7 @@ def compute_imitation_reward(
     eef_ang_vel_failed = eef_ang_vel_err > eef_ang_vel_threshold
 
     failed_execute_eef = (
-        eef_vel_failed
-        | eef_ang_vel_failed
-        | eef_pos_failed
+        eef_pos_failed
         | eef_rot_failed
     ) if terminate_on_eef else torch.zeros_like(obj_pos_err, dtype=torch.bool)
 
@@ -4593,9 +4666,22 @@ def compute_imitation_reward(
     # 6. 计算最终奖励
     reward_interact = torch.exp(-lambda_dynamic * e_interact)
 
+    # [新增] 接触奖励奖励：如果 reference 中指尖离物体最近点的距离小于5mm，
+    # 并且模拟器中指尖也小于5mm且力 > 0.1N，增加额外奖励
+    dist_ref = torch.norm(v_ref, dim=-1) # [N, 5]
+    dist_sim = torch.norm(v_sim, dim=-1) # [N, 5]
+    force_sim = torch.norm(target_states["tip_force"], dim=-1) # [N, 5]
+    
+    ref_contact_mask = dist_ref < 0.005
+    sim_contact_mask = dist_sim < 0.005
+    force_ok_mask = force_sim > 0.1
+    
+    contact_bonus = (ref_contact_mask & sim_contact_mask & force_ok_mask).sum(dim=-1).float() * 3.0
+    reward_interact = reward_interact + contact_bonus
+
     reward_execute = (
-        0.5 * reward_eef_pos  # 从0.1增加到0.3，提高wrist位置跟踪的权重
-        + 1 * reward_eef_rot
+        1.5 * reward_eef_pos  # 从0.1增加到0.3，提高wrist位置跟踪的权重
+        + 2 * reward_eef_rot
         + 0.9 * reward_thumb_tip_pos
         + 0.8 * reward_index_tip_pos
         + 0.75 * reward_middle_tip_pos
@@ -4605,8 +4691,8 @@ def compute_imitation_reward(
         + 0.1 * reward_level_2_pos
         + reward_obj_pos_scale * reward_obj_pos
         + reward_obj_rot_scale * reward_obj_rot
-        + 0.1 * reward_eef_vel
-        + 0.5 * reward_eef_ang_vel
+        + 0.6 * reward_eef_vel
+        + 0.8 * reward_eef_ang_vel
         + 0.1 * reward_joints_vel
         + 0.1 * reward_obj_vel
         + 0.1 * reward_obj_ang_vel
