@@ -1659,6 +1659,16 @@ class DexHandManipBiHEnv(VecTask):
         rh_obj_states = root_state_flat[flat_rh_indices].view(self.num_envs, self.num_objs_per_env, 13)
         lh_obj_states = root_state_flat[flat_lh_indices].view(self.num_envs, self.num_objs_per_env, 13)
 
+        # === 调试断点 1：检查物理仿真状态 ===
+        if torch.isnan(rh_obj_states).any() or torch.isnan(lh_obj_states).any():
+            print("\n[!!!] 检测到物理仿真产生 NaN !")
+            if torch.isnan(rh_obj_states).any():
+                nan_envs = torch.where(torch.isnan(rh_obj_states).any(dim=-1).any(dim=-1))[0]
+                print(f"右侧故障环境 IDs: {nan_envs.tolist()}")
+            if torch.isnan(lh_obj_states).any():
+                nan_envs = torch.where(torch.isnan(lh_obj_states).any(dim=-1).any(dim=-1))[0]
+                print(f"左侧故障环境 IDs: {nan_envs.tolist()}")
+            import pdb; pdb.set_trace()
 
         self.rh_states.update(
             {
@@ -2022,6 +2032,11 @@ class DexHandManipBiHEnv(VecTask):
         # 获取静态物体信息
         obj_is_static = getattr(self, f"manip_obj_{side}_is_static")  # [N, K]
         
+        # [新增] 计算每帧固定的进度奖励单价 (100.0 * num_bins / 原始总全长)
+        # side_demo_data["seq_len"] 已经是广播到 num_envs 维度的 Tensor 了
+        full_motion_length = side_demo_data["seq_len"].to(self.device).float()
+        progress_reward_unit = (100.0 * self.adaptive_sampling_bins) / full_motion_length
+
         rew_buf, reset_buf, success_buf, failure_buf, reward_dict, error_buf, failure_reasons, failure_values = compute_imitation_reward(
             self.reset_buf,
             self.progress_buf,
@@ -2033,6 +2048,7 @@ class DexHandManipBiHEnv(VecTask):
             scale_factor,
             (self.dexhand_rh if side == "rh" else self.dexhand_lh).weight_idx,
             obj_is_static,
+            progress_reward_unit, # 传入计算好的 unit
             self.reward_interact_scale,
             self.terminate_on_eef,
             self.reward_obj_pos_scale,
@@ -2995,8 +3011,9 @@ class DexHandManipBiHEnv(VecTask):
                 
                 # === [新增] 处理 epoch_curriculum 模式的系数更新 ===
                 if self.tighten_method in ["epoch_curriculum", "adaptive_dual"]:
-                    # [修改] 如果是 adaptive_dual，强制 600 epoch 线性降到 0.7；否则使用配置的 target_epoch
-                    cur_target_epoch = 1800 if self.tighten_method == "adaptive_dual" else self.target_epoch
+                    # [修改] 如果是 adaptive_dual，线性降到 0.7；否则使用配置的 target_epoch
+                    # 使用 1800 * (1024 / num_envs) 作为 target_epoch (例如 256 envs 时为 7200)
+                    cur_target_epoch = 1800 * (1024 / self.num_envs) if self.tighten_method == "adaptive_dual" else self.target_epoch
                     progress = current_epoch / cur_target_epoch
                     progress = max(0.0, min(1.0, progress))
                     # 按照 compute_reward_side 中的公式同步更新全局系数
@@ -4259,6 +4276,7 @@ def compute_imitation_reward(
     scale_factor: Tensor, # [N] Changed to Tensor
     dexhand_weight_idx: Dict[str, List[int]],
     obj_is_static: Tensor,  # [N, K] 新增：静态物体信息
+    progress_reward_unit: Tensor, # [新增] 每帧固定的奖励额度 (基于全长计算)
     reward_interact_scale: float = 2.0, # 新增
     terminate_on_eef: bool = True, # 新增
     reward_obj_pos_scale: float = 6.0,
@@ -4343,6 +4361,13 @@ def compute_imitation_reward(
     reward_eef_rot = torch.exp(-0.8 * (diff_eef_rot_angle).abs())
 
     num_envs = current_eef_pos.shape[0]
+
+    # === 调试断点 2：检查奖励计算输入 ===
+    if torch.isnan(states["manip_obj_pos"]).any() or torch.isnan(target_states["manip_obj_pos"]).any():
+        print("\n[!!!] 奖励计算输入包含 NaN !")
+        print(f"States Pos NaN: {torch.isnan(states['manip_obj_pos']).any()}")
+        print(f"Target Pos NaN: {torch.isnan(target_states['manip_obj_pos']).any()}")
+        import pdb; pdb.set_trace()
 
     # object pose reward
     current_obj_pos = ensure_multi_object(states["manip_obj_pos"], num_envs, 3)
@@ -4650,6 +4675,14 @@ def compute_imitation_reward(
     
     # 将局部坐标转为仿真世界坐标
     curr_obj_rot = quat_to_rotmat(curr_obj_quat[:, [3, 0, 1, 2]]) # [N, 3, 3]
+
+    # === 调试断点 3：检查交互奖励计算中间值 ===
+    if torch.isnan(curr_obj_rot).any():
+        print("\n[!!!] quat_to_rotmat 产生 NaN ! 可能是四元数全零或未归一化")
+        nan_mask = torch.isnan(curr_obj_rot).any(dim=-1).any(dim=-1)
+        print(f"非法四元数样例 (第一个故障环境): {curr_obj_quat[nan_mask][0]}")
+        import pdb; pdb.set_trace()
+
     p_obj_sim = torch.bmm(curr_obj_rot, p_obj_local.transpose(-1, -2)).transpose(-1, -2) + curr_obj_pos.unsqueeze(1)
     
     # 3. 构建相对位置向量 [N, 5, 3]
@@ -4679,6 +4712,17 @@ def compute_imitation_reward(
     contact_bonus = (ref_contact_mask & sim_contact_mask & force_ok_mask).sum(dim=-1).float() * 3.0
     reward_interact = reward_interact + contact_bonus
 
+    # === [新增] 基于 Bin 的进度奖励 ===
+    # 使用外部传入的、基于全长计算的每帧固定奖励
+    reward_progress = progress_reward_unit
+
+    succeeded = (
+        progress_buf + 1 + 3 >= max_length
+    ) & ~failed_execute  # reached the end of the trajectory, +3 for max future 3 steps
+
+    # 成功额外奖励 200
+    reward_success_bonus = torch.where(succeeded, torch.ones_like(reward_progress) * 200.0, torch.zeros_like(reward_progress))
+
     reward_execute = (
         1.5 * reward_eef_pos  # 从0.1增加到0.3，提高wrist位置跟踪的权重
         + 2 * reward_eef_rot
@@ -4701,12 +4745,9 @@ def compute_imitation_reward(
         + 0.5 * reward_wrist_power
         + 0.0 * reward_contact_violation
         + reward_interact_scale * reward_interact # 新增
+        + 1.0 * (reward_progress + reward_success_bonus) # 新增进度和成功奖励
     )
 
-    succeeded = (
-        progress_buf + 1 + 3 >= max_length
-    ) & ~failed_execute  # reached the end of the trajectory, +3 for max future 3 steps
-    
     # [恢复] 失败立刻重置，或到达轨迹终点/成功时重置
     reset_buf = torch.where(
         (progress_buf + 1 + 3 >= max_length) | succeeded | failed_execute,
@@ -4728,6 +4769,8 @@ def compute_imitation_reward(
         "reward_obj_vel": reward_obj_vel,
         "reward_obj_ang_vel": reward_obj_ang_vel,
         "reward_interact": reward_interact,
+        "reward_progress": reward_progress,         # 新增
+        "reward_success_bonus": reward_success_bonus, # 新增
         "reward_joints_pos": (
             reward_thumb_tip_pos
             + reward_index_tip_pos
