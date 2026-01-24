@@ -180,7 +180,7 @@ class DexHandManipBiHEnv(VecTask):
         self.current_epoch_avg_steps = 0.0  # 当前epoch的平均step
         self.current_epoch_bin_rates = None # 当前epoch各bin的成功率
         
-        if self.tighten_method in ["adaptive", "adaptive_dual", "epoch_curriculum"]:
+        if self.tighten_method in ["adaptive", "adaptive_dual", "adaptive_real", "epoch_curriculum"]:
             # 配置参数（所有窗口大小都是基于epoch，而非episode）
             self.adaptive_success_window = self.cfg["env"].get("adaptiveSuccessWindow", 5)  # 连续N个epoch检查成功率
             self.adaptive_success_threshold = self.cfg["env"].get("adaptiveSuccessThreshold", 0.10)  # 成功率阈值（20%）
@@ -336,10 +336,27 @@ class DexHandManipBiHEnv(VecTask):
                 [self.adaptive_sampling_lambda**i for i in range(self.adaptive_sampling_kernel_size)], device=self.device
             )
 
+        num_bins = self.adaptive_sampling_bins
+        self.bin_accumulated_epochs_since_reset = torch.zeros((num_bins,), dtype=torch.long, device=self.device)
+
+        # [新增] 维持最小稳定 scale 的逻辑所需的缓冲区
+        # 记录过去 30 个 epoch 的通过率是否 > 70% (1 或 0)
+        self.bin_pos_pass_history = torch.zeros((num_bins, 30), dtype=torch.bool, device=self.device)
+        self.bin_rot_pass_history = torch.zeros((num_bins, 30), dtype=torch.bool, device=self.device)
+        # 记录过去 50 个 epoch 的综合成功率 (float)
+        self.bin_success_history_50 = torch.zeros((num_bins, 50), dtype=torch.float, device=self.device)
+        # 最小稳定 scale：初始设为较大的 1.0
+        self.bin_pos_stable_best = torch.full((num_bins,), 1.0, device=self.device)
+        self.bin_rot_stable_best = torch.full((num_bins,), 1.0, device=self.device)
+        # 当前历史记录的写入指针
+        self.bin_history_ptr_30 = 0
+        self.bin_history_ptr_50 = 0
+        
+        self.bin_next_trial_starter = torch.zeros((num_bins,), dtype=torch.long, device=self.device) # 0: pos, 1: rot
         # === [新增] 初始化 Per-bin independent scale factors and states for adaptive_dual ===
         # 必须在父类初始化之后，因为需要 self.device
         if self.tighten_method == "adaptive_dual" and self.adaptive_sampling_bins is not None:
-            num_bins = self.adaptive_sampling_bins
+            
             # 重新获取 initial_scale
             if self.tighten_factor is not None and 0 < self.tighten_factor <= 1.0:
                 initial_scale = self.tighten_factor
@@ -365,20 +382,7 @@ class DexHandManipBiHEnv(VecTask):
             self.bin_first_mover = torch.full((num_bins,), -1, dtype=torch.long, device=self.device) # -1: none, 0: pos, 1: rot
             self.bin_aggressive_turn = torch.full((num_bins,), -1, dtype=torch.long, device=self.device) # -1: none, 0: pos, 1: rot
 
-            # [新增] 维持最小稳定 scale 的逻辑所需的缓冲区
-            # 记录过去 30 个 epoch 的通过率是否 > 70% (1 或 0)
-            self.bin_pos_pass_history = torch.zeros((num_bins, 30), dtype=torch.bool, device=self.device)
-            self.bin_rot_pass_history = torch.zeros((num_bins, 30), dtype=torch.bool, device=self.device)
-            # 记录过去 50 个 epoch 的综合成功率 (float)
-            self.bin_success_history_50 = torch.zeros((num_bins, 50), dtype=torch.float, device=self.device)
-            # 最小稳定 scale：初始设为较大的 1.0
-            self.bin_pos_stable_best = torch.full((num_bins,), 1.0, device=self.device)
-            self.bin_rot_stable_best = torch.full((num_bins,), 1.0, device=self.device)
-            # 当前历史记录的写入指针
-            self.bin_history_ptr_30 = 0
-            self.bin_history_ptr_50 = 0
-            self.bin_accumulated_epochs_since_reset = torch.zeros((num_bins,), dtype=torch.long, device=self.device)
-            self.bin_next_trial_starter = torch.zeros((num_bins,), dtype=torch.long, device=self.device) # 0: pos, 1: rot
+            
             
             # 记录回升历史，每层每个组件只能回升一次
             self.bin_scale_increase_history = [{"pos": {}, "rot": {}} for _ in range(num_bins)]
@@ -389,6 +393,57 @@ class DexHandManipBiHEnv(VecTask):
             self.bin_other_scale_at_freeze = torch.full((num_bins, 2), 1.0, device=self.device)
 
             print(f"  - Aggressive sampling kernel: {self.adaptive_sampling_kernel.tolist()}, Lambda: {self.adaptive_sampling_lambda}")
+
+        # === [新增] 初始化 Per-bin independent scale factors and states for adaptive_real ===
+        if self.tighten_method == "adaptive_real" and self.adaptive_sampling_bins is not None:
+            num_bins = self.adaptive_sampling_bins
+            # 重新获取 initial_scale
+            if self.tighten_factor is not None and 0 < self.tighten_factor <= 1.0:
+                initial_scale = self.tighten_factor
+            else:
+                initial_scale = 1.0
+                
+            # Per-bin pos 和 rot scale
+            self.bin_pos_scale = torch.full((num_bins,), initial_scale, device=self.device)
+            self.bin_rot_scale = torch.full((num_bins,), initial_scale, device=self.device)
+            
+            # 每个 bin 的状态：
+            # 0: 前900轮线性下降阶段
+            # 1: 触底后，正在调整阶段（需要统计失败率）
+            # 2: 已经成功（永不改变）
+            # 3: 连续30个epoch没有失败但也没有成功（可以继续提升）
+            # 4: 降低难度后反而失败（永不改变）
+            self.bin_status = torch.zeros(num_bins, dtype=torch.long, device=self.device)
+            
+            # 每个 bin 在当前 scale 下停留的 epoch 数
+            self.bin_epochs_at_current_scale = torch.zeros((num_bins, 2), dtype=torch.long, device=self.device)  # [num_bins, 2] for pos and rot
+            
+            # 统计失败率（从 scale 降到 0.7 开始统计）
+            # obj_pos 失败数和 obj_rot 失败数
+            self.bin_pos_fail_count = torch.zeros(num_bins, dtype=torch.float, device=self.device)
+            self.bin_rot_fail_count = torch.zeros(num_bins, dtype=torch.float, device=self.device)
+            self.bin_total_pass_count = torch.zeros(num_bins, dtype=torch.float, device=self.device)
+            
+            # 记录过去30个epoch的成功率，用于判断是否成功或失败
+            self.bin_success_rate_history_30 = torch.zeros((num_bins, 30), dtype=torch.float, device=self.device)
+            self.bin_history_ptr_30 = 0  # 循环指针
+            
+            # 连续没有失败的 epoch 数
+            self.bin_no_fail_epochs = torch.zeros(num_bins, dtype=torch.long, device=self.device)
+            
+            # 记录降低难度前的 scale（用于回退）
+            self.bin_pos_scale_before_decrease = torch.full((num_bins,), initial_scale, device=self.device)
+            self.bin_rot_scale_before_decrease = torch.full((num_bins,), initial_scale, device=self.device)
+            
+            # 记录是否已经尝试过降低难度
+            self.bin_tried_decrease = torch.zeros((num_bins, 2), dtype=torch.bool, device=self.device)  # [num_bins, 2] for pos and rot
+            
+            # 用于判断失败率的标志（是否已经触底）
+            self.bin_reached_bottom = torch.zeros(num_bins, dtype=torch.bool, device=self.device)
+            
+            print(f"[ADAPTIVE REAL] Initialized with {num_bins} bins, initial scale: {initial_scale:.4f}")
+            print(f"  - Phase 1: Linear decay for 900 epochs (adjusted for num_envs={self.num_envs})")
+            print(f"  - Phase 2: Adaptive adjustment based on failure rates when scale reaches 0.70")
 
         # dexhand_r defaults
         # TODO hack here
@@ -1985,6 +2040,14 @@ class DexHandManipBiHEnv(VecTask):
                 # 全局系数（用于重力补偿、支撑力等）依然遵循线性衰减计划
                 scale_factor_val = self.adaptive_global_scale_factor
                 rot_scale_factor_val = self.rot_scale_factor
+            elif self.tighten_method == "adaptive_real":
+                # [核心逻辑] adaptive_real 模式下使用 per-bin 的 scale
+                scale_factor = self.bin_pos_scale[env_bin_indices]
+                current_rot_scale_factor = self.bin_rot_scale[env_bin_indices]
+                
+                # 全局系数（用于重力补偿、支撑力等）依然遵循线性衰减计划
+                scale_factor_val = self.adaptive_global_scale_factor
+                rot_scale_factor_val = self.rot_scale_factor
             elif self.tighten_method == "epoch_curriculum":
                 target_epoch = self.target_epoch
                 progress = estimated_epoch / target_epoch
@@ -2007,8 +2070,8 @@ class DexHandManipBiHEnv(VecTask):
             else:
                 raise NotImplementedError(f"Unknown tighten_method: {self.tighten_method}")
             
-            # 如果不是 adaptive_dual，将单值转为 tensor
-            if self.tighten_method != "adaptive_dual":
+            # 如果不是 adaptive_dual 或 adaptive_real，将单值转为 tensor
+            if self.tighten_method not in ["adaptive_dual", "adaptive_real"]:
                 scale_factor = torch.full((self.num_envs,), scale_factor_val, device=self.device)
                 current_rot_scale_factor = torch.full((self.num_envs,), rot_scale_factor_val, device=self.device)
                 self.rot_scale_factor = rot_scale_factor_val # 更新全局变量
@@ -2086,6 +2149,23 @@ class DexHandManipBiHEnv(VecTask):
             self.obj_pos_fail_count += int(failure_reasons["obj_pos_failed"].sum().item())
             self.obj_rot_fail_count += int(failure_reasons["obj_rot_failed"].sum().item())
             self.total_fail_count += int(failure_buf.sum().item())
+
+        # === [新增] adaptive_real: 统计每个 bin 的失败原因 ===
+        if self.tighten_method == "adaptive_real" and self.training and self.adaptive_sampling_bins is not None:
+            # 统计每个 bin 的失败率（只在 scale 降到 0.7 之后统计）
+            for i in range(self.num_envs):
+                if failure_buf[i]:
+                    bin_idx = env_bin_indices[i].item()
+                    # 只有在已经触底的 bin 才统计失败率
+                    if self.bin_reached_bottom[bin_idx]:
+                        if failure_reasons["obj_pos_failed"][i]:
+                            self.bin_pos_fail_count[bin_idx] += 1
+                        if failure_reasons["obj_rot_failed"][i]:
+                            self.bin_rot_fail_count[bin_idx] += 1
+                
+                # 统计所有经过这个 bin 的环境数（用于计算失败率）
+                if self.bin_reached_bottom[env_bin_indices[i]]:
+                    self.bin_total_pass_count[env_bin_indices[i]] += 1
 
         # === [新增] 打印失败原因诊断并保存到文件 ===
         if failure_buf.any():
@@ -2920,8 +3000,8 @@ class DexHandManipBiHEnv(VecTask):
                 self.adaptive_epoch_steps_history.append(avg_steps_last_epoch)
                 
                 # 获取当前的通过率判定系数用于打印
-                pos_scale_val = self.bin_pos_scale.mean().item() if self.tighten_method == "adaptive_dual" else self.adaptive_global_scale_factor
-                rot_scale_val = self.bin_rot_scale.mean().item() if self.tighten_method == "adaptive_dual" else self.rot_scale_factor
+                pos_scale_val = self.bin_pos_scale.mean().item() if self.tighten_method in ["adaptive_dual", "adaptive_real"] else self.adaptive_global_scale_factor
+                rot_scale_val = self.bin_rot_scale.mean().item() if self.tighten_method in ["adaptive_dual", "adaptive_real"] else self.rot_scale_factor
 
                 print(f"[EPOCH STATS] Epoch {self.adaptive_current_epoch}: "
                       f"Success Rate: {success_rate_last_epoch:.4f}, "
@@ -3010,14 +3090,32 @@ class DexHandManipBiHEnv(VecTask):
                 scale_changed = False
                 
                 # === [新增] 处理 epoch_curriculum 模式的系数更新 ===
-                if self.tighten_method in ["epoch_curriculum", "adaptive_dual"]:
-                    # [修改] 如果是 adaptive_dual，线性降到 0.7；否则使用配置的 target_epoch
-                    # 使用 1800 * (1024 / num_envs) 作为 target_epoch (例如 256 envs 时为 7200)
-                    cur_target_epoch = 1800 * (1024 / self.num_envs) if self.tighten_method == "adaptive_dual" else self.target_epoch
-                    progress = current_epoch / cur_target_epoch
-                    progress = max(0.0, min(1.0, progress))
-                    # 按照 compute_reward_side 中的公式同步更新全局系数
-                    new_scale = 1.0 - (1.0 - 0.7) * progress
+                if self.tighten_method in ["epoch_curriculum", "adaptive_dual", "adaptive_real"]:
+                    # [修改] 如果是 adaptive_dual 或 adaptive_real，线性降到 0.7；否则使用配置的 target_epoch
+                    # 使用 900 * (1024 / num_envs) 作为 target_epoch for adaptive_real (例如 128 envs 时为 7200)
+                    # 使用 1800 * (1024 / num_envs) 作为 target_epoch for adaptive_dual
+                    if self.tighten_method == "adaptive_real":
+                        cur_target_epoch = 900 * (1024 / self.num_envs)
+                        # [adaptive_real] 触底后，global 不再变化
+                        all_bins_reached_bottom = hasattr(self, 'bin_reached_bottom') and torch.all(self.bin_reached_bottom)
+                        if not all_bins_reached_bottom:
+                            progress = current_epoch / cur_target_epoch
+                            progress = max(0.0, min(1.0, progress))
+                            new_scale = 1.0 - (1.0 - 0.7) * progress
+                        else:
+                            # 触底后不再改变 global scale
+                            new_scale = self.adaptive_global_scale_factor
+                    elif self.tighten_method == "adaptive_dual":
+                        cur_target_epoch = 1800 * (1024 / self.num_envs)
+                        progress = current_epoch / cur_target_epoch
+                        progress = max(0.0, min(1.0, progress))
+                        new_scale = 1.0 - (1.0 - 0.7) * progress
+                    else:
+                        cur_target_epoch = self.target_epoch
+                        progress = current_epoch / cur_target_epoch
+                        progress = max(0.0, min(1.0, progress))
+                        new_scale = 1.0 - (1.0 - 0.7) * progress
+                    
                     if abs(new_scale - self.adaptive_global_scale_factor) > 1e-5:
                         # [同步修改] 计算增量并应用到旋转系数
                         delta = new_scale - self.adaptive_global_scale_factor
@@ -3025,10 +3123,30 @@ class DexHandManipBiHEnv(VecTask):
                         self.rot_scale_factor = max(0.7, min(1.0, self.rot_scale_factor + delta))
                         
                         scale_changed = True
+                        
+                        # [adaptive_real] 同时更新所有 bin 的 pos/rot scale（在前900轮）
+                        if self.tighten_method == "adaptive_real" and self.adaptive_sampling_bins is not None:
+                            # 每 30 个 epoch (考虑 num_envs) 下降一次
+                            epochs_per_update = int(30 * (1024 / self.num_envs))
+                            
+                            # 判断是否应该在这个 epoch 更新 scale
+                            if current_epoch <= cur_target_epoch and (current_epoch % epochs_per_update == 0 or current_epoch == 1):
+                                # 按照线性下降规则，每次下降 0.01
+                                self.bin_pos_scale = torch.clamp(self.bin_pos_scale - 0.01, min=0.70)
+                                self.bin_rot_scale = torch.clamp(self.bin_rot_scale - 0.01, min=0.70)
+                                print(f"[ADAPTIVE REAL] Epoch {current_epoch}: All bin pos/rot scales decreased by 0.01. New avg pos scale: {self.bin_pos_scale.mean():.4f}, rot scale: {self.bin_rot_scale.mean():.4f}")
+                            
+                            # 检查是否所有 bin 都已经触底
+                            if torch.all(self.bin_pos_scale <= 0.7001) and torch.all(self.bin_rot_scale <= 0.7001) and not torch.all(self.bin_reached_bottom):
+                                self.bin_reached_bottom[:] = True
+                                print(f"[ADAPTIVE REAL] Epoch {current_epoch}: All bins reached bottom (0.70). Starting failure rate tracking.")
+                        
                         if self.tighten_method == "epoch_curriculum":
                             print(f"[CURRICULUM] Epoch {current_epoch}: Scale updated to {new_scale:.4f}, Rot Scale to {self.rot_scale_factor:.4f}, Obj-Pos Scale: {new_scale:.4f}, Obj-Rot Scale: {self.rot_scale_factor:.4f}")
-                        else:
+                        elif self.tighten_method == "adaptive_dual":
                             print(f"[ADAPTIVE DUAL] Epoch {current_epoch}: Global Scale decayed to {new_scale:.4f}")
+                        elif self.tighten_method == "adaptive_real" and not all_bins_reached_bottom:
+                            print(f"[ADAPTIVE REAL] Epoch {current_epoch}: Global Scale decayed to {new_scale:.4f}")
 
                 # === [修改逻辑] 难度调整规则 ===
                 # Mode 3 & 4 Combined Logic
@@ -3039,8 +3157,8 @@ class DexHandManipBiHEnv(VecTask):
                     # [新增] Warmup 逻辑：前 35 个 epoch 不调整难度，且在之后重新从 0 开始统计
                     if self.adaptive_difficulty_is_warming_up:
                         if self.epochs_at_current_scale <= 35:
-                            pos_scale_val = self.bin_pos_scale.mean().item() if self.tighten_method == "adaptive_dual" else self.adaptive_global_scale_factor
-                            rot_scale_val = self.bin_rot_scale.mean().item() if self.tighten_method == "adaptive_dual" else self.rot_scale_factor
+                            pos_scale_val = self.bin_pos_scale.mean().item() if self.tighten_method in ["adaptive_dual", "adaptive_real"] else self.adaptive_global_scale_factor
+                            rot_scale_val = self.bin_rot_scale.mean().item() if self.tighten_method in ["adaptive_dual", "adaptive_real"] else self.rot_scale_factor
                             print(f"[ADAPTIVE] Epoch {self.adaptive_current_epoch}: Warmup phase ({self.epochs_at_current_scale}/35). Global Scale: {self.adaptive_global_scale_factor:.4f}, Obj-Pos Scale: {pos_scale_val:.4f}, Obj-Rot Scale: {rot_scale_val:.4f}. Stats recorded for logging but no adjustment.")
                         else:
                             # 35 epoch warmup 结束，进入正式评估期
@@ -3051,8 +3169,8 @@ class DexHandManipBiHEnv(VecTask):
                             self.stuck_epoch_counter = 0
                             self.adaptive_epoch_success_rate_history.clear()
                             self.adaptive_epoch_steps_history.clear()
-                            pos_scale_val = self.bin_pos_scale.mean().item() if self.tighten_method == "adaptive_dual" else self.adaptive_global_scale_factor
-                            rot_scale_val = self.bin_rot_scale.mean().item() if self.tighten_method == "adaptive_dual" else self.rot_scale_factor
+                            pos_scale_val = self.bin_pos_scale.mean().item() if self.tighten_method in ["adaptive_dual", "adaptive_real"] else self.adaptive_global_scale_factor
+                            rot_scale_val = self.bin_rot_scale.mean().item() if self.tighten_method in ["adaptive_dual", "adaptive_real"] else self.rot_scale_factor
                             print(f"[ADAPTIVE] Epoch {self.adaptive_current_epoch}: Warmup finished. Starting evaluation from zero. Global Scale: {self.adaptive_global_scale_factor:.4f}, Obj-Pos Scale: {pos_scale_val:.4f}, Obj-Rot Scale: {rot_scale_val:.4f}")
 
                     if not self.adaptive_difficulty_is_warming_up:
@@ -3462,6 +3580,116 @@ class DexHandManipBiHEnv(VecTask):
                         # [修改] global_scale 改变时不再清空 EMA，仅在 local bin scale 变化时清空
                         self.low_success_history.clear()
 
+                # === [新增] adaptive_real 模式的自适应调整逻辑 ===
+                if self.tighten_method == "adaptive_real" and self.random_state_init and self.adaptive_sampling_bins is not None:
+                    # 更新成功率历史（用于计算 avg-30）
+                    self.bin_success_rate_history_30[:, self.bin_history_ptr_30] = current_epoch_bin_rates
+                    self.bin_history_ptr_30 = (self.bin_history_ptr_30 + 1) % 30
+                    
+                    num_bins = self.adaptive_sampling_bins
+                    
+                    for i in range(num_bins):
+                        # 只处理已经触底的 bin
+                        if not self.bin_reached_bottom[i]:
+                            continue
+                        
+                        status = self.bin_status[i].item()
+                        
+                        # 状态 2: 已经成功，永不改变
+                        # 状态 4: 降低难度后反而失败，永不改变
+                        if status in [2, 4]:
+                            continue
+                        
+                        # 更新在当前 scale 下停留的 epoch 数
+                        min_epochs = min(self.bin_epochs_at_current_scale[i, 0].item(), self.bin_epochs_at_current_scale[i, 1].item())
+                        self.bin_epochs_at_current_scale[i, 0] += 1  # pos
+                        self.bin_epochs_at_current_scale[i, 1] += 1  # rot
+                        
+                        # 只有在至少跑了 30 个 epoch 后才开始判断
+                        if min_epochs < 30:
+                            continue
+                        
+                        # 计算 avg-30 成功率
+                        bin_avg_30 = self.bin_success_rate_history_30[i].mean().item()
+                        bin_latest = current_epoch_bin_rates[i].item()
+                        
+                        # 计算 obj-pos 和 obj-rot 的失败率
+                        if self.bin_total_pass_count[i] > 0:
+                            pos_fail_rate = self.bin_pos_fail_count[i] / self.bin_total_pass_count[i]
+                            rot_fail_rate = self.bin_rot_fail_count[i] / self.bin_total_pass_count[i]
+                        else:
+                            pos_fail_rate = 0.0
+                            rot_fail_rate = 0.0
+                        
+                        # 判断是否成功（avg-30 和最新 epoch 成功率都超过 50%）
+                        if bin_avg_30 >= 0.50 and bin_latest >= 0.50:
+                            self.bin_status[i] = 2  # 成功状态
+                            print(f"[ADAPTIVE REAL] Bin {i} succeeded! avg-30: {bin_avg_30:.2%}, latest: {bin_latest:.2%}. Freezing pos/rot scales at pos={self.bin_pos_scale[i]:.4f}, rot={self.bin_rot_scale[i]:.4f}")
+                            continue
+                        
+                        # 判断是否失败（avg-30 和最新 epoch 成功率都低于 30%）
+                        if bin_avg_30 < 0.30 and bin_latest < 0.30:
+                            # 分支 A：回滚锁定 (Rollback & Lock)
+                            # 只有当这个 Bin 之前已经因为“停滞缓解”而降低过难度，现在却依然失败时，才回滚
+                            if self.bin_tried_decrease[i, 0] or self.bin_tried_decrease[i, 1]:
+                                self.bin_pos_scale[i] = self.bin_pos_scale_before_decrease[i]
+                                self.bin_rot_scale[i] = self.bin_rot_scale_before_decrease[i]
+                                self.bin_status[i] = 4  # 永不改变状态
+                                print(f"[ADAPTIVE REAL] Bin {i} failed after stagnation relief! Rolling back and freezing. pos={self.bin_pos_scale[i]:.4f}, rot={self.bin_rot_scale[i]:.4f}")
+                                continue
+                            
+                            # 分支 B：正常救赎降低难度 (Decrease Difficulty)
+                            # 此时不设置 bin_tried_decrease，允许继续救赎
+                            if pos_fail_rate > rot_fail_rate:
+                                old_scale = self.bin_pos_scale[i].item()
+                                self.bin_pos_scale_before_decrease[i] = old_scale # 记录回滚点
+                                self.bin_pos_scale[i] = min(1.0, old_scale + 0.01)
+                                print(f"[ADAPTIVE REAL] Bin {i} Failure Recovery: Increasing pos scale: {old_scale:.4f} -> {self.bin_pos_scale[i]:.4f}")
+                                self.bin_epochs_at_current_scale[i, 0] = 0
+                            else:
+                                old_scale = self.bin_rot_scale[i].item()
+                                self.bin_rot_scale_before_decrease[i] = old_scale # 记录回滚点
+                                self.bin_rot_scale[i] = min(1.0, old_scale + 0.01)
+                                print(f"[ADAPTIVE REAL] Bin {i} Failure Recovery: Increasing rot scale: {old_scale:.4f} -> {self.bin_rot_scale[i]:.4f}")
+                                self.bin_epochs_at_current_scale[i, 1] = 0
+                            
+                            # 重置统计，准备下一轮
+                            self.bin_pos_fail_count[i] = 0
+                            self.bin_rot_fail_count[i] = 0
+                            self.bin_total_pass_count[i] = 0
+                            self.bin_no_fail_epochs[i] = 0
+                            continue
+                        
+                        # 判断停滞缓解 (Stagnation Relief)
+                        # 条件: 连续 30 个 Epoch 成功率在 [30%, 50%)，且未达到成功标准
+                        if 0.30 <= bin_avg_30 < 0.50 and 0.30 <= bin_latest < 0.50:
+                            self.bin_no_fail_epochs[i] += 1
+                            
+                            if self.bin_no_fail_epochs[i] >= 30:
+                                # 模型卡住了，虽然不死，但也学不会 (成功率在 30%-50% 震荡)
+                                if pos_fail_rate > rot_fail_rate and pos_fail_rate > 0:
+                                    old_scale = self.bin_pos_scale[i].item()
+                                    self.bin_pos_scale_before_decrease[i] = old_scale
+                                    self.bin_pos_scale[i] = min(1.0, old_scale + 0.01)
+                                    self.bin_tried_decrease[i, 0] = True # 只有在这里（停滞缓解）才设为 True
+                                    print(f"[ADAPTIVE REAL] Bin {i} STAGNANT Relief: Success rate stuck at {bin_avg_30:.2%}. Increasing pos scale to {self.bin_pos_scale[i]:.4f}. Set tried_decrease=True.")
+                                    self.bin_epochs_at_current_scale[i, 0] = 0
+                                elif rot_fail_rate > 0:
+                                    old_scale = self.bin_rot_scale[i].item()
+                                    self.bin_rot_scale_before_decrease[i] = old_scale
+                                    self.bin_rot_scale[i] = min(1.0, old_scale + 0.01)
+                                    self.bin_tried_decrease[i, 1] = True # 只有在这里（停滞缓解）才设为 True
+                                    print(f"[ADAPTIVE REAL] Bin {i} STAGNANT Relief: Success rate stuck at {bin_avg_30:.2%}. Increasing rot scale to {self.bin_rot_scale[i]:.4f}. Set tried_decrease=True.")
+                                    self.bin_epochs_at_current_scale[i, 1] = 0
+                                
+                                # 重置统计
+                                self.bin_pos_fail_count[i] = 0
+                                self.bin_rot_fail_count[i] = 0
+                                self.bin_total_pass_count[i] = 0
+                                self.bin_no_fail_epochs[i] = 0
+                        else:
+                            # 出现了严重的失败 ( < 30%) 或者已经接近成功 ( >= 50%)，重置停滞计数
+                            self.bin_no_fail_epochs[i] = 0
 
                 # === [原有逻辑移除] ===
                 # ... (原来的 Check 1, 2, 3 逻辑已被上面的新逻辑替换)
@@ -3659,6 +3887,25 @@ class DexHandManipBiHEnv(VecTask):
                         info[f"adaptive_difficulty/bin_{i}_pos_stable_best"] = float(self.bin_pos_stable_best[i].item())
                     if hasattr(self, 'bin_rot_stable_best'):
                         info[f"adaptive_difficulty/bin_{i}_rot_stable_best"] = float(self.bin_rot_stable_best[i].item())
+            
+            # [新增] Adaptive Real 专有数据 (Scale 和 Status)
+            if self.tighten_method == "adaptive_real":
+                for i in range(self.adaptive_sampling_bins):
+                    if hasattr(self, 'bin_pos_scale'):
+                        info[f"adaptive_difficulty/bin_{i}_pos_scale"] = float(self.bin_pos_scale[i].item())
+                    if hasattr(self, 'bin_rot_scale'):
+                        info[f"adaptive_difficulty/bin_{i}_rot_scale"] = float(self.bin_rot_scale[i].item())
+                    if hasattr(self, 'bin_status'):
+                        info[f"adaptive_difficulty/bin_{i}_status"] = float(self.bin_status[i].item())
+                    if hasattr(self, 'bin_pos_fail_count') and hasattr(self, 'bin_total_pass_count'):
+                        if self.bin_total_pass_count[i] > 0:
+                            info[f"adaptive_difficulty/bin_{i}_pos_fail_rate"] = float(self.bin_pos_fail_count[i] / self.bin_total_pass_count[i])
+                            info[f"adaptive_difficulty/bin_{i}_rot_fail_rate"] = float(self.bin_rot_fail_count[i] / self.bin_total_pass_count[i])
+                        else:
+                            info[f"adaptive_difficulty/bin_{i}_pos_fail_rate"] = 0.0
+                            info[f"adaptive_difficulty/bin_{i}_rot_fail_rate"] = 0.0
+                    if hasattr(self, 'bin_no_fail_epochs'):
+                        info[f"adaptive_difficulty/bin_{i}_no_fail_epochs"] = float(self.bin_no_fail_epochs[i].item())
 
             # 3. 总体成功率
             if hasattr(self, 'current_epoch_success_rate'):
