@@ -129,7 +129,7 @@ class DexHandManipBiHEnv(VecTask):
         self.support_force_decay_start_factor = support_force_cfg.get("decay_start_factor", 0.8)
 
         # === [新增] 自适应采样相关配置 ===
-        # 时间片段(bin)数量，用于将轨迹分成多个片段进行采样
+        # 时间片段(bin)数量，将根据动作长度动态确定
         self.adaptive_sampling_bins = self.cfg["env"].get("adaptiveSamplingBins", 12)
         
         if self.random_state_init:
@@ -143,14 +143,9 @@ class DexHandManipBiHEnv(VecTask):
             self.adaptive_sampling_alpha = self.cfg["env"].get("adaptiveSamplingAlpha", 0.2)
             # 所有bin成功率超过此阈值才允许提升难度
             self.adaptive_sampling_all_bins_threshold = self.cfg["env"].get("adaptiveSamplingAllBinsThreshold", 0.40)
-
-            print(f"[ADAPTIVE SAMPLING] Enabled with {self.adaptive_sampling_bins} bins")
-            print(f"  - Kernel size: {self.adaptive_sampling_kernel_size}, Lambda: {self.adaptive_sampling_lambda}")
-            print(f"  - Uniform ratio: {self.adaptive_sampling_uniform_ratio}")
-            print(f"  - All bins success threshold: {self.adaptive_sampling_all_bins_threshold}")
         else:
             # 非自适应采样模式下，依然保持 bin 数量以便记录成功率统计
-            print(f"[BIN STATS] Enabled with {self.adaptive_sampling_bins} bins for logging")
+            pass
 
         self.tighten_method = self.cfg["env"]["tightenMethod"]
         self.tighten_factor = self.cfg["env"]["tightenFactor"]
@@ -180,7 +175,7 @@ class DexHandManipBiHEnv(VecTask):
         self.current_epoch_avg_steps = 0.0  # 当前epoch的平均step
         self.current_epoch_bin_rates = None # 当前epoch各bin的成功率
         
-        if self.tighten_method in ["adaptive", "adaptive_dual", "adaptive_real", "epoch_curriculum"]:
+        if self.tighten_method in ["adaptive_dual", "adaptive_real"]:
             # 配置参数（所有窗口大小都是基于epoch，而非episode）
             self.adaptive_success_window = self.cfg["env"].get("adaptiveSuccessWindow", 5)  # 连续N个epoch检查成功率
             self.adaptive_success_threshold = self.cfg["env"].get("adaptiveSuccessThreshold", 0.10)  # 成功率阈值（20%）
@@ -285,7 +280,7 @@ class DexHandManipBiHEnv(VecTask):
         self.sim_device = torch.device(sim_device)
         
         # === [新增] 初始化失败日志保存路径 ===
-        self._init_failure_log_path()
+        # self._init_failure_log_path() # 将在 super().__init__ 之后，数据加载完成后调用
         self.failure_log_count = 0
         self.last_failure_log_epoch = -1
 
@@ -298,6 +293,25 @@ class DexHandManipBiHEnv(VecTask):
             record=record,
             headless=headless,
         )
+
+        # === [修改] 根据动作长度动态确定 bin 的个数 ===
+        # 已经在 super().__init__ -> create_sim -> _create_envs 中加载了数据
+        if hasattr(self, 'demo_data_rh') and "seq_len" in self.demo_data_rh:
+            max_seq_len = self.demo_data_rh["seq_len"].float().max().item()
+            # 根据总帧数 / 60来确定，然后四舍五入
+            self.adaptive_sampling_bins = max(1, int(round(max_seq_len / 60.0)))
+            print(f"[ADAPTIVE SAMPLING] Dynamically set num_bins to {self.adaptive_sampling_bins} based on max motion length {max_seq_len:.1f}")
+        
+        if self.random_state_init:
+            print(f"[ADAPTIVE SAMPLING] Enabled with {self.adaptive_sampling_bins} bins")
+            print(f"  - Kernel size: {self.adaptive_sampling_kernel_size}, Lambda: {self.adaptive_sampling_lambda}")
+            print(f"  - Uniform ratio: {self.adaptive_sampling_uniform_ratio}")
+            print(f"  - All bins success threshold: {self.adaptive_sampling_all_bins_threshold}")
+        else:
+            print(f"[BIN STATS] Enabled with {self.adaptive_sampling_bins} bins for logging")
+
+        # 现在可以安全地初始化失败日志路径了
+        self._init_failure_log_path()
 
         self.env_start_bin_index = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         # [新增] 初始化从最开始开始 reset 的比例 (默认为 10%)
@@ -2028,9 +2042,6 @@ class DexHandManipBiHEnv(VecTask):
             elif self.tighten_method == "const":
                 scale_factor_val = self.tighten_factor
                 rot_scale_factor_val = self.rot_scale_factor
-            elif self.tighten_method == "adaptive":
-                scale_factor_val = self.adaptive_global_scale_factor
-                rot_scale_factor_val = self.rot_scale_factor
             elif self.tighten_method == "adaptive_dual":
                 # [核心逻辑] adaptive_dual 模式下使用 per-bin 的 scale，不受全局线性衰减的强制约束
                 # 这样可以确保每个 bin 的终止判定精度（Termination）是独立自适应的
@@ -2048,12 +2059,6 @@ class DexHandManipBiHEnv(VecTask):
                 # 全局系数（用于重力补偿、支撑力等）依然遵循线性衰减计划
                 scale_factor_val = self.adaptive_global_scale_factor
                 rot_scale_factor_val = self.rot_scale_factor
-            elif self.tighten_method == "epoch_curriculum":
-                target_epoch = self.target_epoch
-                progress = estimated_epoch / target_epoch
-                progress = max(0.0, min(1.0, progress))
-                scale_factor_val = 1.0 - (1.0 - 0.7) * progress
-                rot_scale_factor_val = scale_factor_val
             elif self.tighten_method == "linear_decay":
                 scale_factor_val = 1 - (1 - self.tighten_factor) / self.tighten_steps * min(last_step, self.tighten_steps)
                 rot_scale_factor_val = scale_factor_val
@@ -3089,9 +3094,9 @@ class DexHandManipBiHEnv(VecTask):
                 # 评估并调整难度
                 scale_changed = False
                 
-                # === [新增] 处理 epoch_curriculum 模式的系数更新 ===
-                if self.tighten_method in ["epoch_curriculum", "adaptive_dual", "adaptive_real"]:
-                    # [修改] 如果是 adaptive_dual 或 adaptive_real，线性降到 0.7；否则使用配置的 target_epoch
+                # === [新增] 处理系数更新 ===
+                if self.tighten_method in ["adaptive_dual", "adaptive_real"]:
+                    # [修改] 如果是 adaptive_dual 或 adaptive_real，线性降到 0.7
                     # 使用 900 * (1024 / num_envs) 作为 target_epoch for adaptive_real (例如 128 envs 时为 7200)
                     # 使用 1800 * (1024 / num_envs) 作为 target_epoch for adaptive_dual
                     if self.tighten_method == "adaptive_real":
@@ -3099,19 +3104,15 @@ class DexHandManipBiHEnv(VecTask):
                         # [adaptive_real] 触底后，global 不再变化
                         all_bins_reached_bottom = hasattr(self, 'bin_reached_bottom') and torch.all(self.bin_reached_bottom)
                         if not all_bins_reached_bottom:
-                            progress = current_epoch / cur_target_epoch
-                            progress = max(0.0, min(1.0, progress))
-                            new_scale = 1.0 - (1.0 - 0.7) * progress
+                            # [修改] 改为阶梯下降逻辑，与 bin scale 同步
+                            epochs_per_update = int(30 * (1024 / self.num_envs))
+                            num_updates = current_epoch // epochs_per_update
+                            new_scale = max(0.7, 1.0 - 0.01 * num_updates)
                         else:
                             # 触底后不再改变 global scale
                             new_scale = self.adaptive_global_scale_factor
-                    elif self.tighten_method == "adaptive_dual":
+                    else: # adaptive_dual
                         cur_target_epoch = 1800 * (1024 / self.num_envs)
-                        progress = current_epoch / cur_target_epoch
-                        progress = max(0.0, min(1.0, progress))
-                        new_scale = 1.0 - (1.0 - 0.7) * progress
-                    else:
-                        cur_target_epoch = self.target_epoch
                         progress = current_epoch / cur_target_epoch
                         progress = max(0.0, min(1.0, progress))
                         new_scale = 1.0 - (1.0 - 0.7) * progress
@@ -3126,31 +3127,26 @@ class DexHandManipBiHEnv(VecTask):
                         
                         # [adaptive_real] 同时更新所有 bin 的 pos/rot scale（在前900轮）
                         if self.tighten_method == "adaptive_real" and self.adaptive_sampling_bins is not None:
-                            # 每 30 个 epoch (考虑 num_envs) 下降一次
-                            epochs_per_update = int(30 * (1024 / self.num_envs))
-                            
-                            # 判断是否应该在这个 epoch 更新 scale
-                            if current_epoch <= cur_target_epoch and (current_epoch % epochs_per_update == 0 or current_epoch == 1):
-                                # 按照线性下降规则，每次下降 0.01
-                                self.bin_pos_scale = torch.clamp(self.bin_pos_scale - 0.01, min=0.70)
-                                self.bin_rot_scale = torch.clamp(self.bin_rot_scale - 0.01, min=0.70)
-                                print(f"[ADAPTIVE REAL] Epoch {current_epoch}: All bin pos/rot scales decreased by 0.01. New avg pos scale: {self.bin_pos_scale.mean():.4f}, rot scale: {self.bin_rot_scale.mean():.4f}")
+                            # 既然已经进入阶梯更新（new_scale 发生了变化），直接同步到 bin scale
+                            if current_epoch <= cur_target_epoch:
+                                # 按照阶梯下降规则，同步到 new_scale
+                                self.bin_pos_scale.fill_(new_scale)
+                                self.bin_rot_scale.fill_(new_scale)
+                                print(f"[ADAPTIVE REAL] Epoch {current_epoch}: All bin pos/rot scales updated to {new_scale:.4f} (Step-wise)")
                             
                             # 检查是否所有 bin 都已经触底
                             if torch.all(self.bin_pos_scale <= 0.7001) and torch.all(self.bin_rot_scale <= 0.7001) and not torch.all(self.bin_reached_bottom):
                                 self.bin_reached_bottom[:] = True
                                 print(f"[ADAPTIVE REAL] Epoch {current_epoch}: All bins reached bottom (0.70). Starting failure rate tracking.")
                         
-                        if self.tighten_method == "epoch_curriculum":
-                            print(f"[CURRICULUM] Epoch {current_epoch}: Scale updated to {new_scale:.4f}, Rot Scale to {self.rot_scale_factor:.4f}, Obj-Pos Scale: {new_scale:.4f}, Obj-Rot Scale: {self.rot_scale_factor:.4f}")
-                        elif self.tighten_method == "adaptive_dual":
+                        if self.tighten_method == "adaptive_dual":
                             print(f"[ADAPTIVE DUAL] Epoch {current_epoch}: Global Scale decayed to {new_scale:.4f}")
                         elif self.tighten_method == "adaptive_real" and not all_bins_reached_bottom:
                             print(f"[ADAPTIVE REAL] Epoch {current_epoch}: Global Scale decayed to {new_scale:.4f}")
 
                 # === [修改逻辑] 难度调整规则 ===
-                # Mode 3 & 4 Combined Logic
-                if self.tighten_method in ["adaptive", "adaptive_dual"] and self.random_state_init and self.adaptive_sampling_bins is not None:
+                # Mode 4 Combined Logic
+                if self.tighten_method == "adaptive_dual" and self.random_state_init and self.adaptive_sampling_bins is not None:
                     ema_bin_rates = self.bin_ema_success_rates
                     self.epochs_at_current_scale += 1
                     
@@ -3842,11 +3838,6 @@ class DexHandManipBiHEnv(VecTask):
         if hasattr(self, 'current_scale_factor'):
             info["adaptive_difficulty/scale_factor"] = float(self.current_scale_factor)
         
-        # 如果是自适应模式，添加更多统计信息
-        if self.tighten_method == "adaptive" and hasattr(self, 'current_epoch_success_rate'):
-            info["adaptive_difficulty/current_epoch_success_rate"] = float(self.current_epoch_success_rate)
-            info["adaptive_difficulty/current_epoch_avg_steps"] = float(self.current_epoch_avg_steps)
-
         # 添加支撑力 Kp 和 Kd 到 TensorBoard
         if hasattr(self, 'support_force_kp'):
             info["adaptive_difficulty/support_force_kp"] = float(self.support_force_kp)
@@ -4421,36 +4412,31 @@ class DexHandManipBiHEnv(VecTask):
         self.current_adaptive_scale_factor = scale_factor
 
         # === [核心修改] 支撑力衰减逻辑 ===
-        # scale_factor 从 1.0 (最易) 到 end_factor 逐渐撤销 support force
-        # 从 1.0 到 decay_start_factor 保持最大，从 decay_start_factor 到 end_factor 线性衰减
-        s_start_decay = self.support_force_decay_start_factor
-        s_end = self.support_force_end_factor # 衰减到的终止难度值
-
-        if scale_factor >= s_start_decay:
-            # 难度较低阶段，支撑力保持最大
-            self.support_force_kp = self.support_force_kp_start
-            self.support_force_kd = self.support_force_kd_start
-            self.support_force_kp_rot = self.support_force_kp_rot_start
-            self.support_force_kd_rot = self.support_force_kd_rot_start
-        elif scale_factor >= s_end:
-            # 难度进阶阶段，从 s_start_decay 到 s_end 支撑力线性衰减至 0
-            decay_range = s_start_decay - s_end
-            if decay_range > 0:
-                normalized_decay = (s_start_decay - scale_factor) / decay_range
-            else:
-                normalized_decay = 1.0
+        # 根据 epoch 进行衰减
+        # 0 - 30 * 1024 / num_envs * 40 epoch 是不变的
+        # 从 30 * 1024 / num_envs * 40 epoch - 30 * 1024 / num_envs * 60 epoch 线性衰减到 0
+        
+        last_step = self.gym.get_frame_count(self.sim)
+        horizon_length = getattr(self, 'horizon_length', 32)
+        frames_per_epoch = horizon_length * self.num_envs
+        current_epoch = int(last_step // frames_per_epoch) if frames_per_epoch > 0 else 0
+        if hasattr(self, 'total_train_env_frames') and self.total_train_env_frames is not None:
+            current_epoch = int(self.total_train_env_frames // frames_per_epoch) if frames_per_epoch > 0 else 0
             
-            decay_factor = 1.0 - normalized_decay
-            self.support_force_kp = self.support_force_kp_start * decay_factor
-            self.support_force_kd = self.support_force_kd_start * decay_factor
-            self.support_force_kp_rot = self.support_force_kp_rot_start * decay_factor
-            self.support_force_kd_rot = self.support_force_kd_rot_start * decay_factor
+        start_decay_epoch = 30 * (1024 / self.num_envs) * 40
+        end_decay_epoch = 30 * (1024 / self.num_envs) * 60
+        
+        if current_epoch < start_decay_epoch:
+            decay_factor = 1.0
+        elif current_epoch < end_decay_epoch:
+            decay_factor = 1.0 - (current_epoch - start_decay_epoch) / (end_decay_epoch - start_decay_epoch)
         else:
-            # 难度超过 s_end 后，支撑力完全关闭
-            self.support_force_kp = 0.0
-            self.support_force_kd = 0.0
-            self.support_force_kp_rot = 0.0
-            self.support_force_kd_rot = 0.0
+            decay_factor = 0.0
+
+        self.support_force_kp = self.support_force_kp_start * decay_factor
+        self.support_force_kd = self.support_force_kd_start * decay_factor
+        self.support_force_kp_rot = self.support_force_kp_rot_start * decay_factor
+        self.support_force_kd_rot = self.support_force_kd_rot_start * decay_factor
 
     def set_force_vis(self, env_ptr, part_k, has_force, side):
         self.gym.set_rigid_body_color(
@@ -4550,8 +4536,6 @@ def compute_imitation_reward(
     obj_ang_vel_limit: float = 200.0,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Dict[str, Tensor], Tensor, Dict[str, Tensor], Dict[str, Tensor]]:
 
-    # type: (Tensor, Tensor, Tensor, Tensor, Dict[str, Tensor], Dict[str, Tensor], Tensor, Tensor, Dict[str, List[int]], Tensor, float, bool, float, float, float, float, float, Tensor, bool, float, float, float, float, float, float, float, float, float, float, float, float, float, float, float) -> Tuple[Tensor, Tensor, Tensor, Tensor, Dict[str, Tensor], Tensor, Dict[str, Tensor], Dict[str, Tensor]]
-
     # end effector pose reward
     current_eef_pos = states["base_state"][:, :3]
     current_eef_quat = states["base_state"][:, 3:7]
@@ -4614,7 +4598,7 @@ def compute_imitation_reward(
         print("\n[!!!] 奖励计算输入包含 NaN !")
         print(f"States Pos NaN: {torch.isnan(states['manip_obj_pos']).any()}")
         print(f"Target Pos NaN: {torch.isnan(target_states['manip_obj_pos']).any()}")
-        import pdb; pdb.set_trace()
+        # import pdb; pdb.set_trace()
 
     # object pose reward
     current_obj_pos = ensure_multi_object(states["manip_obj_pos"], num_envs, 3)
@@ -4928,7 +4912,7 @@ def compute_imitation_reward(
         print("\n[!!!] quat_to_rotmat 产生 NaN ! 可能是四元数全零或未归一化")
         nan_mask = torch.isnan(curr_obj_rot).any(dim=-1).any(dim=-1)
         print(f"非法四元数样例 (第一个故障环境): {curr_obj_quat[nan_mask][0]}")
-        import pdb; pdb.set_trace()
+        # import pdb; pdb.set_trace()
 
     p_obj_sim = torch.bmm(curr_obj_rot, p_obj_local.transpose(-1, -2)).transpose(-1, -2) + curr_obj_pos.unsqueeze(1)
     
@@ -4963,6 +4947,11 @@ def compute_imitation_reward(
     # 使用外部传入的、基于全长计算的每帧固定奖励
     reward_progress = progress_reward_unit
 
+    # [新增] 通过 bin 的奖励：如果跨越了 bin 边界，给 50 奖励
+    bin_now = (progress_buf.float() * progress_reward_unit / 100.0).long()
+    bin_prev = ((progress_buf.float() - 1.0).clamp(min=0.0) * progress_reward_unit / 100.0).long()
+    reward_bin_pass = torch.where(bin_now > bin_prev, torch.ones_like(reward_progress) * 50.0, torch.zeros_like(reward_progress))
+
     succeeded = (
         progress_buf + 1 + 3 >= max_length
     ) & ~failed_execute  # reached the end of the trajectory, +3 for max future 3 steps
@@ -4992,7 +4981,7 @@ def compute_imitation_reward(
         + 0.5 * reward_wrist_power
         + 0.0 * reward_contact_violation
         + reward_interact_scale * reward_interact # 新增
-        + 1.0 * (reward_progress + reward_success_bonus) # 新增进度和成功奖励
+        + 1.0 * (reward_progress + reward_success_bonus + reward_bin_pass) # 新增进度、成功和跨 bin 奖励
     )
 
     # [恢复] 失败立刻重置，或到达轨迹终点/成功时重置
@@ -5018,6 +5007,7 @@ def compute_imitation_reward(
         "reward_interact": reward_interact,
         "reward_progress": reward_progress,         # 新增
         "reward_success_bonus": reward_success_bonus, # 新增
+        "reward_bin_pass": reward_bin_pass,           # 新增
         "reward_joints_pos": (
             reward_thumb_tip_pos
             + reward_index_tip_pos
