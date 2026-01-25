@@ -4639,7 +4639,32 @@ def compute_imitation_reward(
     reward_obj_rot = torch.exp(-3 * (diff_obj_rot_angle).abs())
     if reward_obj_rot.dim() > 1:
         reward_obj_rot = (reward_obj_rot * dynamic_mask).sum(dim=-1) / dynamic_count
+
+    # === [新增] 计算 Alpha (基于 Reference 中的抓握力) ===
+    # 规则: 统计 reference 中指尖距离 < 0.004 的手指数量 N
+    # alpha = 0.2 + (归一化力分数之和 * 0.8 / N)
+    # 归一化分数: force < 0.5 为 0, force > 2.0 为 1
+    ref_finger_dist = target_states["tips_distance"] # [N, 5]
+    ref_finger_force = torch.norm(target_states["tip_force"], dim=-1) # [N, 5]
     
+    contact_mask = ref_finger_dist < 0.004 # [N, 5]
+    N_contacts = contact_mask.sum(dim=-1, keepdim=True).float() # [N, 1]
+    
+    # 计算归一化力分数 [N, 5]
+    force_score = torch.clamp((ref_finger_force - 0.5) / (2.0 - 0.5), 0.0, 1.0)
+    
+    # 计算每个手指的贡献权重
+    force_contribution = (force_score * 0.8) / (N_contacts + 1e-6)
+    alpha_sum = (force_contribution * contact_mask.float()).sum(dim=-1, keepdim=True) # [N, 1]
+    
+    alpha = 0.2 + alpha_sum
+    # 如果没有手指接触，alpha 设为 1.0
+    alpha = torch.where(N_contacts > 0.5, alpha, torch.ones_like(alpha)).squeeze(-1) # [N]
+
+    # 将 alpha 应用到位姿奖励
+    reward_obj_pos = reward_obj_pos * alpha
+    reward_obj_rot = reward_obj_rot * alpha
+
     diff_obj_vel = target_obj_vel - current_obj_vel
     diff_obj_vel = torch.where(dynamic_mask.unsqueeze(-1), diff_obj_vel, torch.zeros_like(diff_obj_vel))
     # [N, K, 3] -> norm -> [N, K] -> mean over D
@@ -4936,11 +4961,16 @@ def compute_imitation_reward(
     dist_sim = torch.norm(v_sim, dim=-1) # [N, 5]
     force_sim = torch.norm(target_states["tip_force"], dim=-1) # [N, 5]
     
-    ref_contact_mask = dist_ref < 0.005
-    sim_contact_mask = dist_sim < 0.005
-    force_ok_mask = force_sim > 0.1
+    ref_contact_mask = dist_ref < 0.003
+    sim_contact_mask = dist_sim < 0.003
+
+    force_score = torch.clamp((force_sim - 0.1) / (2.0 - 0.1), 0.0, 1.0)
     
-    contact_bonus = (ref_contact_mask & sim_contact_mask & force_ok_mask).sum(dim=-1).float() * 3.0
+    # 只有在位置正确（mask为True）时，力越大奖励越高
+    # 基础奖励 4.0 + 额外力奖励 6.0 * force_score
+    current_finger_reward = (4.0 + 6.0 * force_score)
+
+    contact_bonus = ((ref_contact_mask & sim_contact_mask).float() * current_finger_reward).sum(dim=-1)
     reward_interact = reward_interact + contact_bonus
 
     # === [新增] 基于 Bin 的进度奖励 ===
@@ -5004,6 +5034,7 @@ def compute_imitation_reward(
         "reward_obj_rot": reward_obj_rot,
         "reward_obj_vel": reward_obj_vel,
         "reward_obj_ang_vel": reward_obj_ang_vel,
+        "reward_obj_alpha": alpha, # 新增记录 alpha
         "reward_interact": reward_interact,
         "reward_progress": reward_progress,         # 新增
         "reward_success_bonus": reward_success_bonus, # 新增
