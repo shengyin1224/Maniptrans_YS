@@ -206,7 +206,7 @@ def transform_object_points(object_points_local, object_pose):
     return points_transformed[:, :3]
 
 
-def analyze_motion_contacts(data_idx, dexhand, side="right", device="cuda:0", contact_threshold=0.005, num_object_points=1024):
+def analyze_motion_contacts(data_idx, dexhand, side="right", device="cuda:0", contact_threshold=0.005, num_object_points=5000):
     """
     分析一个motion的所有帧的手-物体接触
     
@@ -417,7 +417,7 @@ if __name__ == "__main__":
     parser.add_argument("--dexhand", type=str, default="inspire", help="Dexhand type")
     parser.add_argument("--side", type=str, default="right", help="Hand side (left/right)")
     parser.add_argument("--threshold", type=float, default=0.005, help="Contact distance threshold (meters)")
-    parser.add_argument("--num_points", type=int, default=1024, help="Number of points to sample on object surface")
+    parser.add_argument("--num_points", type=int, default=5000, help="Number of points to sample on object surface")
     parser.add_argument("--device", type=str, default="cuda:0", help="Device")
     parser.add_argument("--output_dir", type=str, default="data/contacts", help="Output directory")
     parser.add_argument("--headless", action="store_true", help="Run in headless mode")

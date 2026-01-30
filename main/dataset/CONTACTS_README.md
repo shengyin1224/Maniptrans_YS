@@ -27,14 +27,14 @@ CUDA_VISIBLE_DEVICES=1 python main/dataset/mano2dexhand_segmented.py --data_idx 
 基本使用：
 ```bash
 python main/dataset/compute_hand_object_contacts.py \
-    --data_idx "transfer_vase_from_utility_cart_to_shelf_then_to_utility_cart_with_both_hands-798" \
+    --data_idx "grasp_and_touch_notebook_with_right_hand_from_side_table-670" \
     --dexhand "inspire" \
     --side "right" \
-    --threshold 0.005 \
+    --threshold 0.012 \
     --output_dir "data/contacts_right"
 
 python main/dataset/compute_hand_object_contacts.py \
-    --data_idx "transfer_vase_from_utility_cart_to_shelf_then_to_utility_cart_with_both_hands-798" \
+    --data_idx "peel_mango_with_peeler_by_rotating_mango_in_left_hand_from_left-855" \
     --dexhand "inspire" \
     --side "left" \
     --threshold 0.005 \

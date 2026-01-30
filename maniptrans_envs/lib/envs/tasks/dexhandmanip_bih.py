@@ -455,6 +455,18 @@ class DexHandManipBiHEnv(VecTask):
             # 用于判断失败率的标志（是否已经触底）
             self.bin_reached_bottom = torch.zeros(num_bins, dtype=torch.bool, device=self.device)
             
+            # [新增] 锁定标志：如果 pos/rot 在成功期间稳定超过阈值，则不允许再上调
+            self.bin_pos_locked = torch.zeros(num_bins, dtype=torch.bool, device=self.device)  # 锁定 pos 上调
+            self.bin_rot_locked = torch.zeros(num_bins, dtype=torch.bool, device=self.device)  # 锁定 rot 上调
+            
+            # [新增] 触底后稳定计数：只看 scale 是否保持不变（与“是否成功”无关）
+            # 连续稳定达到阈值后，锁定对应的 pos/rot，禁止再上调
+            self.bin_pos_stable_epochs = torch.zeros(num_bins, dtype=torch.long, device=self.device)
+            self.bin_rot_stable_epochs = torch.zeros(num_bins, dtype=torch.long, device=self.device)
+            # 使用 -1.0 作为未初始化的标记值
+            self.bin_pos_scale_last = torch.full((num_bins,), -1.0, device=self.device)
+            self.bin_rot_scale_last = torch.full((num_bins,), -1.0, device=self.device)
+            
             print(f"[ADAPTIVE REAL] Initialized with {num_bins} bins, initial scale: {initial_scale:.4f}")
             print(f"  - Phase 1: Linear decay for 900 epochs (adjusted for num_envs={self.num_envs})")
             print(f"  - Phase 2: Adaptive adjustment based on failure rates when scale reaches 0.70")
@@ -3028,11 +3040,12 @@ class DexHandManipBiHEnv(VecTask):
                     )
                     self.current_epoch_bin_rates = current_epoch_bin_rates.clone() 
                     
-                    # [新增] 如果 global_scale 降至 0.7 之后，根据所有 bin 的成功率动态增加从头开始的比例
+                    # [新增] 如果 global_scale 降至 0.7 之后，且 support force 已衰减到 0，根据所有 bin 的成功率动态增加从头开始的比例
                     if self.adaptive_global_scale_factor <= 0.7001:
-                        if torch.all(current_epoch_bin_rates > 0.60):
+                        end_decay_epoch_sf = 30 * (1024 / self.num_envs) * 60  # 与 set_adaptive_scale_factor 中 support force 归零的 epoch 一致
+                        if (current_epoch >= end_decay_epoch_sf) and torch.all(current_epoch_bin_rates > 0.60):
                             self.start_from_beginning_ratio = min(1.0, self.start_from_beginning_ratio + 0.005)
-                            print(f"[ADAPTIVE RESET] All bin rates > 0.60, increasing start_from_beginning_ratio to {self.start_from_beginning_ratio:.4f}")
+                            print(f"[ADAPTIVE RESET] Support force reached 0, all bin rates > 0.60, increasing start_from_beginning_ratio to {self.start_from_beginning_ratio:.4f}")
                     
                     # [新增] 计算当前 epoch 的各 bin obj-pos 和 obj-rot 通过率
                     self.bin_obj_pos_pass_rate = torch.where(
@@ -3583,6 +3596,12 @@ class DexHandManipBiHEnv(VecTask):
                     self.bin_history_ptr_30 = (self.bin_history_ptr_30 + 1) % 30
                     
                     num_bins = self.adaptive_sampling_bins
+                    # 仅当 support force 已衰减到 0 后，才允许将 bin 的 status 设为 2 或 4
+                    end_decay_epoch_sf = 30 * (1024 / self.num_envs) * 60
+                    support_force_reached_zero = (current_epoch >= end_decay_epoch_sf)
+                    
+                    # [新增] 计算稳定阈值：30 * 4 * (num_envs / 1024)
+                    stability_threshold = int(30 * 4 * ( 1024 / self.num_envs))
                     
                     for i in range(num_bins):
                         # 只处理已经触底的 bin
@@ -3595,6 +3614,50 @@ class DexHandManipBiHEnv(VecTask):
                         # 状态 4: 降低难度后反而失败，永不改变
                         if status in [2, 4]:
                             continue
+
+                        # === 新需求：触底后开始统计稳定（不检测是否成功过） ===
+                        # 只要 pos 或 rot 的 scale 连续 stability_threshold 个 epoch 不变，就锁定对应项，禁止再上调。
+                        # pos
+                        last_pos = self.bin_pos_scale_last[i].item()
+                        cur_pos = self.bin_pos_scale[i].item()
+                        if last_pos < 0:
+                            self.bin_pos_scale_last[i] = cur_pos
+                            self.bin_pos_stable_epochs[i] = 0
+                        else:
+                            if abs(cur_pos - last_pos) <= 1e-6:
+                                self.bin_pos_stable_epochs[i] += 1
+                            else:
+                                self.bin_pos_scale_last[i] = cur_pos
+                                self.bin_pos_stable_epochs[i] = 0
+
+                        # rot
+                        last_rot = self.bin_rot_scale_last[i].item()
+                        cur_rot = self.bin_rot_scale[i].item()
+                        if last_rot < 0:
+                            self.bin_rot_scale_last[i] = cur_rot
+                            self.bin_rot_stable_epochs[i] = 0
+                        else:
+                            if abs(cur_rot - last_rot) <= 1e-6:
+                                self.bin_rot_stable_epochs[i] += 1
+                            else:
+                                self.bin_rot_scale_last[i] = cur_rot
+                                self.bin_rot_stable_epochs[i] = 0
+
+                        if (self.bin_pos_stable_epochs[i] >= stability_threshold) and (not self.bin_pos_locked[i]):
+                            self.bin_pos_locked[i] = True
+                            print(
+                                f"[ADAPTIVE REAL] Bin {i} pos scale locked! "
+                                f"Stable for {self.bin_pos_stable_epochs[i].item()} epochs after bottom. "
+                                f"pos={self.bin_pos_scale[i].item():.4f}"
+                            )
+
+                        if (self.bin_rot_stable_epochs[i] >= stability_threshold) and (not self.bin_rot_locked[i]):
+                            self.bin_rot_locked[i] = True
+                            print(
+                                f"[ADAPTIVE REAL] Bin {i} rot scale locked! "
+                                f"Stable for {self.bin_rot_stable_epochs[i].item()} epochs after bottom. "
+                                f"rot={self.bin_rot_scale[i].item():.4f}"
+                            )
                         
                         # 更新在当前 scale 下停留的 epoch 数
                         min_epochs = min(self.bin_epochs_at_current_scale[i, 0].item(), self.bin_epochs_at_current_scale[i, 1].item())
@@ -3617,10 +3680,11 @@ class DexHandManipBiHEnv(VecTask):
                             pos_fail_rate = 0.0
                             rot_fail_rate = 0.0
                         
-                        # 判断是否成功（avg-30 和最新 epoch 成功率都超过 50%）
+                        # 判断是否成功（avg-30 和最新 epoch 成功率都超过 50%）；仅当 support force 归零后才可设为 2
                         if bin_avg_30 >= 0.50 and bin_latest >= 0.50:
-                            self.bin_status[i] = 2  # 成功状态
-                            print(f"[ADAPTIVE REAL] Bin {i} succeeded! avg-30: {bin_avg_30:.2%}, latest: {bin_latest:.2%}. Freezing pos/rot scales at pos={self.bin_pos_scale[i]:.4f}, rot={self.bin_rot_scale[i]:.4f}")
+                            if support_force_reached_zero:
+                                self.bin_status[i] = 2  # 成功状态
+                                print(f"[ADAPTIVE REAL] Bin {i} succeeded! avg-30: {bin_avg_30:.2%}, latest: {bin_latest:.2%}. Freezing pos/rot scales at pos={self.bin_pos_scale[i]:.4f}, rot={self.bin_rot_scale[i]:.4f}")
                             continue
                         
                         # 判断是否失败（avg-30 和最新 epoch 成功率都低于 30%）
@@ -3630,24 +3694,64 @@ class DexHandManipBiHEnv(VecTask):
                             if self.bin_tried_decrease[i, 0] or self.bin_tried_decrease[i, 1]:
                                 self.bin_pos_scale[i] = self.bin_pos_scale_before_decrease[i]
                                 self.bin_rot_scale[i] = self.bin_rot_scale_before_decrease[i]
-                                self.bin_status[i] = 4  # 永不改变状态
+                                # scale 改变则重置稳定计数
+                                self.bin_pos_scale_last[i] = self.bin_pos_scale[i].item()
+                                self.bin_rot_scale_last[i] = self.bin_rot_scale[i].item()
+                                self.bin_pos_stable_epochs[i] = 0
+                                self.bin_rot_stable_epochs[i] = 0
+                                if support_force_reached_zero:
+                                    self.bin_status[i] = 4  # 永不改变状态（仅 support force 归零后才可设置）
                                 print(f"[ADAPTIVE REAL] Bin {i} failed after stagnation relief! Rolling back and freezing. pos={self.bin_pos_scale[i]:.4f}, rot={self.bin_rot_scale[i]:.4f}")
                                 continue
                             
                             # 分支 B：正常救赎降低难度 (Decrease Difficulty)
                             # 此时不设置 bin_tried_decrease，允许继续救赎
                             if pos_fail_rate > rot_fail_rate:
-                                old_scale = self.bin_pos_scale[i].item()
-                                self.bin_pos_scale_before_decrease[i] = old_scale # 记录回滚点
-                                self.bin_pos_scale[i] = min(1.0, old_scale + 0.01)
-                                print(f"[ADAPTIVE REAL] Bin {i} Failure Recovery: Increasing pos scale: {old_scale:.4f} -> {self.bin_pos_scale[i]:.4f}")
-                                self.bin_epochs_at_current_scale[i, 0] = 0
+                                # [新增] 检查 pos 是否被锁定
+                                if self.bin_pos_locked[i]:
+                                    print(f"[ADAPTIVE REAL] Bin {i} Failure Recovery: pos scale is locked, skipping pos adjustment. Trying rot instead.")
+                                    # 如果 pos 被锁定，尝试调整 rot（如果 rot 未被锁定）
+                                    if not self.bin_rot_locked[i]:
+                                        old_scale = self.bin_rot_scale[i].item()
+                                        self.bin_rot_scale_before_decrease[i] = old_scale # 记录回滚点
+                                        self.bin_rot_scale[i] = min(1.0, old_scale + 0.01)
+                                        # scale 改变则重置稳定计数
+                                        self.bin_rot_scale_last[i] = self.bin_rot_scale[i].item()
+                                        self.bin_rot_stable_epochs[i] = 0
+                                        print(f"[ADAPTIVE REAL] Bin {i} Failure Recovery: Increasing rot scale: {old_scale:.4f} -> {self.bin_rot_scale[i]:.4f}")
+                                        self.bin_epochs_at_current_scale[i, 1] = 0
+                                else:
+                                    old_scale = self.bin_pos_scale[i].item()
+                                    self.bin_pos_scale_before_decrease[i] = old_scale # 记录回滚点
+                                    self.bin_pos_scale[i] = min(1.0, old_scale + 0.01)
+                                    # scale 改变则重置稳定计数
+                                    self.bin_pos_scale_last[i] = self.bin_pos_scale[i].item()
+                                    self.bin_pos_stable_epochs[i] = 0
+                                    print(f"[ADAPTIVE REAL] Bin {i} Failure Recovery: Increasing pos scale: {old_scale:.4f} -> {self.bin_pos_scale[i]:.4f}")
+                                    self.bin_epochs_at_current_scale[i, 0] = 0
                             else:
-                                old_scale = self.bin_rot_scale[i].item()
-                                self.bin_rot_scale_before_decrease[i] = old_scale # 记录回滚点
-                                self.bin_rot_scale[i] = min(1.0, old_scale + 0.01)
-                                print(f"[ADAPTIVE REAL] Bin {i} Failure Recovery: Increasing rot scale: {old_scale:.4f} -> {self.bin_rot_scale[i]:.4f}")
-                                self.bin_epochs_at_current_scale[i, 1] = 0
+                                # [新增] 检查 rot 是否被锁定
+                                if self.bin_rot_locked[i]:
+                                    print(f"[ADAPTIVE REAL] Bin {i} Failure Recovery: rot scale is locked, skipping rot adjustment. Trying pos instead.")
+                                    # 如果 rot 被锁定，尝试调整 pos（如果 pos 未被锁定）
+                                    if not self.bin_pos_locked[i]:
+                                        old_scale = self.bin_pos_scale[i].item()
+                                        self.bin_pos_scale_before_decrease[i] = old_scale # 记录回滚点
+                                        self.bin_pos_scale[i] = min(1.0, old_scale + 0.01)
+                                        # scale 改变则重置稳定计数
+                                        self.bin_pos_scale_last[i] = self.bin_pos_scale[i].item()
+                                        self.bin_pos_stable_epochs[i] = 0
+                                        print(f"[ADAPTIVE REAL] Bin {i} Failure Recovery: Increasing pos scale: {old_scale:.4f} -> {self.bin_pos_scale[i]:.4f}")
+                                        self.bin_epochs_at_current_scale[i, 0] = 0
+                                else:
+                                    old_scale = self.bin_rot_scale[i].item()
+                                    self.bin_rot_scale_before_decrease[i] = old_scale # 记录回滚点
+                                    self.bin_rot_scale[i] = min(1.0, old_scale + 0.01)
+                                    # scale 改变则重置稳定计数
+                                    self.bin_rot_scale_last[i] = self.bin_rot_scale[i].item()
+                                    self.bin_rot_stable_epochs[i] = 0
+                                    print(f"[ADAPTIVE REAL] Bin {i} Failure Recovery: Increasing rot scale: {old_scale:.4f} -> {self.bin_rot_scale[i]:.4f}")
+                                    self.bin_epochs_at_current_scale[i, 1] = 0
                             
                             # 重置统计，准备下一轮
                             self.bin_pos_fail_count[i] = 0
@@ -3664,19 +3768,55 @@ class DexHandManipBiHEnv(VecTask):
                             if self.bin_no_fail_epochs[i] >= 30:
                                 # 模型卡住了，虽然不死，但也学不会 (成功率在 30%-50% 震荡)
                                 if pos_fail_rate > rot_fail_rate and pos_fail_rate > 0:
-                                    old_scale = self.bin_pos_scale[i].item()
-                                    self.bin_pos_scale_before_decrease[i] = old_scale
-                                    self.bin_pos_scale[i] = min(1.0, old_scale + 0.01)
-                                    self.bin_tried_decrease[i, 0] = True # 只有在这里（停滞缓解）才设为 True
-                                    print(f"[ADAPTIVE REAL] Bin {i} STAGNANT Relief: Success rate stuck at {bin_avg_30:.2%}. Increasing pos scale to {self.bin_pos_scale[i]:.4f}. Set tried_decrease=True.")
-                                    self.bin_epochs_at_current_scale[i, 0] = 0
+                                    # [新增] 检查 pos 是否被锁定
+                                    if self.bin_pos_locked[i]:
+                                        print(f"[ADAPTIVE REAL] Bin {i} STAGNANT Relief: pos scale is locked, skipping pos adjustment.")
+                                        # 如果 pos 被锁定且 rot 未被锁定，尝试调整 rot
+                                        if not self.bin_rot_locked[i] and rot_fail_rate > 0:
+                                            old_scale = self.bin_rot_scale[i].item()
+                                            self.bin_rot_scale_before_decrease[i] = old_scale
+                                            self.bin_rot_scale[i] = min(1.0, old_scale + 0.01)
+                                            # scale 改变则重置稳定计数
+                                            self.bin_rot_scale_last[i] = self.bin_rot_scale[i].item()
+                                            self.bin_rot_stable_epochs[i] = 0
+                                            self.bin_tried_decrease[i, 1] = True # 只有在这里（停滞缓解）才设为 True
+                                            print(f"[ADAPTIVE REAL] Bin {i} STAGNANT Relief: Success rate stuck at {bin_avg_30:.2%}. Increasing rot scale to {self.bin_rot_scale[i]:.4f}. Set tried_decrease=True.")
+                                            self.bin_epochs_at_current_scale[i, 1] = 0
+                                    else:
+                                        old_scale = self.bin_pos_scale[i].item()
+                                        self.bin_pos_scale_before_decrease[i] = old_scale
+                                        self.bin_pos_scale[i] = min(1.0, old_scale + 0.01)
+                                        # scale 改变则重置稳定计数
+                                        self.bin_pos_scale_last[i] = self.bin_pos_scale[i].item()
+                                        self.bin_pos_stable_epochs[i] = 0
+                                        self.bin_tried_decrease[i, 0] = True # 只有在这里（停滞缓解）才设为 True
+                                        print(f"[ADAPTIVE REAL] Bin {i} STAGNANT Relief: Success rate stuck at {bin_avg_30:.2%}. Increasing pos scale to {self.bin_pos_scale[i]:.4f}. Set tried_decrease=True.")
+                                        self.bin_epochs_at_current_scale[i, 0] = 0
                                 elif rot_fail_rate > 0:
-                                    old_scale = self.bin_rot_scale[i].item()
-                                    self.bin_rot_scale_before_decrease[i] = old_scale
-                                    self.bin_rot_scale[i] = min(1.0, old_scale + 0.01)
-                                    self.bin_tried_decrease[i, 1] = True # 只有在这里（停滞缓解）才设为 True
-                                    print(f"[ADAPTIVE REAL] Bin {i} STAGNANT Relief: Success rate stuck at {bin_avg_30:.2%}. Increasing rot scale to {self.bin_rot_scale[i]:.4f}. Set tried_decrease=True.")
-                                    self.bin_epochs_at_current_scale[i, 1] = 0
+                                    # [新增] 检查 rot 是否被锁定
+                                    if self.bin_rot_locked[i]:
+                                        print(f"[ADAPTIVE REAL] Bin {i} STAGNANT Relief: rot scale is locked, skipping rot adjustment.")
+                                        # 如果 rot 被锁定且 pos 未被锁定，尝试调整 pos
+                                        if not self.bin_pos_locked[i] and pos_fail_rate > 0:
+                                            old_scale = self.bin_pos_scale[i].item()
+                                            self.bin_pos_scale_before_decrease[i] = old_scale
+                                            self.bin_pos_scale[i] = min(1.0, old_scale + 0.01)
+                                            # scale 改变则重置稳定计数
+                                            self.bin_pos_scale_last[i] = self.bin_pos_scale[i].item()
+                                            self.bin_pos_stable_epochs[i] = 0
+                                            self.bin_tried_decrease[i, 0] = True # 只有在这里（停滞缓解）才设为 True
+                                            print(f"[ADAPTIVE REAL] Bin {i} STAGNANT Relief: Success rate stuck at {bin_avg_30:.2%}. Increasing pos scale to {self.bin_pos_scale[i]:.4f}. Set tried_decrease=True.")
+                                            self.bin_epochs_at_current_scale[i, 0] = 0
+                                    else:
+                                        old_scale = self.bin_rot_scale[i].item()
+                                        self.bin_rot_scale_before_decrease[i] = old_scale
+                                        self.bin_rot_scale[i] = min(1.0, old_scale + 0.01)
+                                        # scale 改变则重置稳定计数
+                                        self.bin_rot_scale_last[i] = self.bin_rot_scale[i].item()
+                                        self.bin_rot_stable_epochs[i] = 0
+                                        self.bin_tried_decrease[i, 1] = True # 只有在这里（停滞缓解）才设为 True
+                                        print(f"[ADAPTIVE REAL] Bin {i} STAGNANT Relief: Success rate stuck at {bin_avg_30:.2%}. Increasing rot scale to {self.bin_rot_scale[i]:.4f}. Set tried_decrease=True.")
+                                        self.bin_epochs_at_current_scale[i, 1] = 0
                                 
                                 # 重置统计
                                 self.bin_pos_fail_count[i] = 0
@@ -3847,6 +3987,8 @@ class DexHandManipBiHEnv(VecTask):
             info["adaptive_difficulty/support_force_kp_rot"] = float(self.support_force_kp_rot)
         if hasattr(self, 'support_force_kd_rot'):
             info["adaptive_difficulty/support_force_kd_rot"] = float(self.support_force_kd_rot)
+        if hasattr(self, 'start_from_beginning_ratio'):
+            info["adaptive_difficulty/start_from_beginning_ratio"] = float(self.start_from_beginning_ratio)
 
         # === [重构] 统一难度和采样统计信息填充 (仅按 Iteration 逻辑记录) ===
         if self.adaptive_sampling_bins is not None:
@@ -4413,8 +4555,8 @@ class DexHandManipBiHEnv(VecTask):
 
         # === [核心修改] 支撑力衰减逻辑 ===
         # 根据 epoch 进行衰减
-        # 0 - 30 * 1024 / num_envs * 40 epoch 是不变的
-        # 从 30 * 1024 / num_envs * 40 epoch - 30 * 1024 / num_envs * 60 epoch 线性衰减到 0
+        # 0 - 30 * 1024 / num_envs * 100 epoch 是不变的
+        # 从 30 * 1024 / num_envs * 100 epoch - 30 * 1024 / num_envs * 140 epoch 线性衰减到 0
         
         last_step = self.gym.get_frame_count(self.sim)
         horizon_length = getattr(self, 'horizon_length', 32)
@@ -4423,8 +4565,8 @@ class DexHandManipBiHEnv(VecTask):
         if hasattr(self, 'total_train_env_frames') and self.total_train_env_frames is not None:
             current_epoch = int(self.total_train_env_frames // frames_per_epoch) if frames_per_epoch > 0 else 0
             
-        start_decay_epoch = 30 * (1024 / self.num_envs) * 40
-        end_decay_epoch = 30 * (1024 / self.num_envs) * 60
+        start_decay_epoch = 30 * (1024 / self.num_envs) * 100
+        end_decay_epoch = 30 * (1024 / self.num_envs) * 140
         
         if current_epoch < start_decay_epoch:
             decay_factor = 1.0
@@ -4647,17 +4789,17 @@ def compute_imitation_reward(
     ref_finger_dist = target_states["tips_distance"] # [N, 5]
     ref_finger_force = torch.norm(target_states["tip_force"], dim=-1) # [N, 5]
     
-    contact_mask = ref_finger_dist < 0.004 # [N, 5]
+    contact_mask = ref_finger_dist < 0.03 # [N, 5]
     N_contacts = contact_mask.sum(dim=-1, keepdim=True).float() # [N, 1]
     
     # 计算归一化力分数 [N, 5]
-    force_score = torch.clamp((ref_finger_force - 0.5) / (2.0 - 0.5), 0.0, 1.0)
+    force_score = torch.clamp((ref_finger_force - 0.1) / (2.0 - 0.1), 0.0, 1.0)
     
     # 计算每个手指的贡献权重
-    force_contribution = (force_score * 0.8) / (N_contacts + 1e-6)
+    force_contribution = (force_score * 0.9) / (N_contacts + 1e-6)
     alpha_sum = (force_contribution * contact_mask.float()).sum(dim=-1, keepdim=True) # [N, 1]
     
-    alpha = 0.2 + alpha_sum
+    alpha = 0.1 + alpha_sum
     # 如果没有手指接触，alpha 设为 1.0
     alpha = torch.where(N_contacts > 0.5, alpha, torch.ones_like(alpha)).squeeze(-1) # [N]
 
@@ -4961,8 +5103,8 @@ def compute_imitation_reward(
     dist_sim = torch.norm(v_sim, dim=-1) # [N, 5]
     force_sim = torch.norm(target_states["tip_force"], dim=-1) # [N, 5]
     
-    ref_contact_mask = dist_ref < 0.003
-    sim_contact_mask = dist_sim < 0.003
+    ref_contact_mask = dist_ref < 0.03
+    # sim_contact_mask = dist_sim < 0.003
 
     force_score = torch.clamp((force_sim - 0.1) / (2.0 - 0.1), 0.0, 1.0)
     
@@ -4970,7 +5112,7 @@ def compute_imitation_reward(
     # 基础奖励 4.0 + 额外力奖励 6.0 * force_score
     current_finger_reward = (4.0 + 6.0 * force_score)
 
-    contact_bonus = ((ref_contact_mask & sim_contact_mask).float() * current_finger_reward).sum(dim=-1)
+    contact_bonus = ((ref_contact_mask).float() * current_finger_reward).sum(dim=-1)
     reward_interact = reward_interact + contact_bonus
 
     # === [新增] 基于 Bin 的进度奖励 ===
