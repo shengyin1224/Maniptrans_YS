@@ -1,4 +1,6 @@
 import os
+import sys
+import io
 
 from rl_games.common import vecenv
 
@@ -117,7 +119,8 @@ def print_statistics(
     frame,
     max_frames,
 ):
-    if print_stats:
+    # 每 20 个 epoch 打印一次 fps / epoch 信息
+    if print_stats and (epoch_num % 20 == 0):
         step_time = max(step_time, 1e-9)
         fps_step = curr_frames / step_time
         fps_step_inference = curr_frames / step_inference_time
@@ -1434,9 +1437,17 @@ class MyContinuousA2CBase(MyA2CBase):
                             self.save(os.path.join(self.nn_dir, "last_" + checkpoint_name))
 
                     if mean_rewards[0] > self.last_mean_rewards and epoch_num >= self.save_best_after:
-                        print("saving next best rewards: ", mean_rewards)
+                        do_print_save = (epoch_num % 20 == 0)
+                        if do_print_save:
+                            print("saving next best rewards: ", mean_rewards)
                         self.last_mean_rewards = mean_rewards[0]
-                        self.save(os.path.join(self.nn_dir, self.config["name"]))
+                        if not do_print_save:
+                            _old_stdout, sys.stdout = sys.stdout, io.StringIO()
+                        try:
+                            self.save(os.path.join(self.nn_dir, self.config["name"]))
+                        finally:
+                            if not do_print_save:
+                                sys.stdout = _old_stdout
 
                         if "score_to_win" in self.config:
                             if self.last_mean_rewards > self.config["score_to_win"]:

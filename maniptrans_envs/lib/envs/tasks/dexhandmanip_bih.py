@@ -571,10 +571,12 @@ class DexHandManipBiHEnv(VecTask):
                         f.write(f"  Bin {i:02d}: {start_pct:5.1f}% - {end_pct:5.1f}% (Steps {start_step:3d} - {end_step:3d})\n")
                 
                 f.write("=" * 80 + "\n\n")
+            self._failure_log_buffer = []  # 累积失败日志，每 20 个 epoch 写一次文件
             print(f"[INFO] Failure diagnostics will be saved to: {self.failure_log_file}")
         except Exception as e:
             print(f"[WARNING] Failed to initialize failure log file: {e}")
             self.failure_log_file = None
+            self._failure_log_buffer = []
 
     def _reset_bin_histories(self, bin_idx):
         """当某个 bin 的 scale 或状态发生重大改变时，重置其通过率历史统计"""
@@ -602,6 +604,8 @@ class DexHandManipBiHEnv(VecTask):
             self.physics_engine,
             self.sim_params,
         )
+        # [第 5 点] 初始化重力缓存，供 compute_observations 中 manip_obj_weight 使用
+        self._gravity_z = float(self.sim_params.gravity.z)
         self._create_ground_plane()
         self._create_envs()
 
@@ -1359,6 +1363,17 @@ class DexHandManipBiHEnv(VecTask):
         self.dexhand_lh_handles = {
             k: self.gym.find_actor_rigid_body_handle(env_ptr, dexhand_lh_handle, k) for k in self.dexhand_lh.body_names
         }
+        # [第 3 点] 预计算 joints_state 的 body 索引，避免 _update_states 中每步 Python 循环 + torch.stack
+        self._rh_joints_state_body_indices = torch.tensor(
+            [self.dexhand_rh_handles[k] for k in self.dexhand_rh.body_names],
+            dtype=torch.long,
+            device=self.device,
+        )
+        self._lh_joints_state_body_indices = torch.tensor(
+            [self.dexhand_lh_handles[k] for k in self.dexhand_lh.body_names],
+            dtype=torch.long,
+            device=self.device,
+        )
         self.dexhand_rh_cf_weights = {
             k: (1.0 if ("intermediate" in k or "distal" in k) else 0.0) for k in self.dexhand_rh.body_names
         }
@@ -1710,10 +1725,8 @@ class DexHandManipBiHEnv(VecTask):
             }
         )
 
-        self.rh_states["joints_state"] = torch.stack(
-            [self._rigid_body_state[:, self.dexhand_rh_handles[k], :][:, :10] for k in self.dexhand_rh.body_names],
-            dim=1,
-        )
+        # [第 3 点] 使用预计算索引，单次索引替代 Python 循环 + torch.stack
+        self.rh_states["joints_state"] = self._rigid_body_state[:, self._rh_joints_state_body_indices, :][:, :, :10]
 
         # === [修改 2] 抓取多物体的状态 ===
         # 目标: [NumEnvs, NumObjs, 3] 或 [NumEnvs, NumObjs, 4]
@@ -1769,10 +1782,8 @@ class DexHandManipBiHEnv(VecTask):
                 "base_state": self._lh_base_state[:, :],
             }
         )
-        self.lh_states["joints_state"] = torch.stack(
-            [self._rigid_body_state[:, self.dexhand_lh_handles[k], :][:, :10] for k in self.dexhand_lh.body_names],
-            dim=1,
-        )
+        # [第 3 点] 使用预计算索引，单次索引替代 Python 循环 + torch.stack
+        self.lh_states["joints_state"] = self._rigid_body_state[:, self._lh_joints_state_body_indices, :][:, :, :10]
         self.lh_states.update(
             {
                 "manip_obj_pos": lh_obj_states[..., :3],
@@ -1783,6 +1794,12 @@ class DexHandManipBiHEnv(VecTask):
         )
 
     def _refresh(self):
+        # [第 4 点优化] 同帧内避免重复刷新；Reset 后通过 _last_refresh_step = -1 强制下次必刷新，保证观测正确
+        if not hasattr(self, "_last_refresh_step"):
+            self._last_refresh_step = -1
+        current_frame = self.gym.get_frame_count(self.sim)
+        if current_frame == self._last_refresh_step:
+            return
 
         self.gym.refresh_dof_state_tensor(self.sim)
         self.gym.refresh_actor_root_state_tensor(self.sim)
@@ -1793,6 +1810,7 @@ class DexHandManipBiHEnv(VecTask):
 
         # Refresh states
         self._update_states()
+        self._last_refresh_step = current_frame
 
     def compute_reward(self, actions):
         # [新增] 打印物体重量并设置断点
@@ -1917,46 +1935,11 @@ class DexHandManipBiHEnv(VecTask):
         target_objs_quat = target_objs_quat[:, [1, 2, 3, 0]]  # [w, x, y, z] -> [x, y, z, w]
         target_state["manip_obj_quat"] = target_objs_quat.reshape(self.num_envs, self.num_objs_per_env, 4)
         
-        # 从 scene_objects 中读取每个物体的速度和角速度
-        target_objs_vel_list = []
-        target_objs_ang_vel_list = []
-        for env_id in range(self.num_envs):
-            env_vels = []
-            env_ang_vels = []
-            scene_objs = side_demo_data["scene_objects"][env_id]
-            for k in range(self.num_objs_per_env):
-                if k < len(scene_objs):
-                    scene_obj = scene_objs[k]
-                    # 获取速度
-                    if 'velocity' in scene_obj:
-                        vel = scene_obj['velocity']
-                        if isinstance(vel, torch.Tensor):
-                            env_vels.append(vel[cur_idx[env_id]])  # [3]
-                        else:
-                            env_vels.append(torch.tensor(vel[cur_idx[env_id]], device=self.device, dtype=torch.float32))
-                    else:
-                        # 向后兼容：使用第一个物体的速度
-                        env_vels.append(side_demo_data["obj_velocity"][env_id, cur_idx[env_id]])
-                    
-                    # 获取角速度
-                    if 'angular_velocity' in scene_obj:
-                        ang_vel = scene_obj['angular_velocity']
-                        if isinstance(ang_vel, torch.Tensor):
-                            env_ang_vels.append(ang_vel[cur_idx[env_id]])  # [3]
-                        else:
-                            env_ang_vels.append(torch.tensor(ang_vel[cur_idx[env_id]], device=self.device, dtype=torch.float32))
-                    else:
-                        # 向后兼容：使用第一个物体的角速度
-                        env_ang_vels.append(side_demo_data["obj_angular_velocity"][env_id, cur_idx[env_id]])
-                else:
-                    # Padding: 如果物体数量不足，使用零
-                    env_vels.append(torch.zeros(3, device=self.device, dtype=torch.float32))
-                    env_ang_vels.append(torch.zeros(3, device=self.device, dtype=torch.float32))
-            target_objs_vel_list.append(torch.stack(env_vels))  # [K, 3]
-            target_objs_ang_vel_list.append(torch.stack(env_ang_vels))  # [K, 3]
-        
-        target_state["manip_obj_vel"] = torch.stack(target_objs_vel_list)  # [N, K, 3]
-        target_state["manip_obj_ang_vel"] = torch.stack(target_objs_ang_vel_list)  # [N, K, 3]
+        # [优化] 使用预处理好的 multi_obj_vel / multi_obj_ang_vel 做向量化索引，替代 Python 双层循环
+        multi_obj_vel = self.rh_multi_obj_vel if side == "rh" else self.lh_multi_obj_vel  # [N, K, T, 3]
+        multi_obj_ang_vel = self.rh_multi_obj_ang_vel if side == "rh" else self.lh_multi_obj_ang_vel  # [N, K, T, 3]
+        target_state["manip_obj_vel"] = multi_obj_vel[batch_idx, obj_idx, time_idx]  # [N, K, 3]
+        target_state["manip_obj_ang_vel"] = multi_obj_ang_vel[batch_idx, obj_idx, time_idx]  # [N, K, 3]
         
         # hack_current_vel = current_objs_vel.mean(dim=1)
         # hack_current_ang_vel = current_objs_ang_vel.mean(dim=1)
@@ -1981,6 +1964,10 @@ class DexHandManipBiHEnv(VecTask):
             ),
         )
         target_state["tip_contact_state"] = getattr(self, f"{side}_tips_contact_history")
+
+        # 手指接触力模长 [N, 5]，供 tensorboard 记录
+        finger_force = torch.norm(target_state["tip_force"], dim=-1)  # [N, 5]
+        setattr(self, f"_{side}_finger_force", finger_force)
 
         side_states = getattr(self, f"{side}_states")
         # [Hack] 临时替换 side_states 里的物体位置，欺骗 JIT 函数
@@ -2238,8 +2225,8 @@ class DexHandManipBiHEnv(VecTask):
                     if failure_reasons["contact_violation"][env_id_item]:
                         failure_reasons_list.append("  - 接触惩罚: 手指距离过近但未检测到接触")
 
-                    # 保存到文件
-                    if hasattr(self, 'failure_log_file') and self.failure_log_file is not None:
+                    # 累积到 buffer，每 20 个 epoch 统一写入文件
+                    if hasattr(self, 'failure_log_file') and self.failure_log_file is not None and hasattr(self, '_failure_log_buffer'):
                         try:
                             cur_bin_str = ""
                             if self.adaptive_sampling_bins is not None:
@@ -2249,24 +2236,22 @@ class DexHandManipBiHEnv(VecTask):
                                     cur_bin_str = f" (Bin {cur_bin})"
                                 else:
                                     cur_bin_str = " (Bin N/A)"
-
-                            with open(self.failure_log_file, "a", encoding="utf-8") as f:
-                                f.write(f"\n[FAILURE DIAGNOSIS] {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-                                f.write(f"Env {env_id_item} ({side.upper()} side), Step {cur_step}{cur_bin_str}, Running {running_steps} steps\n")
-                                f.write(f"  Estimated Epoch: {estimated_epoch} (Frame: {last_step}, Frames/Epoch: {frames_per_epoch})\n")
-                                if failure_reasons_list:
-                                    for reason in failure_reasons_list:
-                                        f.write(reason + "\n")
-                                else:
-                                    f.write(f"  - 未知原因 (可能是 running_progress_buf < 8)\n")
-                                
-                                # 获取该环境对应的 scale
-                                env_scale = scale_factor[env_id_item].item()
-                                env_rot_scale = current_rot_scale_factor[env_id_item].item()
-                                f.write(f"  Scale Factor (Pos): {env_scale:.4f}, (Rot): {env_rot_scale:.4f}\n")
-                                f.write("-" * 80 + "\n")
+                            env_scale = scale_factor[env_id_item].item()
+                            env_rot_scale = current_rot_scale_factor[env_id_item].item()
+                            lines = [
+                                f"\n[FAILURE DIAGNOSIS] {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n",
+                                f"Env {env_id_item} ({side.upper()} side), Step {cur_step}{cur_bin_str}, Running {running_steps} steps\n",
+                                f"  Estimated Epoch: {estimated_epoch} (Frame: {last_step}, Frames/Epoch: {frames_per_epoch})\n",
+                            ]
+                            if failure_reasons_list:
+                                lines.extend([reason + "\n" for reason in failure_reasons_list])
+                            else:
+                                lines.append(f"  - 未知原因 (可能是 running_progress_buf < 8)\n")
+                            lines.append(f"  Scale Factor (Pos): {env_scale:.4f}, (Rot): {env_rot_scale:.4f}\n")
+                            lines.append("-" * 80 + "\n")
+                            self._failure_log_buffer.extend(lines)
                         except Exception as e:
-                            print(f"[WARNING] Failed to write to failure log file: {e}")
+                            print(f"[WARNING] Failed to append to failure log buffer: {e}")
                     
                     self.failure_log_count += 1
 
@@ -2342,9 +2327,10 @@ class DexHandManipBiHEnv(VecTask):
                     pri_obs_values.append(flat_rel_com.reshape(self.num_envs, -1))
                     
                 elif ob == "manip_obj_weight":
-                    prop = self.gym.get_sim_params(self.sim)
-                    # Mass: [N, K] -> [N, K*1]
-                    weights = getattr(self, f"manip_obj_{side}_mass") * -1 * prop.gravity.z
+                    # [第 5 点] 使用缓存的重力，避免每步 get_sim_params；在 _update_adaptive_difficulty 中会更新 _gravity_z
+                    if getattr(self, "_gravity_z", None) is None:
+                        self._gravity_z = float(self.gym.get_sim_params(self.sim).gravity.z)
+                    weights = getattr(self, f"manip_obj_{side}_mass") * (-self._gravity_z)
                     pri_obs_values.append(weights.reshape(self.num_envs, -1))
                     
                 elif ob == "tip_force":
@@ -2444,33 +2430,10 @@ class DexHandManipBiHEnv(VecTask):
         current_pos = side_states["manip_obj_pos"][:, None, :, :]
         next_target_state["delta_manip_obj_pos"] = (target_pos - current_pos).reshape(nE, -1)
 
-        # 4. 计算速度 Delta - 从 scene_objects 中读取每个物体的速度
-        # 构造目标速度 tensor [N, F, K, 3]
-        target_obj_vel_list = []
-        for env_id in range(nE):
-            env_vels_future = []
-            scene_objs = side_demo_data["scene_objects"][env_id]
-            env_cur_idx = cur_idx[env_id]  # [F]
-            for k in range(self.num_objs_per_env):
-                if k < len(scene_objs):
-                    scene_obj = scene_objs[k]
-                    if 'velocity' in scene_obj:
-                        vel = scene_obj['velocity']
-                        if isinstance(vel, torch.Tensor):
-                            # vel: [T, 3], env_cur_idx: [F] -> [F, 3]
-                            vel_future = vel[env_cur_idx]  # [F, 3]
-                        else:
-                            vel_tensor = torch.tensor(vel, device=self.device, dtype=torch.float32)
-                            vel_future = vel_tensor[env_cur_idx]
-                    else:
-                        # 向后兼容：使用第一个物体的速度
-                        vel_future = side_demo_data["obj_velocity"][env_id, env_cur_idx]  # [F, 3]
-                else:
-                    # Padding: 如果物体数量不足，使用零
-                    vel_future = torch.zeros((nF, 3), device=self.device, dtype=torch.float32)
-                env_vels_future.append(vel_future)  # [F, 3]
-            target_obj_vel_list.append(torch.stack(env_vels_future, dim=1))  # [F, K, 3]
-        target_obj_vel = torch.stack(target_obj_vel_list)  # [N, F, K, 3]
+        # 4. 计算速度 Delta - [优化] 使用预处理好的 multi_obj_vel 做 indicing，替代 Python 双层循环
+        raw_multi_vel = self.rh_multi_obj_vel if side == "rh" else self.lh_multi_obj_vel  # [N, K, T, 3]
+        multi_vel_time_first = raw_multi_vel.transpose(1, 2)  # [N, T, K, 3] 以适配 indicing
+        target_obj_vel = indicing(multi_vel_time_first, cur_idx)  # [N, F, K, 3]
             
         current_vel = side_states["manip_obj_vel"][:, None, :, :]
         next_target_state["manip_obj_vel"] = target_obj_vel.reshape(nE, -1)
@@ -2493,33 +2456,10 @@ class DexHandManipBiHEnv(VecTask):
         
         next_target_state["delta_manip_obj_quat"] = flat_delta_quat.reshape(nE, -1)
 
-        # 6. 计算角速度 Delta - 从 scene_objects 中读取每个物体的角速度
-        # 构造目标角速度 tensor [N, F, K, 3]
-        target_obj_ang_vel_list = []
-        for env_id in range(nE):
-            env_ang_vels_future = []
-            scene_objs = side_demo_data["scene_objects"][env_id]
-            env_cur_idx = cur_idx[env_id]  # [F]
-            for k in range(self.num_objs_per_env):
-                if k < len(scene_objs):
-                    scene_obj = scene_objs[k]
-                    if 'angular_velocity' in scene_obj:
-                        ang_vel = scene_obj['angular_velocity']
-                        if isinstance(ang_vel, torch.Tensor):
-                            # ang_vel: [T, 3], env_cur_idx: [F] -> [F, 3]
-                            ang_vel_future = ang_vel[env_cur_idx]  # [F, 3]
-                        else:
-                            ang_vel_tensor = torch.tensor(ang_vel, device=self.device, dtype=torch.float32)
-                            ang_vel_future = ang_vel_tensor[env_cur_idx]
-                    else:
-                        # 向后兼容：使用第一个物体的角速度
-                        ang_vel_future = side_demo_data["obj_angular_velocity"][env_id, env_cur_idx]  # [F, 3]
-                else:
-                    # Padding: 如果物体数量不足，使用零
-                    ang_vel_future = torch.zeros((nF, 3), device=self.device, dtype=torch.float32)
-                env_ang_vels_future.append(ang_vel_future)  # [F, 3]
-            target_obj_ang_vel_list.append(torch.stack(env_ang_vels_future, dim=1))  # [F, K, 3]
-        target_obj_ang_vel = torch.stack(target_obj_ang_vel_list)  # [N, F, K, 3]
+        # 6. 计算角速度 Delta - [优化] 使用预处理好的 multi_obj_ang_vel 做 indicing，替代 Python 双层循环
+        raw_multi_ang_vel = self.rh_multi_obj_ang_vel if side == "rh" else self.lh_multi_obj_ang_vel  # [N, K, T, 3]
+        multi_ang_vel_time_first = raw_multi_ang_vel.transpose(1, 2)  # [N, T, K, 3] 以适配 indicing
+        target_obj_ang_vel = indicing(multi_ang_vel_time_first, cur_idx)  # [N, F, K, 3]
 
         current_ang_vel = side_states["manip_obj_ang_vel"][:, None, :, :]
         next_target_state["manip_obj_ang_vel"] = target_obj_ang_vel.reshape(nE, -1)
@@ -3020,12 +2960,22 @@ class DexHandManipBiHEnv(VecTask):
                 pos_scale_val = self.bin_pos_scale.mean().item() if self.tighten_method in ["adaptive_dual", "adaptive_real"] else self.adaptive_global_scale_factor
                 rot_scale_val = self.bin_rot_scale.mean().item() if self.tighten_method in ["adaptive_dual", "adaptive_real"] else self.rot_scale_factor
 
-                print(f"[EPOCH STATS] Epoch {self.adaptive_current_epoch}: "
-                      f"Success Rate: {success_rate_last_epoch:.4f}, "
-                      f"Avg Steps: {avg_steps_last_epoch:.2f}, "
-                      f"Global Scale: {self.adaptive_global_scale_factor:.4f}, "
-                      f"Obj-Pos Scale: {pos_scale_val:.4f}, "
-                      f"Obj-Rot Scale: {rot_scale_val:.4f}")
+                # 每 20 个 epoch 打印一次，并刷新失败日志到文件
+                if self.adaptive_current_epoch % 20 == 0:
+                    if getattr(self, '_failure_log_buffer', None) is not None and hasattr(self, 'failure_log_file') and self.failure_log_file is not None and len(self._failure_log_buffer) > 0:
+                        try:
+                            with open(self.failure_log_file, "a", encoding="utf-8") as f:
+                                for line in self._failure_log_buffer:
+                                    f.write(line)
+                            self._failure_log_buffer.clear()
+                        except Exception as e:
+                            print(f"[WARNING] Failed to flush failure log buffer: {e}")
+                    print(f"[EPOCH STATS] Epoch {self.adaptive_current_epoch}: "
+                          f"Success Rate: {success_rate_last_epoch:.4f}, "
+                          f"Avg Steps: {avg_steps_last_epoch:.2f}, "
+                          f"Global Scale: {self.adaptive_global_scale_factor:.4f}, "
+                          f"Obj-Pos Scale: {pos_scale_val:.4f}, "
+                          f"Obj-Rot Scale: {rot_scale_val:.4f}")
                 
                 # === [新增] 更新各 bin 成功率统计，不论什么模式都执行 ===
                 if self.adaptive_sampling_bins is not None:
@@ -3831,9 +3781,10 @@ class DexHandManipBiHEnv(VecTask):
                 # ... (原来的 Check 1, 2, 3 逻辑已被上面的新逻辑替换)
                 
                 # === [新增] 记录当前epoch的重力和摩擦力信息到tensorboard ===
-                # 获取当前模拟器实际使用的重力
+                # 获取当前模拟器实际使用的重力，并更新缓存供 compute_observations 使用 [第 5 点]
                 current_sim_params = self.gym.get_sim_params(self.sim)
                 current_gravity = current_sim_params.gravity.z
+                self._gravity_z = float(current_gravity)
 
                 # 获取摩擦力的平均值（遍历所有环境的非hand actor）
                 total_friction = 0.0
@@ -3878,17 +3829,17 @@ class DexHandManipBiHEnv(VecTask):
                         (1 - self.adaptive_sampling_alpha) * self.bin_total_count
                     )
 
-                    # 打印当前epoch的bin统计信息
-                    bin_reset_counts = self._current_bin_reset.int().tolist()
-                    current_rates = current_epoch_bin_rates.tolist()
-                    ema_rates = self.bin_ema_success_rates.tolist()
-                    
-                    print(f"[ADAPTIVE STATS] Epoch {self.adaptive_current_epoch} (Global Scale: {self.adaptive_global_scale_factor:.4f}, Start Ratio: {self.start_from_beginning_ratio:.4f}, Obj-Pos Scale: {self.bin_pos_scale.mean().item():.4f}, Obj-Rot Scale: {self.bin_rot_scale.mean().item():.4f}):")
-                    print(f"  - Bin Reset Counts: {bin_reset_counts}")
-                    print(f"  - Bin Success Rates (Current): {[f'{r:.2f}' for r in current_rates]}")
-                    print(f"  - Bin Success Rates (EMA):     {[f'{r:.2f}' for r in ema_rates]}")
-                    print(f"  - Bin Obj-Pos Pass Rates:      {[f'{r:.2f}' for r in self.bin_obj_pos_pass_rate.tolist()]}")
-                    print(f"  - Bin Obj-Rot Pass Rates:      {[f'{r:.2f}' for r in self.bin_obj_rot_pass_rate.tolist()]}")
+                    # 每 20 个 epoch 打印一次 bin 统计信息
+                    if self.adaptive_current_epoch % 20 == 0:
+                        bin_reset_counts = self._current_bin_reset.int().tolist()
+                        current_rates = current_epoch_bin_rates.tolist()
+                        ema_rates = self.bin_ema_success_rates.tolist()
+                        print(f"[ADAPTIVE STATS] Epoch {self.adaptive_current_epoch} (Global Scale: {self.adaptive_global_scale_factor:.4f}, Start Ratio: {self.start_from_beginning_ratio:.4f}, Obj-Pos Scale: {self.bin_pos_scale.mean().item():.4f}, Obj-Rot Scale: {self.bin_rot_scale.mean().item():.4f}):")
+                        print(f"  - Bin Reset Counts: {bin_reset_counts}")
+                        print(f"  - Bin Success Rates (Current): {[f'{r:.2f}' for r in current_rates]}")
+                        print(f"  - Bin Success Rates (EMA):     {[f'{r:.2f}' for r in ema_rates]}")
+                        print(f"  - Bin Obj-Pos Pass Rates:      {[f'{r:.2f}' for r in self.bin_obj_pos_pass_rate.tolist()]}")
+                        print(f"  - Bin Obj-Rot Pass Rates:      {[f'{r:.2f}' for r in self.bin_obj_rot_pass_rate.tolist()]}")
 
                     # 重置当前epoch的统计
                     self._current_bin_success.zero_()
@@ -3952,6 +3903,9 @@ class DexHandManipBiHEnv(VecTask):
         if hasattr(self, "env_obj_pos_failed"):
             self.env_obj_pos_failed[env_ids] = False
             self.env_obj_rot_failed[env_ids] = False
+
+        # [第 4 点] 瞬移后标记“数据已过期”，强制下一帧取 obs 时必做一次 _refresh，避免观测到 reset 前的旧状态
+        self._last_refresh_step = -1
 
     def reset_done(self):
         done_env_ids = self.reset_buf.nonzero(as_tuple=False).flatten()
@@ -4055,6 +4009,14 @@ class DexHandManipBiHEnv(VecTask):
             info["adaptive_difficulty/current_epoch_gravity"] = float(self.current_epoch_gravity)
         if hasattr(self, 'current_epoch_avg_friction'):
             info["adaptive_difficulty/current_epoch_avg_friction"] = float(self.current_epoch_avg_friction)
+
+        # 6. 手指接触力 finger_force = norm(tip_force) [N, 5]，写入 tensorboard
+        if hasattr(self, "_rh_finger_force") and hasattr(self, "_lh_finger_force"):
+            info["finger_force/rh_mean"] = float(self._rh_finger_force.mean().item())
+            info["finger_force/lh_mean"] = float(self._lh_finger_force.mean().item())
+            for i in range(self._rh_finger_force.shape[1]):
+                info[f"finger_force/rh_{i}"] = float(self._rh_finger_force[:, i].mean().item())
+                info[f"finger_force/lh_{i}"] = float(self._lh_finger_force[:, i].mean().item())
 
         # === [物理引擎设置] ===
         if hasattr(self, "current_scale_factor"):
@@ -4793,13 +4755,13 @@ def compute_imitation_reward(
     N_contacts = contact_mask.sum(dim=-1, keepdim=True).float() # [N, 1]
     
     # 计算归一化力分数 [N, 5]
-    force_score = torch.clamp((ref_finger_force - 0.1) / (2.0 - 0.1), 0.0, 1.0)
+    force_score = torch.clamp((ref_finger_force - 0.1) / (1.5 - 0.1), 0.0, 1.0)
     
     # 计算每个手指的贡献权重
-    force_contribution = (force_score * 0.9) / (N_contacts + 1e-6)
+    force_contribution = (force_score * 1.0) / (N_contacts + 1e-6)
     alpha_sum = (force_contribution * contact_mask.float()).sum(dim=-1, keepdim=True) # [N, 1]
     
-    alpha = 0.1 + alpha_sum
+    alpha = 0.4 + 2.6 * alpha_sum
     # 如果没有手指接触，alpha 设为 1.0
     alpha = torch.where(N_contacts > 0.5, alpha, torch.ones_like(alpha)).squeeze(-1) # [N]
 
@@ -5106,11 +5068,11 @@ def compute_imitation_reward(
     ref_contact_mask = dist_ref < 0.03
     # sim_contact_mask = dist_sim < 0.003
 
-    force_score = torch.clamp((force_sim - 0.1) / (2.0 - 0.1), 0.0, 1.0)
+    force_score = torch.clamp((force_sim - 0.1) / (1.5 - 0.1), 0.0, 1.0)
     
     # 只有在位置正确（mask为True）时，力越大奖励越高
     # 基础奖励 4.0 + 额外力奖励 6.0 * force_score
-    current_finger_reward = (4.0 + 6.0 * force_score)
+    current_finger_reward = (0.1 + 3.0 * force_score)
 
     contact_bonus = ((ref_contact_mask).float() * current_finger_reward).sum(dim=-1)
     reward_interact = reward_interact + contact_bonus
