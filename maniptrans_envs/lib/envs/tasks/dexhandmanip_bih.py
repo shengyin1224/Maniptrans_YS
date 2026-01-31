@@ -2992,7 +2992,7 @@ class DexHandManipBiHEnv(VecTask):
                     
                     # [新增] 如果 global_scale 降至 0.7 之后，且 support force 已衰减到 0，根据所有 bin 的成功率动态增加从头开始的比例
                     if self.adaptive_global_scale_factor <= 0.7001:
-                        end_decay_epoch_sf = 30 * (1024 / self.num_envs) * 60  # 与 set_adaptive_scale_factor 中 support force 归零的 epoch 一致
+                        end_decay_epoch_sf = 30 * (1024 / self.num_envs) * 100  # 与 set_adaptive_scale_factor 中 support force 归零的 epoch 一致
                         if (current_epoch >= end_decay_epoch_sf) and torch.all(current_epoch_bin_rates > 0.60):
                             self.start_from_beginning_ratio = min(1.0, self.start_from_beginning_ratio + 0.005)
                             print(f"[ADAPTIVE RESET] Support force reached 0, all bin rates > 0.60, increasing start_from_beginning_ratio to {self.start_from_beginning_ratio:.4f}")
@@ -3547,7 +3547,7 @@ class DexHandManipBiHEnv(VecTask):
                     
                     num_bins = self.adaptive_sampling_bins
                     # 仅当 support force 已衰减到 0 后，才允许将 bin 的 status 设为 2 或 4
-                    end_decay_epoch_sf = 30 * (1024 / self.num_envs) * 60
+                    end_decay_epoch_sf = 30 * (1024 / self.num_envs) * 100
                     support_force_reached_zero = (current_epoch >= end_decay_epoch_sf)
                     
                     # [新增] 计算稳定阈值：30 * 4 * (num_envs / 1024)
