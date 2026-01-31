@@ -1615,9 +1615,6 @@ if __name__ == "__main__":
                 stage1_pkl = dump_path.replace(".pkl", "_stage1_nocontact.pkl")
             run_stage2(parser, idx, stage1_pkl)
         elif stage == "both":
-            # 先运行stage1
-            run_stage1(parser, idx)
-            # 然后运行stage2
             dataset_type = ManipDataFactory.dataset_type(idx)
             demo_d = ManipDataFactory.create_data(
                 manipdata_type=dataset_type,
@@ -1630,7 +1627,12 @@ if __name__ == "__main__":
             demo_data = pack_data([demo_d[idx]], dexhand)
             dump_path = _get_dump_path(dataset_type, demo_data, dexhand, idx)
             stage1_pkl = dump_path.replace(".pkl", "_stage1_nocontact.pkl")
-            run_stage2(parser, idx, stage1_pkl)
+            if os.path.exists(stage1_pkl):
+                cprint(f"[STAGE1] 已存在，跳过 stage1，直接运行 stage2: {stage1_pkl}", "cyan")
+                run_stage2(parser, idx, stage1_pkl)
+            else:
+                run_stage1(parser, idx)
+                run_stage2(parser, idx, stage1_pkl)
         else:
             raise ValueError(f"Unknown stage: {stage}. Must be '1', '2', or 'both'")
 

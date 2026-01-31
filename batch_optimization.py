@@ -285,12 +285,12 @@ def main():
                 completed_count += 1
                 status = "成功" if success else "失败"
                 print(f"[{completed_count}/{len(tasks)}] {data_idx}: {status}")
-                # 跑完后若对应 output 路径下没有 pkl，则记录到日志
-                check_and_log_missing_output(data_idx)
+                # 仅在 stage 2 也跑完（任务成功）时再检查 output；stage 1 失败时不会产生最终 pkl，不记缺失
+                if success:
+                    check_and_log_missing_output(data_idx)
             except Exception as e:
                 print(f"[{completed_count+1}/{len(tasks)}] {data_idx}: 异常 - {e}")
                 completed_count += 1
-                check_and_log_missing_output(data_idx)
 
     print("所有任务处理完成")
 
