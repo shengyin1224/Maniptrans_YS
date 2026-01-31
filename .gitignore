@@ -10,6 +10,7 @@ __pycache__/
 
 isaacgym/
 0105_nerv/
+0130_nerv/
 
 events.out.tfevents.*
 
