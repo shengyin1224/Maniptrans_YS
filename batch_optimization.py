@@ -126,6 +126,18 @@ def get_expected_output_paths(data_idx: str):
     return lh, rh
 
 
+def get_stage1_path(data_idx: str, side: str):
+    """返回某 data_idx 和 side 的 stage1 中间文件路径。"""
+    side_abbr = "lh" if side == "left" else "rh"
+    return os.path.join(BASE_DIR, "data", "retargeting", "Humoto", f"mano2inspire_{side_abbr}", f"{data_idx}_stage1_nocontact.pkl")
+
+
+def check_stage1_file_exists(data_idx: str, side: str):
+    """检查指定手的 stage1 中间文件是否存在。"""
+    stage1_path = get_stage1_path(data_idx, side)
+    return os.path.isfile(stage1_path), stage1_path
+
+
 def check_and_log_missing_output(data_idx: str) -> None:
     """
     若该动作跑完后对应 output 路径下没有 pkl，则追加写入日志。
@@ -170,6 +182,7 @@ def run_optimization_for_data(data_idx: str, gpu_id: int, stage: int = None):
 
     # 为左右手分别运行
     sides = ["left", "right"]
+    all_success = True
 
     for side in sides:
         cmd = base_cmd.copy()
@@ -190,22 +203,48 @@ def run_optimization_for_data(data_idx: str, gpu_id: int, stage: int = None):
             print(f"完成: {data_idx} {side} hand (stage {stage if stage else 'all'})")
         except subprocess.CalledProcessError as e:
             print(f"错误: {data_idx} {side} hand 运行失败 (stage {stage if stage else 'all'}): {e}")
-            return False
+            # 如果是 stage 1 失败，检查该手的 stage1 文件是否存在
+            if stage == 1:
+                exists, stage1_path = check_stage1_file_exists(data_idx, side)
+                if exists:
+                    print(f"检测到 {side} 手的 Stage 1 中间文件已存在: {stage1_path}")
+                    print(f"将继续在 Stage 2 中处理 {side} 手")
+                    # 这个手的 stage1 虽然命令失败，但文件存在，所以不算完全失败
+                    continue
+                else:
+                    print(f"{side} 手的 Stage 1 完全失败，未生成中间文件")
+                    all_success = False
+            else:
+                all_success = False
 
-    return True
+    return all_success
 
 def run_two_stage_optimization(data_idx: str, gpu_id: int):
     """
     为指定数据运行两阶段优化：先stage 1，再stage 2
+    每个手独立处理：如果某个手的 stage1 失败但文件存在，会继续运行该手的 stage2
     """
     print(f"=== 开始两阶段优化: {data_idx} (GPU {gpu_id}) ===")
 
     # Stage 1
     print(f"Stage 1 开始: {data_idx}")
     success1 = run_optimization_for_data(data_idx, gpu_id, stage=1)
+    # 注意：run_optimization_for_data 已经处理了单个手的 stage1 文件检查逻辑
+    # 如果某个手的 stage1 失败但文件存在，函数会继续处理下一个手，不会返回 False
+    
     if not success1:
-        print(f"Stage 1 失败: {data_idx}")
-        return False
+        # 检查是否至少有一个手的 stage1 文件存在
+        lh_exists, lh_path = check_stage1_file_exists(data_idx, "left")
+        rh_exists, rh_path = check_stage1_file_exists(data_idx, "right")
+        if not lh_exists and not rh_exists:
+            print(f"Stage 1 完全失败，左右手都未生成中间文件: {data_idx}")
+            return False
+        else:
+            print(f"Stage 1 部分完成，继续运行 Stage 2:")
+            if lh_exists:
+                print(f"  - 左手文件存在: {lh_path}")
+            if rh_exists:
+                print(f"  - 右手文件存在: {rh_path}")
 
     print(f"Stage 1 完成: {data_idx}")
 
@@ -222,8 +261,8 @@ def run_two_stage_optimization(data_idx: str, gpu_id: int):
 
 def main():
     parser = argparse.ArgumentParser(description="批量运行 mano2dexhand_segmented.py 优化")
-    parser.add_argument("--gpu_ids", type=str, default="0,1,2,3,4,5,6,7",
-                       help="可用的GPU ID列表，用逗号分隔 (默认: 0,1,2,3,4,5,6,7；使用 --missing_15 时默认 5,7,11)")
+    parser.add_argument("--gpu_ids", type=str, default="0,4,5,8",
+                       help="可用的GPU ID列表，用逗号分隔 (默认: 0,4,5,8；使用 --missing_15 时默认 5,7,11)")
     parser.add_argument("--max_parallel", type=int, default=4,
                        help="最大并行进程数 (默认: 4)")
     parser.add_argument("--data_indices", type=str, default=None,
@@ -237,7 +276,7 @@ def main():
 
     # 使用 --missing_15 时：固定 15 个动作 + 默认 5,7,11 卡
     if args.missing_15:
-        if args.gpu_ids == "0,1,2,3,4,5,6,7":
+        if args.gpu_ids == "0,4,5,8":
             args.gpu_ids = "5,7,11"
         if args.data_indices is None:
             args.data_indices = ",".join(MISSING_FROM_BOTH_15)
