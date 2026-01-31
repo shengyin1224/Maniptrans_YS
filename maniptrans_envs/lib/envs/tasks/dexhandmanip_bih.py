@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import random
 from collections import deque
 from enum import Enum
@@ -39,6 +40,29 @@ from ...utils.pose_utils import get_mat
 
 def soft_clamp(x, lower, upper):
     return lower + torch.sigmoid(4 / (upper - lower) * (x - (lower + upper) / 2)) * (upper - lower)
+
+
+def _urdf_path_for_isaac(urdf_path):
+    """
+    Isaac Gym 只识别扩展名为 .urdf 的文件；对 name.000.urdf / name.001.urdf 会报
+    "Unrecognized extension '.000.urdf'"。将此类路径转为同目录下仅含一个点的文件名
+    (如 name_000.urdf)，复制后返回 (asset_root, asset_file) 供 load_asset 使用。
+    同品类多实例用 .000/.001 区分时，必须经过此转换才能被 Isaac 加载。
+    """
+    root, filename = os.path.split(urdf_path)
+    base, ext = os.path.splitext(filename)  # e.g. ("clothes_hanger.000", ".urdf")
+    if ext.lower() != ".urdf":
+        return root, filename
+    # 若 base 中还包含点（如 clothes_hanger.000），Isaac 会误判扩展名
+    if "." in base:
+        # 改为下划线：clothes_hanger.000 -> clothes_hanger_000，保证扩展名仅为 .urdf
+        safe_base = base.replace(".", "_")
+        safe_filename = safe_base + ".urdf"
+        safe_path = os.path.join(root, safe_filename)
+        if safe_path != urdf_path:
+            shutil.copy2(urdf_path, safe_path)
+        return root, safe_filename
+    return root, filename
 
 
 class DexHandManipBiHEnv(VecTask):
@@ -1210,7 +1234,21 @@ class DexHandManipBiHEnv(VecTask):
                 asset_options.fix_base_link = is_static  # 静态物体固定base link
                 # asset_options.disable_gravity = True 
                 
-                asset = self.gym.load_asset(self.sim, *os.path.split(urdf_path), asset_options)
+                # 检查并处理 URDF 路径（使用与 mano2dexhand_segmented.py 相同的处理方式）
+                if not os.path.exists(urdf_path):
+                    raise FileNotFoundError(f"URDF file not found: {urdf_path}")
+                
+                # 使用 _urdf_path_for_isaac 处理 .000.urdf 等特殊扩展名
+                asset_root, asset_file = _urdf_path_for_isaac(urdf_path)
+                
+                try:
+                    asset = self.gym.load_asset(self.sim, asset_root, asset_file, asset_options)
+                except Exception as e:
+                    raise RuntimeError(f"Failed to load asset from {urdf_path} (processed as {asset_file}): {str(e)}")
+                
+                if asset is None:
+                    raise RuntimeError(f"Asset loading returned None for {urdf_path} (processed as {asset_file})")
+                
                 self.objs_assets[asset_cache_key] = asset
             
             # 2. 设置初始 Pose（轨迹已是 Gym 坐标系）
@@ -1245,6 +1283,14 @@ class DexHandManipBiHEnv(VecTask):
             # 4.1 设置质量 (Rigid Body Properties)
             body_props = self.gym.get_actor_rigid_body_properties(env_ptr, handle)
             
+            # 检查 body_props 是否为空
+            if len(body_props) == 0:
+                raise RuntimeError(
+                    f"Actor '{obj_name}_{side}_{k}' (handle={handle}) has no rigid bodies. "
+                    f"This usually means the asset failed to load or the URDF is invalid. "
+                    f"URDF path: {urdf_path}"
+                )
+            
             original_mass = body_props[0].mass
             # import pdb; pdb.set_trace()
             new_mass = max(0.1, min(0.5, original_mass)) # 限制质量范围
@@ -1256,11 +1302,15 @@ class DexHandManipBiHEnv(VecTask):
             # 4.2 设置摩擦力 (Rigid Shape Properties)
             shape_props = self.gym.get_actor_rigid_shape_properties(env_ptr, handle)
             # 通常一个 actor 可能有多个 shape，这里假设统一设置
-            for shape_prop in shape_props:
-                shape_prop.friction = 3.0  # 初始摩擦力，VecTask 的自适应逻辑会在第一次 randomization 时根据配置覆盖此值
-                shape_prop.rolling_friction = 0.05 # 推荐加一点防止无限滚动
-                shape_prop.torsion_friction = 0.05 
-            self.gym.set_actor_rigid_shape_properties(env_ptr, handle, shape_props)
+            if len(shape_props) == 0:
+                if i == 0:
+                    print(f"[WARNING] Actor '{obj_name}_{side}_{k}' has no rigid shapes")
+            else:
+                for shape_prop in shape_props:
+                    shape_prop.friction = 3.0  # 初始摩擦力，VecTask 的自适应逻辑会在第一次 randomization 时根据配置覆盖此值
+                    shape_prop.rolling_friction = 0.05 # 推荐加一点防止无限滚动
+                    shape_prop.torsion_friction = 0.05 
+                self.gym.set_actor_rigid_shape_properties(env_ptr, handle, shape_props)
             
             # 5. 记录数据
             handles.append(handle)

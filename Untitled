@@ -1,0 +1,9 @@
+[Error] [carb.gym.plugin] *** Unable to guess asset format: Unrecognized extension '.000.urdf' 
+                   
+  File "/GPFS/data/shengyin-1/humanoid/Maniptrans_YS/maniptrans_envs/lib/envs/tasks/dexhandmanip_bih.py", line 1014, in _create_envs
+    env_objs_rh, env_mass_rh, env_com_rh, env_is_static_rh = self._create_scene_objects(env_ptr, i, side="rh")
+  File "/GPFS/data/shengyin-1/humanoid/Maniptrans_YS/maniptrans_envs/lib/envs/tasks/dexhandmanip_bih.py", line 1248, in _create_scene_objects
+    original_mass = body_props[0].mass                                                               
+IndexError: list index out of range                         
+
+为什么
