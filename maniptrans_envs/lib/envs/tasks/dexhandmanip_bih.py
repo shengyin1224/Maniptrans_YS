@@ -2784,13 +2784,6 @@ class DexHandManipBiHEnv(VecTask):
         opt_wrist_vel = side_demo_data["opt_wrist_velocity"][env_ids, seq_idx]
         opt_wrist_ang_vel = side_demo_data["opt_wrist_angular_velocity"][env_ids, seq_idx]
 
-        # 确保所有张量都是2维的，避免维度不匹配（参考第1930行的处理方式）
-        num_reset = len(env_ids)
-        opt_wrist_pos = opt_wrist_pos.view(num_reset, 3)
-        opt_wrist_rot = opt_wrist_rot.view(num_reset, 4)
-        opt_wrist_vel = opt_wrist_vel.view(num_reset, 3)
-        opt_wrist_ang_vel = opt_wrist_ang_vel.view(num_reset, 3)
-
         opt_hand_pose_vel = torch.concat([opt_wrist_pos, opt_wrist_rot, opt_wrist_vel, opt_wrist_ang_vel], dim=-1)
 
         getattr(self, f"_{side}_base_state")[env_ids, :] = opt_hand_pose_vel
