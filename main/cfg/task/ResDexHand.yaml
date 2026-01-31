@@ -9,7 +9,7 @@ env:
   numEnvs: ${resolve_default:8192,${...num_envs}}
   dexhand: ${...dexhand}
 
-  episodeLength: 1200
+  episodeLength: 2000
   training: ${if:${...test},False,True}
 
   usePIDControl: ${...usePIDControl}
