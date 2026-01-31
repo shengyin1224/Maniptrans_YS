@@ -2,6 +2,7 @@ import math
 import os
 import pickle
 import copy
+import shutil
 import imageio
 import xml.etree.ElementTree as ET
 from isaacgym import gymapi, gymtorch, gymutil
@@ -63,6 +64,29 @@ def pack_data(data, dexhand):
 
 def soft_clamp(x, lower, upper):
     return lower + torch.sigmoid(4 / (upper - lower) * (x - (lower + upper) / 2)) * (upper - lower)
+
+
+def _urdf_path_for_isaac(urdf_path):
+    """
+    Isaac Gym 只识别扩展名为 .urdf 的文件；对 name.000.urdf / name.001.urdf 会报
+    "Unrecognized extension '.000.urdf'"。将此类路径转为同目录下仅含一个点的文件名
+    (如 name_000.urdf)，复制后返回 (asset_root, asset_file) 供 load_asset 使用。
+    同品类多实例用 .000/.001 区分时，必须经过此转换才能被 Isaac 加载。
+    """
+    root, filename = os.path.split(urdf_path)
+    base, ext = os.path.splitext(filename)  # e.g. ("clothes_hanger.000", ".urdf")
+    if ext.lower() != ".urdf":
+        return root, filename
+    # 若 base 中还包含点（如 clothes_hanger.000），Isaac 会误判扩展名
+    if "." in base:
+        # 改为下划线：clothes_hanger.000 -> clothes_hanger_000，保证扩展名仅为 .urdf
+        safe_base = base.replace(".", "_")
+        safe_filename = safe_base + ".urdf"
+        safe_path = os.path.join(root, safe_filename)
+        if safe_path != urdf_path:
+            shutil.copy2(urdf_path, safe_path)
+        return root, safe_filename
+    return root, filename
 
 
 class Mano2Dexhand:
@@ -292,7 +316,9 @@ class Mano2Dexhand:
             asset_options.disable_gravity = True
             asset_options.density = 200
             
-            current_asset = self.gym.load_asset(self.sim, *os.path.split(obj_info['urdf']), asset_options)
+            # Isaac Gym 不识别 .000.urdf / .001.urdf，需转为 name_000.urdf 等再加载
+            asset_root, asset_file = _urdf_path_for_isaac(obj_info['urdf'])
+            current_asset = self.gym.load_asset(self.sim, asset_root, asset_file, asset_options)
             
             rigid_shape_props_asset = self.gym.get_asset_rigid_shape_properties(current_asset)
             for element in rigid_shape_props_asset:
