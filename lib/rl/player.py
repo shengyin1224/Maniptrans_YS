@@ -399,6 +399,8 @@ class MyBasePlayer(object):
 
         cr = torch.zeros(batch_size, dtype=torch.float32)
         steps = torch.zeros(batch_size, dtype=torch.float32)
+        # optional: env-provided "absolute progress" (e.g. demo frame index)
+        frame_steps = torch.zeros(batch_size, dtype=torch.float32)
 
         done = None
 
@@ -484,8 +486,10 @@ class MyBasePlayer(object):
 
             if "total_rewards" in info:
                 cr = torch.max(cr, info["total_rewards"].to(cr.device))
+            # Some envs provide an absolute step/progress counter (e.g. demo frame index) via info["total_steps"].
+            # Keep it separate from "steps" (episode length) to avoid confusion in prints.
             if "total_steps" in info:
-                steps = torch.max(steps, info["total_steps"].to(steps.device))
+                frame_steps = torch.max(frame_steps, info["total_steps"].to(frame_steps.device))
 
             if render:
                 self.env.render(mode="human")
@@ -511,7 +515,14 @@ class MyBasePlayer(object):
                     cur_rewards_done = cur_rewards / done_count
                     cur_steps_done = cur_steps / done_count
                     success_count = prev_success_buf[done_indices].sum().item()
-                    print(f"reward: {cur_rewards_done:.2f} steps: {cur_steps_done:.1f}")
+                    if "total_steps" in info:
+                        # mean absolute progress (e.g. demo frame idx) for done envs
+                        cur_frame_steps_done = frame_steps[done_indices].sum().item() / done_count
+                        print(
+                            f"reward: {cur_rewards_done:.2f} steps: {cur_steps_done:.1f} frames: {cur_frame_steps_done:.1f}"
+                        )
+                    else:
+                        print(f"reward: {cur_rewards_done:.2f} steps: {cur_steps_done:.1f}")
                     if success_count > 0:
                         print("success")
 

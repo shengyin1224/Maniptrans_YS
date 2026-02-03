@@ -85,7 +85,8 @@ class DexHandManipBiHEnv(VecTask):
         self.max_episode_length = self.cfg["env"]["episodeLength"]
         self.action_scale = self.cfg["env"]["actionScale"]
         # self.dexhand_rh_dof_noise = self.cfg["env"]["dexhand_rDofNoise"]
-        self.aggregate_mode = self.cfg["env"]["aggregateMode"]
+        self.aggregate_mode = 0
+        # self.aggregate_mode = self.cfg["env"]["aggregateMode"]
         self.training = self.cfg["env"]["training"]
         self.dexhand_rh = DexHandFactory.create_hand(self.cfg["env"]["dexhand"], "right")
         self.dexhand_lh = DexHandFactory.create_hand(self.cfg["env"]["dexhand"], "left")
@@ -950,8 +951,22 @@ class DexHandManipBiHEnv(VecTask):
         # 聚合组大小 = 机器人 + 桌子 + 所有物体的 Body/Shape 总数
         # 预估最大物体数量（双手的物体，每个物体预留 5 个 Shape/Body 冗余）
         max_objs = self.num_objs_per_env
-        max_agg_bodies = num_dexhand_rh_bodies + num_dexhand_lh_bodies + 1 + 2 * max_objs * 5 
-        max_agg_shapes = num_dexhand_rh_shapes + num_dexhand_lh_shapes + 1 + 2 * max_objs * 5
+        # 动态计算 Asset 真实的 Body 和 Shape 数量
+        max_body_per_obj = 0
+        max_shape_per_obj = 0
+        for asset in self.objs_assets.values():
+            max_body_per_obj = max(max_body_per_obj, self.gym.get_asset_rigid_body_count(asset))
+            max_shape_per_obj = max(max_shape_per_obj, self.gym.get_asset_rigid_shape_count(asset))
+
+        # 重新计算聚合组配额，并预留 20 个单位的冗余空间
+        max_agg_bodies = (num_dexhand_rh_bodies + num_dexhand_lh_bodies + 2 + 
+                        self.num_objs_per_env * max_body_per_obj + 20)
+        max_agg_shapes = (num_dexhand_rh_shapes + num_dexhand_lh_shapes + 2 + 
+                        self.num_objs_per_env * max_shape_per_obj + 20)
+        self.max_agg_bodies = max_agg_bodies
+        self.max_agg_shapes = max_agg_shapes
+        # max_agg_bodies = num_dexhand_rh_bodies + num_dexhand_lh_bodies + 1 + 2 * max_objs * 5 
+        # max_agg_shapes = num_dexhand_rh_shapes + num_dexhand_lh_shapes + 1 + 2 * max_objs * 5
 
         # 初始化容器
         self.dexhand_rs = []
@@ -1812,7 +1827,11 @@ class DexHandManipBiHEnv(VecTask):
             if torch.isnan(lh_obj_states).any():
                 nan_envs = torch.where(torch.isnan(lh_obj_states).any(dim=-1).any(dim=-1))[0]
                 print(f"左侧故障环境 IDs: {nan_envs.tolist()}")
-            import pdb; pdb.set_trace()
+
+            if self.training:
+                import pdb; pdb.set_trace()
+            else:
+                raise RuntimeError("Physics simulation generated NaN values.")
 
         self.rh_states.update(
             {
@@ -4465,60 +4484,60 @@ class DexHandManipBiHEnv(VecTask):
         self.compute_reward(self.actions)
 
         # [新增] 在测试模式下输出 wrist 的线速度和角速度，以及与 reference 的误差 (仅对环境 0)
-        if not self.training:
-            # 1. 获取当前索引
-            cur_idx = torch.clamp(self.progress_buf, torch.zeros_like(self.demo_data_rh["seq_len"]), self.demo_data_rh["seq_len"] - 1)
-            e0 = 0 # Env 0
+        # if not self.training:
+        #     # 1. 获取当前索引
+        #     cur_idx = torch.clamp(self.progress_buf, torch.zeros_like(self.demo_data_rh["seq_len"]), self.demo_data_rh["seq_len"] - 1)
+        #     e0 = 0 # Env 0
 
-            # 2. 获取当前状态 (Env 0)
-            # base_state 包含: pos(3), quat(4), vel(3), ang_vel(3)
-            rh_pos = self.rh_states["base_state"][e0, :3]
-            rh_quat = self.rh_states["base_state"][e0, 3:7]
-            rh_vel = self.rh_states["base_state"][e0, 7:10]
-            rh_ang_vel = self.rh_states["base_state"][e0, 10:13]
+        #     # 2. 获取当前状态 (Env 0)
+        #     # base_state 包含: pos(3), quat(4), vel(3), ang_vel(3)
+        #     rh_pos = self.rh_states["base_state"][e0, :3]
+        #     rh_quat = self.rh_states["base_state"][e0, 3:7]
+        #     rh_vel = self.rh_states["base_state"][e0, 7:10]
+        #     rh_ang_vel = self.rh_states["base_state"][e0, 10:13]
 
-            lh_pos = self.lh_states["base_state"][e0, :3]
-            lh_quat = self.lh_states["base_state"][e0, 3:7]
-            lh_vel = self.lh_states["base_state"][e0, 7:10]
-            lh_ang_vel = self.lh_states["base_state"][e0, 10:13]
+        #     lh_pos = self.lh_states["base_state"][e0, :3]
+        #     lh_quat = self.lh_states["base_state"][e0, 3:7]
+        #     lh_vel = self.lh_states["base_state"][e0, 7:10]
+        #     lh_ang_vel = self.lh_states["base_state"][e0, 10:13]
 
-            # 3. 获取目标状态 (Env 0)
-            rh_target_pos = self.demo_data_rh["wrist_pos"][e0, cur_idx[e0]]
-            rh_target_aa = self.demo_data_rh["wrist_rot"][e0, cur_idx[e0]]
-            rh_target_quat = aa_to_quat(rh_target_aa.view(1, 3))[:, [1, 2, 3, 0]].view(4)
-            rh_target_vel = self.demo_data_rh["wrist_velocity"][e0, cur_idx[e0]]
-            rh_target_ang_vel = self.demo_data_rh["wrist_angular_velocity"][e0, cur_idx[e0]]
+        #     # 3. 获取目标状态 (Env 0)
+        #     rh_target_pos = self.demo_data_rh["wrist_pos"][e0, cur_idx[e0]]
+        #     rh_target_aa = self.demo_data_rh["wrist_rot"][e0, cur_idx[e0]]
+        #     rh_target_quat = aa_to_quat(rh_target_aa.view(1, 3))[:, [1, 2, 3, 0]].view(4)
+        #     rh_target_vel = self.demo_data_rh["wrist_velocity"][e0, cur_idx[e0]]
+        #     rh_target_ang_vel = self.demo_data_rh["wrist_angular_velocity"][e0, cur_idx[e0]]
 
-            lh_target_pos = self.demo_data_lh["wrist_pos"][e0, cur_idx[e0]]
-            lh_target_aa = self.demo_data_lh["wrist_rot"][e0, cur_idx[e0]]
-            lh_target_quat = aa_to_quat(lh_target_aa.view(1, 3))[:, [1, 2, 3, 0]].view(4)
-            lh_target_vel = self.demo_data_lh["wrist_velocity"][e0, cur_idx[e0]]
-            lh_target_ang_vel = self.demo_data_lh["wrist_angular_velocity"][e0, cur_idx[e0]]
+        #     lh_target_pos = self.demo_data_lh["wrist_pos"][e0, cur_idx[e0]]
+        #     lh_target_aa = self.demo_data_lh["wrist_rot"][e0, cur_idx[e0]]
+        #     lh_target_quat = aa_to_quat(lh_target_aa.view(1, 3))[:, [1, 2, 3, 0]].view(4)
+        #     lh_target_vel = self.demo_data_lh["wrist_velocity"][e0, cur_idx[e0]]
+        #     lh_target_ang_vel = self.demo_data_lh["wrist_angular_velocity"][e0, cur_idx[e0]]
 
-            # 4. 计算误差 (与 compute_imitation_reward 逻辑一致)
-            # Position Error (Norm)
-            rh_pos_err = torch.norm(rh_target_pos - rh_pos).item()
-            lh_pos_err = torch.norm(lh_target_pos - lh_pos).item()
+        #     # 4. 计算误差 (与 compute_imitation_reward 逻辑一致)
+        #     # Position Error (Norm)
+        #     rh_pos_err = torch.norm(rh_target_pos - rh_pos).item()
+        #     lh_pos_err = torch.norm(lh_target_pos - lh_pos).item()
 
-            # Rotation Error (Angle in degrees)
-            rh_rot_diff = quat_mul(rh_target_quat.view(1, 4), quat_conjugate(rh_quat.view(1, 4)))
-            rh_rot_err = (quat_to_angle_axis(rh_rot_diff)[0].abs() / np.pi * 180).item()
-            lh_rot_diff = quat_mul(lh_target_quat.view(1, 4), quat_conjugate(lh_quat.view(1, 4)))
-            lh_rot_err = (quat_to_angle_axis(lh_rot_diff)[0].abs() / np.pi * 180).item()
+        #     # Rotation Error (Angle in degrees)
+        #     rh_rot_diff = quat_mul(rh_target_quat.view(1, 4), quat_conjugate(rh_quat.view(1, 4)))
+        #     rh_rot_err = (quat_to_angle_axis(rh_rot_diff)[0].abs() / np.pi * 180).item()
+        #     lh_rot_diff = quat_mul(lh_target_quat.view(1, 4), quat_conjugate(lh_quat.view(1, 4)))
+        #     lh_rot_err = (quat_to_angle_axis(lh_rot_diff)[0].abs() / np.pi * 180).item()
 
-            # Velocity Error (Mean Absolute Error)
-            rh_vel_err = (rh_target_vel - rh_vel).abs().mean().item()
-            lh_vel_err = (lh_target_vel - lh_vel).abs().mean().item()
+        #     # Velocity Error (Mean Absolute Error)
+        #     rh_vel_err = (rh_target_vel - rh_vel).abs().mean().item()
+        #     lh_vel_err = (lh_target_vel - lh_vel).abs().mean().item()
 
-            # Angular Velocity Error (Mean Absolute Error)
-            rh_ang_vel_err = (rh_target_ang_vel - rh_ang_vel).abs().mean().item()
-            lh_ang_vel_err = (lh_target_ang_vel - lh_ang_vel).abs().mean().item()
+        #     # Angular Velocity Error (Mean Absolute Error)
+        #     rh_ang_vel_err = (rh_target_ang_vel - rh_ang_vel).abs().mean().item()
+        #     lh_ang_vel_err = (lh_target_ang_vel - lh_ang_vel).abs().mean().item()
 
-            print(f"Step {self.progress_buf[0].item()}:")
-            print(f"  [RH Wrist] LinVel: {rh_vel.cpu().numpy()}, AngVel: {rh_ang_vel.cpu().numpy()}")
-            print(f"             ERR: pos={rh_pos_err:.4f}m, rot={rh_rot_err:.2f}deg, vel={rh_vel_err:.4f}, ang_vel={rh_ang_vel_err:.4f}")
-            print(f"  [LH Wrist] LinVel: {lh_vel.cpu().numpy()}, AngVel: {lh_ang_vel.cpu().numpy()}")
-            print(f"             ERR: pos={lh_pos_err:.4f}m, rot={lh_rot_err:.2f}deg, vel={lh_vel_err:.4f}, ang_vel={lh_ang_vel_err:.4f}")
+        #     print(f"Step {self.progress_buf[0].item()}:")
+        #     print(f"  [RH Wrist] LinVel: {rh_vel.cpu().numpy()}, AngVel: {rh_ang_vel.cpu().numpy()}")
+        #     print(f"             ERR: pos={rh_pos_err:.4f}m, rot={rh_rot_err:.2f}deg, vel={rh_vel_err:.4f}, ang_vel={rh_ang_vel_err:.4f}")
+        #     print(f"  [LH Wrist] LinVel: {lh_vel.cpu().numpy()}, AngVel: {lh_ang_vel.cpu().numpy()}")∂
+        #     print(f"             ERR: pos={lh_pos_err:.4f}m, rot={lh_rot_err:.2f}deg, vel={lh_vel_err:.4f}, ang_vel={lh_ang_vel_err:.4f}")
 
         self.progress_buf += 1
         self.running_progress_buf += 1

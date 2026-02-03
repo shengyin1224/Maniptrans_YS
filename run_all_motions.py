@@ -76,7 +76,7 @@ def run_tests():
             "task=ResDexHand",
             "dexhand=inspire",
             "side=BiH",
-            "num_envs=4",
+            "num_envs=64",
             "learning_rate=2e-4",
             "rh_base_model_checkpoint=assets/imitator_rh_inspire.pth",
             "lh_base_model_checkpoint=assets/imitator_lh_inspire.pth",
@@ -94,15 +94,15 @@ def run_tests():
             ("FIXED_INIT", base_cmd + [
                 "randomStateInit=False", 
                 "save_successful_rollouts_only=True", 
-                "num_rollouts_to_save=10", 
-                "num_rollouts_to_run=100", 
+                "num_rollouts_to_save=3", 
+                "num_rollouts_to_run=300", 
                 f"experiment={motion_name_base}_fixed"
             ]),
             ("RANDOM_INIT", base_cmd + [
                 "randomStateInit=True", 
                 "save_successful_rollouts_only=False", 
                 "num_rollouts_to_save=20", 
-                "num_rollouts_to_run=300", 
+                "num_rollouts_to_run=200", 
                 f"experiment={motion_name_base}_random"
             ])
         ]
