@@ -32,19 +32,20 @@ class Xhand(DexHand, ABC):
             "hand_thumb_rota_link2",
             "hand_thumb_rota_tip",
         ]
+        # Order matches Isaac Gym DOF order from vendor URDF XHAND1 (thumb → index → mid → ring → pinky).
         self.dof_names = [
+            "hand_thumb_bend_joint",
+            "hand_thumb_rota_joint1",
+            "hand_thumb_rota_joint2",
             "hand_index_bend_joint",
             "hand_index_joint1",
             "hand_index_joint2",
             "hand_mid_joint1",
             "hand_mid_joint2",
-            "hand_pinky_joint1",
-            "hand_pinky_joint2",
             "hand_ring_joint1",
             "hand_ring_joint2",
-            "hand_thumb_bend_joint",
-            "hand_thumb_rota_joint1",
-            "hand_thumb_rota_joint2",
+            "hand_pinky_joint1",
+            "hand_pinky_joint2",
         ]
         self.hand2dex_mapping = {
             "wrist": ["hand_link"],  # ! MUST only have one element

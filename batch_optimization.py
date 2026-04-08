@@ -20,21 +20,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # --- 配置数据 (保持原样) ---
 MISSING_FROM_BOTH_15 = [
-    "drinking_from_mug1_and_talking-879",
-    "getting_off_bed_and_touch_table_lamp_then_grasp_clothes_from_clothes_rack-752",
-    "move_clothes_rack_with_both_hands-840",
     "organizing_and_transfering_utensils_to_draw_organizer_tray-489",
-    "pour_from_vacuum_flask_and_peel_and_cut_mango-117",
-    "sitting_on_working_chair_at_table_working_with_laptop_drinking_coffee_with_mug_in_left_hand-176",
-    "transfer_deep_plate_side_plate_and_serving_bowl_to_table_with_both_hands-922",
-    "transfer_from_woven_basket_to_wash_tub-105",
-    "transfer_mango_and_plastic_bowl_from_side_table_and_basket-017",
-    "transfer_mug_and_side_plate_from_side_table_to_utility_cart_and_return-980",
-    "turning_working_chair_right_with_right_foot_three_times-209",
-    "walk_with_low_chair-308",
-    "walking_back_and_forth_while_pushing_the_clothes_rack_with_right_hand_then_left_hand-594",
-    "walking_back_and_forth_with_the_draw_organizer_tray_in_right_hand_while_raising_then_switching_hands-867",
-    "working_with_laptop_and_drinking_coffee_with_right_hand-870",
 ]
 
 MISSING_OUTPUT_LOG = os.path.join(BASE_DIR, "batch_optimization_missing_outputs.log")
@@ -51,13 +37,13 @@ COMPLETED_DATA_INDICES = []
 # --- 路径辅助函数 ---
 
 def get_expected_output_paths(data_idx: str):
-    lh = os.path.join(BASE_DIR, "data", "retargeting", "Humoto", "mano2inspire_lh", f"{data_idx}.pkl")
-    rh = os.path.join(BASE_DIR, "data", "retargeting", "Humoto", "mano2inspire_rh", f"{data_idx}.pkl")
+    lh = os.path.join(BASE_DIR, "data", "retargeting", "Humoto", "mano2xhand_lh", f"{data_idx}.pkl")
+    rh = os.path.join(BASE_DIR, "data", "retargeting", "Humoto", "mano2xhand_rh", f"{data_idx}.pkl")
     return lh, rh
 
 def get_stage1_path(data_idx: str, side: str):
     side_abbr = "lh" if side == "left" else "rh"
-    return os.path.join(BASE_DIR, "data", "retargeting", "Humoto", f"mano2inspire_{side_abbr}", f"{data_idx}_stage1_nocontact.pkl")
+    return os.path.join(BASE_DIR, "data", "retargeting", "Humoto", f"mano2xhand_{side_abbr}", f"{data_idx}_stage1_nocontact.pkl")
 
 def check_stage1_file_exists(data_idx: str, side: str):
     stage1_path = get_stage1_path(data_idx, side)
@@ -117,7 +103,7 @@ def run_single_hand_pipeline(data_idx: str, side: str, gpu_id: int) -> bool:
     base_cmd = [
         "python", "main/dataset/mano2dexhand_segmented.py",
         "--data_idx", data_idx,
-        "--dexhand", "inspire",
+        "--dexhand", "xhand",
         "--iter", "15000",
         "--headless",
         "--draw_all_lines", "0",

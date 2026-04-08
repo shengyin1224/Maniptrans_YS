@@ -166,7 +166,7 @@ class Mano2Dexhand:
         asset_options.default_dof_drive_mode = gymapi.DOF_MODE_POS
         dexhand_asset = self.gym.load_asset(self.sim, asset_root, asset_file, asset_options)
 
-        self.chain = pk.build_chain_from_urdf(open(os.path.join(asset_root, asset_file)).read())
+        self.chain = pk.build_chain_from_urdf(open(os.path.join(asset_root, asset_file), 'rb').read())
         self.chain = self.chain.to(dtype=torch.float32, device=self.sim_device)
 
         # 配置机器人关节参数

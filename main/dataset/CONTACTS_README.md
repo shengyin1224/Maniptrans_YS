@@ -34,10 +34,10 @@ python main/dataset/compute_hand_object_contacts.py \
     --output_dir "data/contacts_right"
 
 python main/dataset/compute_hand_object_contacts.py \
-    --data_idx "peel_mango_with_peeler_by_rotating_mango_in_left_hand_from_left-855" \
+    --data_idx "organizing_and_transfering_utensils_to_draw_organizer_tray-489" \
     --dexhand "inspire" \
     --side "left" \
-    --threshold 0.005 \
+    --threshold 0.03 \
     --output_dir "data/contacts_left"
 ```
 
