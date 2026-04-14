@@ -206,10 +206,10 @@ def transform_object_points(object_points_local, object_pose):
     return points_transformed[:, :3]
 
 
-def analyze_motion_contacts(data_idx, dexhand, side="right", device="cuda:0", contact_threshold=0.005, num_object_points=5000):
+def analyze_motion_contacts(data_idx, dexhand, side="right", device="cuda:0", contact_threshold=0.005, num_object_points=5000, data_dir=None):
     """
     分析一个motion的所有帧的手-物体接触
-    
+
     Args:
         data_idx: 数据索引
         dexhand: 手部模型
@@ -217,14 +217,19 @@ def analyze_motion_contacts(data_idx, dexhand, side="right", device="cuda:0", co
         device: 计算设备
         contact_threshold: 接触距离阈值（米）
         num_object_points: 物体点云采样数量
-    
+        data_dir: 数据目录（None 时使用各数据集默认路径）
+
     Returns:
         results: Dict，包含所有帧的接触信息
     """
     # 加载数据
     dataset_type = ManipDataFactory.dataset_type(data_idx)
     cprint(f"Loading {dataset_type} data: {data_idx} (side: {side})", "cyan")
-    
+
+    extra_kwargs = {}
+    if data_dir is not None:
+        extra_kwargs["data_dir"] = data_dir
+
     demo_d = ManipDataFactory.create_data(
         manipdata_type=dataset_type,
         side=side,
@@ -232,6 +237,7 @@ def analyze_motion_contacts(data_idx, dexhand, side="right", device="cuda:0", co
         mujoco2gym_transf=torch.eye(4, device=device),
         dexhand=dexhand,
         verbose=False,
+        **extra_kwargs,
     )
     
     demo_data = pack_data([demo_d[data_idx]], dexhand)
@@ -244,14 +250,14 @@ def analyze_motion_contacts(data_idx, dexhand, side="right", device="cuda:0", co
     mujoco2gym_transf[:3, :3] = aa_to_rotmat(np.array([0, 0, -np.pi / 2])) @ aa_to_rotmat(
         np.array([np.pi / 2, 0, 0])
     )
-    
+
     # 根据数据集类型设置平移
     if dataset_type == "humoto":
         mujoco2gym_transf[:3, 3] = np.array([0, 0, 0])
     else:
         table_surface_z = 0.4 + 0.015  # table_pos.z + table_half_height
         mujoco2gym_transf[:3, 3] = np.array([0, 0, table_surface_z])
-    
+
     mujoco2gym_transf = torch.tensor(mujoco2gym_transf, device=device, dtype=torch.float32)
     
     # 转换手部位置到世界坐标系
@@ -421,12 +427,13 @@ if __name__ == "__main__":
     parser.add_argument("--device", type=str, default="cuda:0", help="Device")
     parser.add_argument("--output_dir", type=str, default="data/contacts", help="Output directory")
     parser.add_argument("--headless", action="store_true", help="Run in headless mode")
-    
+    parser.add_argument("--data_dir", type=str, default=None, help="Data directory (overrides dataset default)")
+
     args = parser.parse_args()
-    
+
     # 创建 dexhand 模型（用于获取手部关节名称）
     dexhand = DexHandFactory.create_hand(args.dexhand, args.side)
-    
+
     # 分析接触
     results = analyze_motion_contacts(
         data_idx=args.data_idx,
@@ -434,15 +441,17 @@ if __name__ == "__main__":
         side=args.side,
         device=args.device,
         contact_threshold=args.threshold,
-        num_object_points=args.num_points
+        num_object_points=args.num_points,
+        data_dir=args.data_dir,
     )
     
     # 打印摘要
     print_contact_summary(results)
     
-    # 保存结果
+    # 保存结果，按左右手分目录存放
     dataset_type = results['dataset_type']
-    output_path = os.path.join(args.output_dir, dataset_type, f"contacts_{args.data_idx}.pkl")
+    side_dir = f"contacts_{args.side}"   # contacts_left / contacts_right
+    output_path = os.path.join(args.output_dir, side_dir, dataset_type, f"contacts_{args.data_idx}.pkl")
     save_results(results, output_path)
     
     cprint("\nDone!", "green", attrs=['bold'])

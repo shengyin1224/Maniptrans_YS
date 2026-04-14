@@ -29,13 +29,14 @@ RESULTS_DIR = RUNS_ROOT
 RESULTS_FILE_PREFIX = "run_all_motions_results"
 # Physics NaN 错误关键词，用于检测并触发 num_envs 重试（最多 3 次）
 NAN_ERROR_MARKER = "Physics simulation generated NaN values."
-MAX_NAN_ATTEMPTS = 3
-NUM_ENVS_RETRIES = [16, 4, 4]  # 三次尝试依次使用的 num_envs
+MAX_NAN_ATTEMPTS = 10
+NUM_ENVS_RETRIES = [16, 4, 4, 4, 4, 4, 4, 4, 4, 4]  # 三次尝试依次使用的 num_envs
 
 _RUN_START_TS = None  # 在 main() 中设置，用于只清理本次运行期间产生的 dumps
 _TRACK_LOCK = threading.Lock()
 _SEEN_EXPERIMENTS = set()  # 记录本次运行中出现过的 experiment 名称（fixed/random 各自算一个）
 _KEEP_DUMP_DIR = {}  # exp_name -> dump_dir（仅保留本次运行里“最终要留”的一个）
+_CHECKPOINT_OVERRIDE = {}  # key: f"{motion_key}|||{subfolder}" -> 绝对路径 checkpoint.pth
 
 
 def _list_dump_dirs_for_experiment(exp_name: str):
@@ -154,6 +155,65 @@ def parse_motion_list(path):
     return out
 
 
+def parse_pth_files_list(path):
+    """
+    解析 pth_files_list.txt，返回 [(motion_key, subfolder), ...]
+    - 支持两部分：
+      1) 相对路径形式：0119_nerv/.../nn/xxx.pth
+      2) 绝对路径形式：/home/.../runs/.../nn/xxx.pth
+    - 每个 pth 后面紧跟一行: DataIndice: <motion_key>[  ...注释]
+    - subfolder 统一转换成相对 RUNS_ROOT 的路径，供 run_one_motion 使用：
+      os.path.join(RUNS_ROOT, subfolder) == 该 pth 所在子任务目录（nn 的父目录）
+    """
+    out = []
+    current_pth_dir = None  # nn 目录的父目录（task 子目录）
+    with open(path, "r", encoding="utf-8") as f:
+        for raw in f:
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            # pth 路径行
+            if line.endswith(".pth"):
+                pth_path = line
+                if not os.path.isabs(pth_path):
+                    pth_path = os.path.join(BASE_DIR, pth_path)
+                # 既支持 .../<task_dir>/nn/xxx.pth 也支持 .../<task_dir>/xxx.pth
+                pth_dir = os.path.dirname(pth_path)
+                if os.path.basename(pth_dir) == "nn":
+                    task_dir = os.path.dirname(pth_dir)
+                else:
+                    task_dir = pth_dir
+                current_pth_dir = (task_dir, pth_path)
+                continue
+            # DataIndice 行
+            if line.lower().startswith("dataindice"):
+                if current_pth_dir is None:
+                    continue
+                try:
+                    _, rest = line.split(":", 1)
+                    # 去掉注释，只取第一个 token 作为 motion_key
+                    rest = rest.strip()
+                    if "#" in rest:
+                        rest = rest.split("#", 1)[0].strip()
+                    motion_key = rest.split()[0] if rest else ""
+                    if not motion_key:
+                        continue
+                    task_dir, pth_path_abs = current_pth_dir
+                    # subfolder: task_dir 相对 RUNS_ROOT 的路径（可能带 ../）
+                    subfolder = os.path.relpath(task_dir, RUNS_ROOT)
+                    out.append((motion_key, subfolder))
+                    # 记录该 motion 的 checkpoint 绝对路径，run_one_motion 会优先使用
+                    key = f"{motion_key}|||{subfolder}"
+                    _CHECKPOINT_OVERRIDE[key] = pth_path_abs
+                except Exception:
+                    # 某一行解析失败就跳过，不影响其它条目
+                    pass
+                finally:
+                    current_pth_dir = None
+                continue
+    return out
+
+
 def get_latest_pth(nn_dir):
     """
     选择 checkpoint 规则：
@@ -233,22 +293,33 @@ def run_one_motion(motion_key, subfolder, gpu_id, result_lines, result_lock):
     """
     folder_path = os.path.join(RUNS_ROOT, subfolder)
     config_path = os.path.join(folder_path, "config.yaml")
-    nn_dir = os.path.join(folder_path, "nn")
 
-    if not os.path.isdir(nn_dir):
-        with result_lock:
-            line = f"{datetime.now().isoformat()}\t{motion_key}\t{subfolder}\tGPU{gpu_id}\tno_nn_dir\t-\t-\t-\t-\t-\n"
-            result_lines.append(line)
-        return
+    # 若在 pth_files_list.txt 中为该 motion 显式指定了 checkpoint，则优先使用该路径
+    override_key = f"{motion_key}|||{subfolder}"
+    checkpoint_override = _CHECKPOINT_OVERRIDE.get(override_key)
 
-    checkpoint_name = get_latest_pth(nn_dir)
-    if not checkpoint_name:
-        with result_lock:
-            line = f"{datetime.now().isoformat()}\t{motion_key}\t{subfolder}\tGPU{gpu_id}\tno_pth\t-\t-\t-\t-\t-\n"
-            result_lines.append(line)
-        return
+    checkpoint_path = None
+    checkpoint_name = None
 
-    checkpoint_path = os.path.join(nn_dir, checkpoint_name)
+    if checkpoint_override and os.path.isfile(checkpoint_override):
+        checkpoint_path = checkpoint_override
+        checkpoint_name = os.path.basename(checkpoint_path)
+    else:
+        nn_dir = os.path.join(folder_path, "nn")
+        if not os.path.isdir(nn_dir):
+            with result_lock:
+                line = f"{datetime.now().isoformat()}\t{motion_key}\t{subfolder}\tGPU{gpu_id}\tno_nn_dir\t-\t-\t-\t-\t-\n"
+                result_lines.append(line)
+            return
+
+        checkpoint_name = get_latest_pth(nn_dir)
+        if not checkpoint_name:
+            with result_lock:
+                line = f"{datetime.now().isoformat()}\t{motion_key}\t{subfolder}\tGPU{gpu_id}\tno_pth\t-\t-\t-\t-\t-\n"
+                result_lines.append(line)
+            return
+
+        checkpoint_path = os.path.join(nn_dir, checkpoint_name)
     # FLAG: ep >= 140*30*1024/num_envs，num_envs 从该子文件夹 config 读
     num_envs = get_num_envs(config_path)
     threshold = (140 * 30 * 1024) / num_envs
@@ -325,15 +396,16 @@ def run_one_motion(motion_key, subfolder, gpu_id, result_lines, result_lock):
 
         try:
             # 既要能检测 NaN（需要读取输出），又要让输出继续在终端可见
+            # 这里通过 PIPE 捕获 stdout+stderr，一边打印一边检查关键字
             saw_nan = False
             p = subprocess.Popen(
                 cmd,
                 cwd=BASE_DIR,
                 env=env,
-                # stdout=None 表示继承父进程的输出，即直接显示在终端
-                stdout=None,
-                stderr=None,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
                 text=True,
+                bufsize=1,
             )
             # 记录运行前已有的 dump，用来推断本次 phase 是否新产生了 dump
             before = set(_list_dump_dirs_for_experiment(exp_name))
@@ -476,16 +548,20 @@ def main():
         print(f"列表文件不存在: {args.list_file}")
         sys.exit(1)
 
+    # 1) 优先按老的 data_motions_*.txt 格式解析（带 '->'）
     motions = parse_motion_list(args.list_file)
+    # 2) 若解析不到，则尝试按 pth_files_list.txt 格式解析
     if not motions:
-        print("未解析到任何 data motion")
+        motions = parse_pth_files_list(args.list_file)
+    if not motions:
+        print("未解析到任何 data motion（既不是 data_motions_*.txt 也不是 pth_files_list.txt 格式）")
         sys.exit(0)
 
     num_gpus = args.num_gpus
     if num_gpus is None:
         cuda_dev = os.environ.get("CUDA_VISIBLE_DEVICES", "")
         if cuda_dev:
-            num_gpus = len(cuda_dev.split(","))
+            num_gpus = len([x for x in cuda_dev.split(",") if x.strip()])
         else:
             num_gpus = 1
     num_gpus = max(1, num_gpus)
