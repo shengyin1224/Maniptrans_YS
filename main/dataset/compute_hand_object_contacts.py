@@ -107,10 +107,9 @@ def load_object_point_clouds(scene_objects, num_points=1024, device="cpu"):
             mesh_obj = trimesh.load(mesh_path, force='mesh')
             mesh_obj.apply_scale(scale)
             
-            # 采样点云（相对于物体中心）
-            center = np.mean(mesh_obj.vertices, 0)
+            # 采样点云（保持相对于 URDF 原点的坐标，与物体 pose 对齐）
             object_points, _ = trimesh.sample.sample_surface_even(mesh_obj, count=num_points, seed=2024)
-            object_points = to_torch(object_points - center, device=device)
+            object_points = to_torch(object_points, device=device)
             
             # 如果采样点不足，重复填充
             while object_points.shape[0] < num_points:
