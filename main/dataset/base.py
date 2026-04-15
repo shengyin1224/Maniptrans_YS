@@ -41,11 +41,14 @@ class ManipData(Dataset, ABC):
         self.mujoco2gym_transf = mujoco2gym_transf
         self.max_seq_len = max_seq_len
 
-        # caculate contact
+        self._ch_dist = None  # lazy-initialized on first use
 
-        import chamfer_distance as chd
-
-        self.ch_dist = chd.ChamferDistance()
+    @property
+    def ch_dist(self):
+        if self._ch_dist is None:
+            import chamfer_distance as chd
+            self._ch_dist = chd.ChamferDistance()
+        return self._ch_dist
 
     def __len__(self):
         return len(self.data_pathes)

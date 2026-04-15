@@ -22,20 +22,16 @@ Z_UP_TO_Y_UP = np.array([
     [0, 0, 0, 1]
 ])
 
-# ==========================================
-# [新增补丁] 解决 NumPy 1.x 加载 NumPy 2.0+ pickle 的兼容性问题
-# ManipTrans 环境通常是 NumPy 1.x，而你的数据可能是用新环境生成的
-import sys
-try:
-    import numpy._core
-except ImportError:
-    # 如果当前环境没有 _core (说明是 NumPy 1.x)，手动映射一下
-    # 这样 pickle 加载时找 numpy._core 就会找到 numpy.core
-    sys.modules['numpy._core'] = np.core
-    from numpy import core
-    if hasattr(core, 'multiarray'):
-        sys.modules['numpy._core.multiarray'] = core.multiarray
-# ==========================================
+class NumpyCompatUnpickler(pickle.Unpickler):
+    """
+    兼容 NumPy 2.x 生成的 pkl 在 NumPy 1.x 环境中加载。
+    NumPy 2.x 将内部模块从 numpy.core 迁移到 numpy._core，
+    直接 pickle.load 会在 C 层 segfault，用此 Unpickler 在解析阶段重定向模块名。
+    """
+    def find_class(self, module, name):
+        if module.startswith('numpy._core'):
+            module = module.replace('numpy._core', 'numpy.core', 1)
+        return super().find_class(module, name)
 
 def load_one_humoto_sequence(
     data_path: str, 
@@ -96,9 +92,9 @@ def load_one_humoto_sequence(
     if not os.path.exists(pk_file_path):
         raise FileNotFoundError(f"Pickle file not found: {pk_file_path}")
     
-    # Load the main data
+    # Load the main data（兼容 NumPy 2.x 生成的 pkl 在 1.x 环境下加载）
     with open(pk_file_path, 'rb') as f:
-        data = pickle.load(f)
+        data = NumpyCompatUnpickler(f).load()
     
     # Validate required keys
     required_keys = ['armature', 'objects']
