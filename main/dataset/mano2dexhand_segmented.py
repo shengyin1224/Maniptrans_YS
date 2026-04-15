@@ -1135,6 +1135,12 @@ if __name__ == "__main__":
                 "default": None,
                 "help": "Path to stage1 pkl file (required when --stage=2)",
             },
+            {
+                "name": "--source_fps",
+                "type": int,
+                "default": 60,
+                "help": "Source data FPS (e.g. 30, 60, 120). Used to resample to target 60Hz.",
+            },
         ],
     )
 
@@ -1279,12 +1285,13 @@ if __name__ == "__main__":
             mujoco2gym_transf=torch.eye(4, device="cuda:0"),
             dexhand=dexhand,
             verbose=False,
+            source_fps=parser.source_fps,
         )
 
         demo_data = pack_data([demo_d[idx]], dexhand)
 
         total_frames = demo_data["mano_joints"].shape[0]
-        
+
         # Determine optimization range
         start_f = max(0, parser.start_frame)
         if parser.max_frames != -1:
@@ -1451,6 +1458,7 @@ if __name__ == "__main__":
             mujoco2gym_transf=torch.eye(4, device="cuda:0"),
             dexhand=dexhand,
             verbose=False,
+            source_fps=parser.source_fps,
         )
 
         demo_data = pack_data([demo_d[idx]], dexhand)
@@ -1609,6 +1617,7 @@ if __name__ == "__main__":
                     mujoco2gym_transf=torch.eye(4, device="cuda:0"),
                     dexhand=dexhand,
                     verbose=False,
+                    source_fps=parser.source_fps,
                 )
                 demo_data = pack_data([demo_d[idx]], dexhand)
                 dump_path = _get_dump_path(dataset_type, demo_data, dexhand, idx)
@@ -1623,6 +1632,7 @@ if __name__ == "__main__":
                 mujoco2gym_transf=torch.eye(4, device="cuda:0"),
                 dexhand=dexhand,
                 verbose=False,
+                source_fps=parser.source_fps,
             )
             demo_data = pack_data([demo_d[idx]], dexhand)
             dump_path = _get_dump_path(dataset_type, demo_data, dexhand, idx)
