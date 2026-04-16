@@ -153,6 +153,9 @@ class Mano2Dexhand:
         self.gym.add_ground(self.sim, plane_params)
         if not self.headless:
             self.viewer = self.gym.create_viewer(self.sim, gymapi.CameraProperties())
+            if self.viewer is None:
+                print("[WARNING] Viewer creation failed (no display?). Falling back to headless mode.")
+                self.headless = True
 
         # === 加载机器人 Asset ===
         asset_root = os.path.split(self.dexhand.urdf_path)[0]
@@ -686,7 +689,18 @@ class Mano2Dexhand:
     
     def fitting(self, max_iter, target_wrist_pos, target_wrist_rot, target_mano_joints, init_state=None):
         assert target_mano_joints.shape[0] == self.num_envs
-        
+
+        def _to_np(x):
+            if torch.is_tensor(x):
+                return x.detach().cpu().numpy()
+            return np.array(x)
+
+        print("\n[DBG] fitting() start")
+        print("[DBG] target_wrist_pos[0] pre-transform:", _to_np(target_wrist_pos[0]))
+        print("[DBG] target_wrist_rot[0] pre-transform:", _to_np(target_wrist_rot[0]))
+        print("[DBG] target_mano_joints[0] shape:", target_mano_joints[0].shape)
+        print("[DBG] target_mano_joints[0,:5] pre-transform:", _to_np(target_mano_joints[0, :5]))
+
         # 转换 Target 到 Gym 坐标系
         target_wrist_pos = (self.mujoco2gym_transf[:3, :3] @ target_wrist_pos.T).T + self.mujoco2gym_transf[:3, 3]
         origin_wrist_rot = aa_to_rotmat(target_wrist_rot)
