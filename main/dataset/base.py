@@ -390,15 +390,15 @@ class ManipData(Dataset, ABC):
         # data["opt_joints_velocity"] = self.compute_velocity(
         #     data["opt_joints_pos"], 1 / (120 / self.skip), guassian_filter=True
         # ) # ? only used for ablation study
-        if len(data["opt_wrist_pos"]) > self.max_seq_len:
-            data["opt_wrist_pos"] = data["opt_wrist_pos"][: self.max_seq_len]
-            data["opt_wrist_rot"] = data["opt_wrist_rot"][: self.max_seq_len]
-            data["opt_wrist_velocity"] = data["opt_wrist_velocity"][: self.max_seq_len]
-            data["opt_wrist_angular_velocity"] = data["opt_wrist_angular_velocity"][: self.max_seq_len]
-            data["opt_dof_pos"] = data["opt_dof_pos"][: self.max_seq_len]
-            data["opt_dof_velocity"] = data["opt_dof_velocity"][: self.max_seq_len]
-            # ? only used for ablation study
-            # data["opt_joints_pos"] = data["opt_joints_pos"][: self.max_seq_len]
-            # data["opt_joints_velocity"] = data["opt_joints_velocity"][: self.max_seq_len]
-
+        trunc = min(len(data["opt_wrist_pos"]), len(data["obj_trajectory"]), self.max_seq_len)
+        data["opt_wrist_pos"] = data["opt_wrist_pos"][:trunc]
+        data["opt_wrist_rot"] = data["opt_wrist_rot"][:trunc]
+        data["opt_wrist_velocity"] = data["opt_wrist_velocity"][:trunc]
+        data["opt_wrist_angular_velocity"] = data["opt_wrist_angular_velocity"][:trunc]
+        data["opt_dof_pos"] = data["opt_dof_pos"][:trunc]
+        data["opt_dof_velocity"] = data["opt_dof_velocity"][:trunc]
+        data["obj_trajectory"] = data["obj_trajectory"][:trunc]
+        # ? only used for ablation study
+        # data["opt_joints_pos"] = data["opt_joints_pos"][:trunc]
+        # data["opt_joints_velocity"] = data["opt_joints_velocity"][:trunc]
         assert len(data["opt_wrist_pos"]) == len(data["obj_trajectory"])

@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<robot name="shelf">
+  <link name="shelf_link">
+    <visual><origin xyz="0 0 0" rpy="0 0 0"/><geometry><mesh filename="shelf.obj" scale="1 1 1"/></geometry></visual>
+    <collision><origin xyz="0 0 0" rpy="0 0 0"/><geometry><mesh filename="shelf.obj" scale="1 1 1"/></geometry></collision>
+  </link>
+</robot>

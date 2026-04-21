@@ -83,7 +83,7 @@ class HumotoDatasetBase(ManipData):
         data_dir: str = "data/humoto", 
         split: str = "all",
         device="cuda:0",
-        human_model_json: str = "main/dataset/human_model/human_model_up_bone_yup.json", 
+        human_model_json: str = "main/dataset/human_model/human_model_take000_mixamorig_yup.json", 
         fix_orientation: bool = False, 
         fix_coordinate_system: bool = False,
         target_fps: int = 60,
@@ -223,7 +223,8 @@ class HumotoDatasetBase(ManipData):
              # 1.2 转换为矩阵并应用全局修正
              traj_tensor = self._quat_pos_to_mat_tensor(obj_data[:, :4], obj_data[:, 4:])
              traj_tensor = torch.matmul(self.global_fix_matrix, traj_tensor)
-             
+             traj_tensor = traj_tensor[::self.skip]
+
              # 1.3 获取 Mesh 并采样点云
              if obj_name in raw_data['object_models']:
                  verts_np, faces_np = raw_data['object_models'][obj_name]['mesh']
@@ -311,7 +312,7 @@ class HumotoDatasetBase(ManipData):
             else:
                 mano_joints[mano_k] = torch.zeros_like(wrist_pos)
 
-        # 4. 构造返回字典
+        # 4. 构造返回字典 (统一下采样到 60fps)
         data = {
             "data_path": pkl_path,
             # 兼容字段 (指向第一个物体)
@@ -321,10 +322,10 @@ class HumotoDatasetBase(ManipData):
             "obj_trajectory": scene_objects_info[0]["trajectory"] if scene_objects_info else torch.eye(4, device=self.device)[None],
             # 新增字段：包含所有物体
             "scene_objects": scene_objects_info,
-            "wrist_rot9": wrist_rot,
-            "wrist_pos": wrist_pos,
-            "wrist_rot": wrist_rot,
-            "mano_joints": mano_joints,
+            "wrist_rot9": wrist_rot[::self.skip],
+            "wrist_pos": wrist_pos[::self.skip],
+            "wrist_rot": wrist_rot[::self.skip],
+            "mano_joints": {k: v[::self.skip] for k, v in mano_joints.items()},
         }
 
         # 加载 Retargeting 数据
