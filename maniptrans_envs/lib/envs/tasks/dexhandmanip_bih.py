@@ -716,14 +716,46 @@ class DexHandManipBiHEnv(VecTask):
         print(f"Start loading unique data for {len(self.dataIndices)} tasks...")
         unique_data_lh_list = []
         unique_data_rh_list = []
+
+        def _tensor_len_or_neg1(x):
+            if isinstance(x, torch.Tensor):
+                return int(x.shape[0])
+            return -1
+
+        def _mano_len_or_neg1(sample):
+            mano = sample.get("mano_joints", None)
+            if isinstance(mano, dict) and len(mano) > 0:
+                first_joint = next(iter(mano.values()))
+                return _tensor_len_or_neg1(first_joint)
+            return -1
+
         for data_idx in self.dataIndices:
             dtype = ManipDataFactory.dataset_type(data_idx)
-            unique_data_lh_list.append(self.demo_dataset_lh_dict[dtype][data_idx])
-            unique_data_rh_list.append(self.demo_dataset_rh_dict[dtype][data_idx])
+            lh_item = self.demo_dataset_lh_dict[dtype][data_idx]
+            rh_item = self.demo_dataset_rh_dict[dtype][data_idx]
+            unique_data_lh_list.append(lh_item)
+            unique_data_rh_list.append(rh_item)
+
+            lh_wrist_len = _tensor_len_or_neg1(lh_item.get("wrist_pos", None))
+            rh_wrist_len = _tensor_len_or_neg1(rh_item.get("wrist_pos", None))
+            lh_mano_len = _mano_len_or_neg1(lh_item)
+            rh_mano_len = _mano_len_or_neg1(rh_item)
+            lh_obj_len = _tensor_len_or_neg1(lh_item.get("obj_trajectory", None))
+            rh_obj_len = _tensor_len_or_neg1(rh_item.get("obj_trajectory", None))
+            print(
+                f"[DATA LEN] idx={data_idx} | "
+                f"LH(wrist={lh_wrist_len}, mano={lh_mano_len}, obj={lh_obj_len}) | "
+                f"RH(wrist={rh_wrist_len}, mano={rh_mano_len}, obj={rh_obj_len})"
+            )
 
         print("Packing unique data to GPU...")
         packed_unique_lh = self.pack_data(unique_data_lh_list, side="lh")
         packed_unique_rh = self.pack_data(unique_data_rh_list, side="rh")
+        if "seq_len" in packed_unique_lh and "seq_len" in packed_unique_rh:
+            print(
+                f"[DATA LEN][PACKED] LH seq_len={packed_unique_lh['seq_len'].detach().cpu().tolist()} | "
+                f"RH seq_len={packed_unique_rh['seq_len'].detach().cpu().tolist()}"
+            )
 
         env_to_data_indices = torch.arange(self.num_envs, device=self.device, dtype=torch.long) % len(self.dataIndices)
 

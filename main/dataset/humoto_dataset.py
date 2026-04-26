@@ -83,11 +83,11 @@ class HumotoDatasetBase(ManipData):
         data_dir: str = "data/humoto", 
         split: str = "all",
         device="cuda:0",
-        human_model_json: str = "main/dataset/human_model/human_model_take000_mixamorig_yup.json", 
+        human_model_json: str = "main/dataset/human_model/human_model_take000_xiu_sp3all.json", 
         fix_orientation: bool = False, 
         fix_coordinate_system: bool = False,
         target_fps: int = 60,
-        source_fps: int = 30,
+        source_fps: int = 120,
         embodiment: str = None, 
         side: str = "right",
         **kwargs,
@@ -188,7 +188,12 @@ class HumotoDatasetBase(ManipData):
 
     def __getitem__(self, index):
         if isinstance(index, str):
-             idx = self.indices.get(index, 0)
+             if index not in self.indices:
+                 raise KeyError(
+                     f"HUMOTO index '{index}' not found in data_dir='{self.data_dir}'. "
+                     "Refusing to fall back to an unrelated sample."
+                 )
+             idx = self.indices[index]
         else:
              idx = index
         

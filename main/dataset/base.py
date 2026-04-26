@@ -17,7 +17,7 @@ class ManipData(Dataset, ABC):
         *,
         data_dir: str,
         split: str = "all",
-        skip: int = 2,
+        skip: int = 1,
         device="cuda:0",
         mujoco2gym_transf=None,
         max_seq_len=int(1e10),

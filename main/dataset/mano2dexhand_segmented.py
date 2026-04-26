@@ -89,6 +89,44 @@ def _urdf_path_for_isaac(urdf_path):
     return root, filename
 
 
+def _validate_contact_frame_count_or_raise(contact_data, expected_frames, stage_name, contact_path):
+    """
+    Ensure contact data and IK target have the same number of frames.
+    Raise immediately when mismatched to avoid silent misalignment.
+    """
+    if contact_data is None:
+        return
+
+    frames = contact_data.get("frames", [])
+    actual_frames = len(frames)
+    declared_frames = contact_data.get("num_frames", None)
+
+    cprint(
+        f"[{stage_name}][FRAME_CHECK] IK expected frames: {expected_frames}",
+        "red",
+    )
+    cprint(
+        f"[{stage_name}][FRAME_CHECK] Contact frames (len(frames)): {actual_frames}",
+        "red",
+    )
+    cprint(
+        f"[{stage_name}][FRAME_CHECK] Contact declared num_frames: {declared_frames}",
+        "red",
+    )
+    cprint(
+        f"[{stage_name}][FRAME_CHECK] Contact file: {contact_path}",
+        "red",
+    )
+
+    if actual_frames != expected_frames:
+        raise ValueError(
+            f"[{stage_name}] Frame mismatch: IK expects {expected_frames} frames, "
+            f"but contact has {actual_frames} frames (declared num_frames={declared_frames}). "
+            f"contact_file={contact_path}. "
+            "Please align source_fps/target_fps/skip across contact generation and IK, then regenerate contact data."
+        )
+
+
 class Mano2Dexhand:
     def __init__(self, args, dexhand, scene_objects, dataset_type="oakink2", contact_data=None, stage = None):
         """
@@ -1152,7 +1190,7 @@ if __name__ == "__main__":
             {
                 "name": "--source_fps",
                 "type": int,
-                "default": 60,
+                "default": 120,
                 "help": "Source data FPS (e.g. 30, 60, 120). Used to resample to target 60Hz.",
             },
         ],
@@ -1330,6 +1368,12 @@ if __name__ == "__main__":
             with open(parser.contact_data, "rb") as f:
                 contact_data_full = pickle.load(f)
             cprint(f"[CONTACT] Loaded {contact_data_full.get('num_frames', len(contact_data_full.get('frames', [])))} frames", "green")
+            _validate_contact_frame_count_or_raise(
+                contact_data=contact_data_full,
+                expected_frames=T,
+                stage_name="STAGE1",
+                contact_path=parser.contact_data,
+            )
 
         # === 从第0帧开始按是否有 contact 分段 ===
         has_contact = [False] * T
@@ -1489,6 +1533,12 @@ if __name__ == "__main__":
             with open(parser.contact_data, "rb") as f:
                 contact_data_full = pickle.load(f)
             cprint(f"[CONTACT] Loaded {contact_data_full.get('num_frames', len(contact_data_full.get('frames', [])))} frames", "green")
+            _validate_contact_frame_count_or_raise(
+                contact_data=contact_data_full,
+                expected_frames=T,
+                stage_name="STAGE2",
+                contact_path=parser.contact_data,
+            )
 
         # === 从第0帧开始按是否有 contact 分段 ===
         has_contact = [False] * T

@@ -104,8 +104,7 @@ class Mano2Dexhand:
         self.sim_params.gravity = gymapi.Vec3(0.0, 0.0, -9.81)
 
         self.headless = args.headless
-        if self.headless:
-            self.graphics_device_id = -1
+        self.graphics_device_id = -1 if self.headless else args.graphics_device_id
 
         assert args.physics_engine == gymapi.SIM_PHYSX
 
@@ -119,8 +118,9 @@ class Mano2Dexhand:
         self.sim_params.use_gpu_pipeline = args.use_gpu_pipeline
         self.sim_device = args.sim_device if args.use_gpu_pipeline else "cpu"
 
+        # In headless mode Isaac Gym should not create a graphics context.
         self.sim = self.gym.create_sim(
-            args.compute_device_id, args.graphics_device_id, args.physics_engine, self.sim_params
+            args.compute_device_id, self.graphics_device_id, args.physics_engine, self.sim_params
         )
 
         plane_params = gymapi.PlaneParams()
