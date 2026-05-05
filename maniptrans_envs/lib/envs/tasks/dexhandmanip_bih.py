@@ -12,6 +12,7 @@ from datetime import datetime
 
 import numpy as np
 import torch
+import trimesh
 from ...utils import torch_jit_utils as torch_jit_utils
 from bps_torch.bps import bps_torch
 from gym import spaces
@@ -36,6 +37,10 @@ from ..core.config import ROBOT_HEIGHT, config
 from ...envs.core.sim_config import sim_config
 from ...envs.core.vec_task import VecTask
 from ...utils.pose_utils import get_mat
+from ...utils.object_pose_error_utils import (
+    compute_sampled_object_pose_errors,
+    load_urdf_sample_points,
+)
 
 
 def soft_clamp(x, lower, upper):
@@ -90,6 +95,7 @@ class DexHandManipBiHEnv(VecTask):
         self.training = self.cfg["env"]["training"]
         self.dexhand_rh = DexHandFactory.create_hand(self.cfg["env"]["dexhand"], "right")
         self.dexhand_lh = DexHandFactory.create_hand(self.cfg["env"]["dexhand"], "left")
+        self.object_pose_num_sample_points = int(self.cfg["env"].get("objectPoseNumSamplePoints", 32))
 
         self.use_pid_control = self.cfg["env"]["usePIDControl"]
         if self.use_pid_control:
@@ -156,21 +162,14 @@ class DexHandManipBiHEnv(VecTask):
         # === [新增] 自适应采样相关配置 ===
         # 时间片段(bin)数量，将根据动作长度动态确定
         self.adaptive_sampling_bins = self.cfg["env"].get("adaptiveSamplingBins", 12)
-        
-        if self.random_state_init:
-            # 平滑核大小，用于对失败率进行平滑处理
-            self.adaptive_sampling_kernel_size = self.cfg["env"].get("adaptiveSamplingKernelSize", 3)
-            # 平滑衰减因子，越接近1变化越慢
-            self.adaptive_sampling_lambda = self.cfg["env"].get("adaptiveSamplingLambda", 0.8)
-            # 均匀采样比例，避免某些bin完全不被采样
-            self.adaptive_sampling_uniform_ratio = self.cfg["env"].get("adaptiveSamplingUniformRatio", 0.4)
-            # 失败率更新时的衰减因子，越接近1变化越慢
-            self.adaptive_sampling_alpha = self.cfg["env"].get("adaptiveSamplingAlpha", 0.2)
-            # 所有bin成功率超过此阈值才允许提升难度
-            self.adaptive_sampling_all_bins_threshold = self.cfg["env"].get("adaptiveSamplingAllBinsThreshold", 0.40)
-        else:
-            # 非自适应采样模式下，依然保持 bin 数量以便记录成功率统计
-            pass
+        # 这些配置不仅用于 random_state_init=True 的自适应起始帧采样，
+        # 也会在训练过程中的 bin 统计 / adaptive difficulty 中使用。
+        # 因此即使 random_state_init=False，也必须提供默认值。
+        self.adaptive_sampling_kernel_size = self.cfg["env"].get("adaptiveSamplingKernelSize", 3)
+        self.adaptive_sampling_lambda = self.cfg["env"].get("adaptiveSamplingLambda", 0.8)
+        self.adaptive_sampling_uniform_ratio = self.cfg["env"].get("adaptiveSamplingUniformRatio", 0.4)
+        self.adaptive_sampling_alpha = self.cfg["env"].get("adaptiveSamplingAlpha", 0.2)
+        self.adaptive_sampling_all_bins_threshold = self.cfg["env"].get("adaptiveSamplingAllBinsThreshold", 0.40)
 
         self.tighten_method = self.cfg["env"]["tightenMethod"]
         self.tighten_factor = self.cfg["env"]["tightenFactor"]
@@ -182,6 +181,7 @@ class DexHandManipBiHEnv(VecTask):
         self.no_regression_threshold = self.cfg["env"].get("noRegressionThreshold", 1.5)
         # 初始化旋转难度系数，初始与全局系数同步
         self.rot_scale_factor = self.tighten_factor if (self.tighten_factor is not None and 0 < self.tighten_factor <= 1.0) else 1.0
+        self.obj_pose_fail_count = 0
         self.obj_pos_fail_count = 0
         self.obj_rot_fail_count = 0
         self.total_fail_count = 0
@@ -339,15 +339,25 @@ class DexHandManipBiHEnv(VecTask):
         self._init_failure_log_path()
 
         self.env_start_bin_index = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
-        # [新增] 初始化从最开始开始 reset 的比例 (默认为 10%)
-        self.start_from_beginning_ratio = 0.10
+        # [新增] 初始化从最开始开始 reset 的比例。
+        # In strict const mode we want every reset to start from the beginning;
+        # adaptive modes keep the previous curriculum default unless overridden.
+        default_start_from_beginning_ratio = 1.0 if self.tighten_method == "const" else 0.10
+        self.start_from_beginning_ratio = self.cfg["env"].get(
+            "startFromBeginningRatio", default_start_from_beginning_ratio
+        )
         # [新增] 记录每个环境是否发生了特定的失败
+        self.env_obj_pose_failed = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self.env_obj_pos_failed = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self.env_obj_rot_failed = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
 
 
-        # === [新增] 初始化自适应采样 tensors (在父类初始化之后，因为需要 self.device) ===
-        if self.random_state_init and self.adaptive_sampling_bins is not None:
+        # === [新增] 初始化自适应采样 / bin统计 tensors (在父类初始化之后，因为需要 self.device) ===
+        # 注意：
+        # - random_state_init 只控制“reset 时是否随机/自适应采样起始帧”
+        # - 但训练中的 adaptive difficulty / bin logging 在 random_state_init=False 时也会运行
+        #   因此这些统计缓冲区不能只在 random_state_init=True 时初始化。
+        if self.adaptive_sampling_bins is not None:
             # 初始化采样统计（记录成功和失败次数）
             self.bin_success_count = torch.zeros(self.adaptive_sampling_bins, dtype=torch.float, device=self.device)
             self.bin_total_count = torch.zeros(self.adaptive_sampling_bins, dtype=torch.float, device=self.device)
@@ -602,6 +612,24 @@ class DexHandManipBiHEnv(VecTask):
             print(f"[WARNING] Failed to initialize failure log file: {e}")
             self.failure_log_file = None
             self._failure_log_buffer = []
+
+    def _flush_failure_log_buffer(self, trigger: str):
+        """Write buffered failure diagnostics to disk when logs are enabled."""
+        if (
+            getattr(self, "_failure_log_buffer", None) is None
+            or not hasattr(self, "failure_log_file")
+            or self.failure_log_file is None
+            or len(self._failure_log_buffer) == 0
+        ):
+            return
+
+        try:
+            with open(self.failure_log_file, "a", encoding="utf-8") as f:
+                for line in self._failure_log_buffer:
+                    f.write(line)
+            self._failure_log_buffer.clear()
+        except Exception as e:
+            print(f"[WARNING] Failed to flush failure log buffer during {trigger}: {e}")
 
     def _reset_bin_histories(self, bin_idx):
         """当某个 bin 的 scale 或状态发生重大改变时，重置其通过率历史统计"""
@@ -1009,12 +1037,17 @@ class DexHandManipBiHEnv(VecTask):
         
         # 缓存 Asset (防止重复加载)
         self.objs_assets = {} 
+        self.objs_point_cache = {}
 
         # [新增] 用于收集 Mass 和 CoM 的临时列表 (List of Lists)
         raw_rh_masses = []
         raw_rh_coms = []
         raw_lh_masses = []
         raw_lh_coms = []
+        raw_rh_sample_points = []
+        raw_lh_sample_points = []
+        raw_rh_point_radius = []
+        raw_lh_point_radius = []
         # [新增] 用于收集静态物体信息的临时列表
         raw_rh_is_static = []
         raw_lh_is_static = []
@@ -1082,21 +1115,32 @@ class DexHandManipBiHEnv(VecTask):
 
             # === [修改] 创建多物体 (Multi-Object Creation) ===
             # RH
-            env_objs_rh, env_mass_rh, env_com_rh, env_is_static_rh = self._create_scene_objects(env_ptr, i, side="rh")
+            env_objs_rh, env_mass_rh, env_com_rh, env_is_static_rh, env_sample_points_rh, env_point_radius_rh = self._create_scene_objects(env_ptr, i, side="rh")
             self.objs_handles_rh.append(env_objs_rh)
             raw_rh_masses.append(env_mass_rh)
             raw_rh_coms.append(env_com_rh)
             raw_rh_is_static.append(env_is_static_rh)
+            raw_rh_sample_points.append(env_sample_points_rh)
+            raw_rh_point_radius.append(env_point_radius_rh)
 
             # LH
             if self._scene_objects_shared(i):
-                env_objs_lh, env_mass_lh, env_com_lh, env_is_static_lh = env_objs_rh, env_mass_rh, env_com_rh, env_is_static_rh
+                env_objs_lh, env_mass_lh, env_com_lh, env_is_static_lh, env_sample_points_lh, env_point_radius_lh = (
+                    env_objs_rh,
+                    env_mass_rh,
+                    env_com_rh,
+                    env_is_static_rh,
+                    env_sample_points_rh,
+                    env_point_radius_rh,
+                )
             else:
-                env_objs_lh, env_mass_lh, env_com_lh, env_is_static_lh = self._create_scene_objects(env_ptr, i, side="lh")
+                env_objs_lh, env_mass_lh, env_com_lh, env_is_static_lh, env_sample_points_lh, env_point_radius_lh = self._create_scene_objects(env_ptr, i, side="lh")
             self.objs_handles_lh.append(env_objs_lh)
             raw_lh_masses.append(env_mass_lh)
             raw_lh_coms.append(env_com_lh)
             raw_lh_is_static.append(env_is_static_lh)
+            raw_lh_sample_points.append(env_sample_points_lh)
+            raw_lh_point_radius.append(env_point_radius_lh)
 
             # === [新增] 结束聚合 (End Aggregate) ===
             if self.aggregate_mode > 0:
@@ -1202,13 +1246,27 @@ class DexHandManipBiHEnv(VecTask):
                 padded_list.append(padded_item)
             return torch.tensor(padded_list, device=self.device, dtype=torch.bool)
 
+        def pad_and_stack_points(data_list, num_points, pad_value=0.0):
+            max_len = max([len(x) for x in data_list]) if data_list else 0
+            padded_list = []
+            pad_point = [[pad_value] * 3 for _ in range(num_points)]
+            for item in data_list:
+                pad_len = max_len - len(item)
+                padded_item = item + [pad_point] * pad_len
+                padded_list.append(padded_item)
+            return torch.tensor(padded_list, device=self.device, dtype=torch.float32)
+
         self.manip_obj_rh_mass = pad_and_stack(raw_rh_masses)      # Shape: [NumEnvs, MaxObjs]
         self.manip_obj_rh_com = pad_and_stack(raw_rh_coms)         # Shape: [NumEnvs, MaxObjs, 3]
         self.manip_obj_rh_is_static = pad_and_stack_bool(raw_rh_is_static)  # Shape: [NumEnvs, MaxObjs]
+        self.manip_obj_rh_sample_points = pad_and_stack_points(raw_rh_sample_points, self.object_pose_num_sample_points)
+        self.manip_obj_rh_point_radius = pad_and_stack(raw_rh_point_radius)
         
         self.manip_obj_lh_mass = pad_and_stack(raw_lh_masses)
         self.manip_obj_lh_com = pad_and_stack(raw_lh_coms)
         self.manip_obj_lh_is_static = pad_and_stack_bool(raw_lh_is_static)  # Shape: [NumEnvs, MaxObjs]
+        self.manip_obj_lh_sample_points = pad_and_stack_points(raw_lh_sample_points, self.object_pose_num_sample_points)
+        self.manip_obj_lh_point_radius = pad_and_stack(raw_lh_point_radius)
 
         print(f"Object Mass Shape: {self.manip_obj_rh_mass.shape}") # Debug 确认形状
 
@@ -1231,11 +1289,14 @@ class DexHandManipBiHEnv(VecTask):
         handles = []
         masses = []  
         coms = []
+        sample_points = []
+        point_radii = []
         is_static_list = []  # 新增：记录静态物体信息
         
         for k, obj_info in enumerate(scene_objs_list):
             obj_name = obj_info['name']
             urdf_path = obj_info['urdf']
+            sampled_points_local, point_radius = self._get_or_create_object_pose_samples(urdf_path)
             
             # 0. 检查物体是否静态（轨迹中所有帧的pose是否相同）
             traj = obj_info["trajectory"]  # [T, 4, 4]
@@ -1364,9 +1425,29 @@ class DexHandManipBiHEnv(VecTask):
             masses.append(new_mass)
             # 记录质心 (使用 body_props)
             coms.append([body_props[0].com.x, body_props[0].com.y, body_props[0].com.z])
+            sample_points.append(sampled_points_local.tolist())
+            point_radii.append(point_radius)
             is_static_list.append(is_static)  # 新增：记录静态物体信息
             
-        return handles, masses, coms, is_static_list
+        return handles, masses, coms, is_static_list, sample_points, point_radii
+
+    def _get_or_create_object_pose_samples(self, urdf_path: str):
+        if not hasattr(self, "object_pose_num_sample_points"):
+            self.object_pose_num_sample_points = int(self.cfg["env"].get("objectPoseNumSamplePoints", 32))
+        cache_key = (urdf_path, self.object_pose_num_sample_points)
+        if cache_key in self.objs_point_cache:
+            return self.objs_point_cache[cache_key]
+
+        sampled_points_local = load_urdf_sample_points(
+            urdf_path,
+            num_points=self.object_pose_num_sample_points,
+            use_collision_mesh=False,
+        )
+        sampled_points_tensor = torch.tensor(sampled_points_local, dtype=torch.float32)
+        local_centroid = sampled_points_tensor.mean(dim=0, keepdim=True)
+        point_radius = torch.norm(sampled_points_tensor - local_centroid, dim=-1).mean().item()
+        self.objs_point_cache[cache_key] = (sampled_points_local, point_radius)
+        return self.objs_point_cache[cache_key]
 
     def _adaptive_sampling(self, env_ids):
         """
@@ -1640,6 +1721,11 @@ class DexHandManipBiHEnv(VecTask):
             hand_keys = [
                 "wrist_pos", "wrist_rot", "wrist_velocity", "wrist_angular_velocity",
                 "opt_dof_pos", "opt_dof_velocity", "tips_distance",
+                "hand_contact_distance",
+                "hand_contact_closest_obj_idx",
+                "hand_contact_closest_pt_idx",
+                "hand_contact_closest_pt_local",
+                "hand_contact_closest_pt_world",
                 "obj_velocity", "obj_angular_velocity",
                 "opt_wrist_pos", "opt_wrist_rot",
                 "opt_wrist_velocity", "opt_wrist_angular_velocity"
@@ -1951,7 +2037,10 @@ class DexHandManipBiHEnv(VecTask):
         self.error_buf = rh_error_buf | lh_error_buf
         
         # [新增] 记录每个环境是否发生了特定类型的失败
-        self.env_obj_pos_failed |= lh_failure_reasons["obj_pos_failed"] | rh_failure_reasons["obj_pos_failed"]
+        obj_pose_failed = lh_failure_reasons["obj_pose_failed"] | rh_failure_reasons["obj_pose_failed"]
+        self.env_obj_pose_failed |= obj_pose_failed
+        # 保留旧字段，避免影响依赖 obj_pos/obj_rot 统计的自适应逻辑。
+        self.env_obj_pos_failed |= obj_pose_failed
         self.env_obj_rot_failed |= lh_failure_reasons["obj_rot_failed"] | rh_failure_reasons["obj_rot_failed"]
 
         self.reward_dict = {
@@ -1989,6 +2078,7 @@ class DexHandManipBiHEnv(VecTask):
         # --- 下面的代码保持原样 ---
         
         target_state["tips_distance"] = side_demo_data["tips_distance"][torch.arange(self.num_envs), cur_idx]
+        target_state["hand_contact_distance"] = side_demo_data["hand_contact_distance"][torch.arange(self.num_envs), cur_idx]
         cur_joints_pos = side_demo_data["mano_joints"][torch.arange(self.num_envs), cur_idx]
         target_state["joints_pos"] = cur_joints_pos.reshape(self.num_envs, -1, 3)
         target_state["joints_vel"] = side_demo_data["mano_joints_velocity"][torch.arange(self.num_envs), cur_idx].reshape(self.num_envs, -1, 3)
@@ -2035,6 +2125,8 @@ class DexHandManipBiHEnv(VecTask):
         target_objs_quat = rotmat_to_quat(target_objs_rotmat.reshape(-1, 3, 3))  # [N*K, 4]
         target_objs_quat = target_objs_quat[:, [1, 2, 3, 0]]  # [w, x, y, z] -> [x, y, z, w]
         target_state["manip_obj_quat"] = target_objs_quat.reshape(self.num_envs, self.num_objs_per_env, 4)
+        target_state["manip_obj_sample_points_local"] = getattr(self, f"manip_obj_{side}_sample_points")
+        target_state["manip_obj_point_radius"] = getattr(self, f"manip_obj_{side}_point_radius")
         
         # [优化] 使用预处理好的 multi_obj_vel / multi_obj_ang_vel 做向量化索引，替代 Python 双层循环
         multi_obj_vel = self.rh_multi_obj_vel if side == "rh" else self.lh_multi_obj_vel  # [N, K, T, 3]
@@ -2116,6 +2208,9 @@ class DexHandManipBiHEnv(VecTask):
         target_state["tips_closest_obj_idx"] = side_demo_data["tips_closest_obj_idx"][torch.arange(self.num_envs), cur_idx]
         target_state["tips_closest_pt_local"] = side_demo_data["tips_closest_pt_local"][torch.arange(self.num_envs), cur_idx]
         target_state["tips_closest_pt_world"] = side_demo_data["tips_closest_pt_world"][torch.arange(self.num_envs), cur_idx]
+        target_state["hand_contact_closest_obj_idx"] = side_demo_data["hand_contact_closest_obj_idx"][torch.arange(self.num_envs), cur_idx]
+        target_state["hand_contact_closest_pt_local"] = side_demo_data["hand_contact_closest_pt_local"][torch.arange(self.num_envs), cur_idx]
+        target_state["hand_contact_closest_pt_world"] = side_demo_data["hand_contact_closest_pt_world"][torch.arange(self.num_envs), cur_idx]
 
         # === [新增] 计算每个环境当前的 bin 索引 ===
         if self.adaptive_sampling_bins is not None:
@@ -2251,7 +2346,8 @@ class DexHandManipBiHEnv(VecTask):
         
         # === [新增] Mode 4: 统计失败原因 ===
         if self.tighten_method == "adaptive_dual" and self.training and failure_buf.any():
-            self.obj_pos_fail_count += int(failure_reasons["obj_pos_failed"].sum().item())
+            self.obj_pose_fail_count += int(failure_reasons["obj_pose_failed"].sum().item())
+            self.obj_pos_fail_count += int(failure_reasons["obj_pose_failed"].sum().item())
             self.obj_rot_fail_count += int(failure_reasons["obj_rot_failed"].sum().item())
             self.total_fail_count += int(failure_buf.sum().item())
 
@@ -2263,7 +2359,7 @@ class DexHandManipBiHEnv(VecTask):
                     bin_idx = env_bin_indices[i].item()
                     # 只有在已经触底的 bin 才统计失败率
                     if self.bin_reached_bottom[bin_idx]:
-                        if failure_reasons["obj_pos_failed"][i]:
+                        if failure_reasons["obj_pose_failed"][i]:
                             self.bin_pos_fail_count[bin_idx] += 1
                         if failure_reasons["obj_rot_failed"][i]:
                             self.bin_rot_fail_count[bin_idx] += 1
@@ -2292,8 +2388,8 @@ class DexHandManipBiHEnv(VecTask):
                     
                     # 映射失败原因到展示文本
                     reason_map = [
-                        ("obj_pos_failed", "物体位置误差过大", "obj_pos_err", "obj_pos_threshold", "m"),
-                        ("obj_rot_failed", "物体旋转误差过大", "obj_rot_err", "obj_rot_threshold", "°"),
+                        ("obj_pose_failed", "物体采样点位姿平均误差过大", "obj_pose_err", "obj_pose_threshold", "m"),
+                        ("obj_rot_failed", "[诊断] 物体采样点旋转等效误差过大", "obj_rot_err", "obj_rot_threshold", "°"),
                         ("thumb_failed", "拇指位置误差过大", "thumb_tip_dist", "thumb_threshold", "m"),
                         ("index_failed", "食指位置误差过大", "index_tip_dist", "index_threshold", "m"),
                         ("middle_failed", "中指位置误差过大", "middle_tip_dist", "middle_threshold", "m"),
@@ -2999,7 +3095,7 @@ class DexHandManipBiHEnv(VecTask):
                     # 2. 如果是失败，则失败bin只增加总数不增加成功数
                     # 3. 如果是成功，则失败bin（此时是结束位置）也增加成功数
                     is_success = self.success_buf[env_id_item].item() > 0
-                    obj_pos_failed = self.env_obj_pos_failed[env_id_item].item()
+                    obj_pose_failed = self.env_obj_pose_failed[env_id_item].item()
                     obj_rot_failed = self.env_obj_rot_failed[env_id_item].item()
                     
                     # 确保 start_bin <= end_bin
@@ -3022,7 +3118,7 @@ class DexHandManipBiHEnv(VecTask):
                         # 当前bin累加一次失败（只加total）
                         self._current_bin_total[end_bin] += 1
                         # 如果当前bin失败不是因为 obj_pos/obj_rot，则计入通过
-                        if not obj_pos_failed:
+                        if not obj_pose_failed:
                             self._current_bin_obj_pos_pass[end_bin] += 1
                         if not obj_rot_failed:
                             self._current_bin_obj_rot_pass[end_bin] += 1
@@ -3063,14 +3159,7 @@ class DexHandManipBiHEnv(VecTask):
 
                 # 每 20 个 epoch 打印一次，并刷新失败日志到文件
                 if self.adaptive_current_epoch % 20 == 0:
-                    if getattr(self, '_failure_log_buffer', None) is not None and hasattr(self, 'failure_log_file') and self.failure_log_file is not None and len(self._failure_log_buffer) > 0:
-                        try:
-                            with open(self.failure_log_file, "a", encoding="utf-8") as f:
-                                for line in self._failure_log_buffer:
-                                    f.write(line)
-                            self._failure_log_buffer.clear()
-                        except Exception as e:
-                            print(f"[WARNING] Failed to flush failure log buffer: {e}")
+                    self._flush_failure_log_buffer(trigger="epoch stats")
                     print(f"[EPOCH STATS] Epoch {self.adaptive_current_epoch}: "
                           f"Success Rate: {success_rate_last_epoch:.4f}, "
                           f"Avg Steps: {avg_steps_last_epoch:.2f}, "
@@ -3983,8 +4072,12 @@ class DexHandManipBiHEnv(VecTask):
         self._refresh()
         
         # === [新增] 在重置前记录表现并更新自适应难度 ===
-        if self.training:
+        if self.training and self.tighten_method in ["adaptive_dual", "adaptive_real"]:
             self._update_adaptive_difficulty(env_ids)
+        else:
+            # Test/play mode does not run epoch-based adaptive updates, so flush
+            # failure diagnostics as soon as a reset is about to happen.
+            self._flush_failure_log_buffer(trigger="test reset")
         
         if self.randomize:
             self.apply_randomizations(self.dr_randomizations)
@@ -4001,6 +4094,8 @@ class DexHandManipBiHEnv(VecTask):
         self._reset_default(env_ids)
         
         # [新增] 重置特定类型的失败记录
+        if hasattr(self, "env_obj_pose_failed"):
+            self.env_obj_pose_failed[env_ids] = False
         if hasattr(self, "env_obj_pos_failed"):
             self.env_obj_pos_failed[env_ids] = False
             self.env_obj_rot_failed[env_ids] = False
@@ -4136,8 +4231,24 @@ class DexHandManipBiHEnv(VecTask):
 
             self.gym.clear_lines(self.viewer)
 
+            def add_ref_point(viewer, env_ptr, point, color, size=0.012):
+                point = point.detach().cpu().numpy().astype(np.float32)
+                point_lines = point[None, None, :] + np.array(
+                    [
+                        [[-size, 0.0, 0.0], [size, 0.0, 0.0]],
+                        [[0.0, -size, 0.0], [0.0, size, 0.0]],
+                        [[0.0, 0.0, -size], [0.0, 0.0, size]],
+                    ],
+                    dtype=np.float32,
+                )
+                for line in point_lines:
+                    self.gym.add_lines(viewer, env_ptr, 1, line, color)
+
             def set_side_joint(cur_idx, side="rh"):
                 cur_wrist_pos = getattr(self, f"demo_data_{side}")["wrist_pos"][torch.arange(self.num_envs), cur_idx]
+                cur_obj_ref_pos = getattr(self, f"demo_data_{side}")["obj_trajectory"][
+                    torch.arange(self.num_envs), cur_idx, :3, 3
+                ]
                 cur_mano_joint_pos = getattr(self, f"demo_data_{side}")["mano_joints"][
                     torch.arange(self.num_envs), cur_idx
                 ].reshape(self.num_envs, -1, 3)
@@ -4165,6 +4276,13 @@ class DexHandManipBiHEnv(VecTask):
 
                     color = np.array([[0.0, 1.0, 0.0]], dtype=np.float32)
                     add_lines(self.viewer, env_ptr, cur_mano_joint_pos[env_id].cpu(), color)
+                    if side == "rh" or not getattr(self, "is_scene_objects_shared", False):
+                        obj_ref_color = (
+                            np.array([[1.0, 0.45, 0.0]], dtype=np.float32)
+                            if side == "rh"
+                            else np.array([[0.0, 0.75, 1.0]], dtype=np.float32)
+                        )
+                        add_ref_point(self.viewer, env_ptr, cur_obj_ref_pos[env_id], obj_ref_color)
 
             set_side_joint(cur_idx, "lh")
             set_side_joint(cur_idx, "rh")
@@ -4763,6 +4881,9 @@ def compute_imitation_reward(
     diff_joints_pos = target_joints_pos - joints_pos
     diff_joints_pos_dist = torch.norm(diff_joints_pos, dim=-1)
 
+    sim_hand_points = states["joints_state"][:, 1:, :3]
+    ref_hand_points = target_states["joints_pos"]
+
     # ? assign different weights to different joints
     # assert diff_joints_pos_dist.shape[1] == 17  # ignore the base joint
     diff_thumb_tip_pos_dist = diff_joints_pos_dist[:, [k - 1 for k in dexhand_weight_idx["thumb_tip"]]].mean(dim=-1)
@@ -4796,6 +4917,69 @@ def compute_imitation_reward(
     diff_eef_rot_angle = quat_to_angle_axis(diff_eef_rot)[0]
     reward_eef_rot = torch.exp(-0.8 * (diff_eef_rot_angle).abs())
 
+    # Human hand shape rewards that do not depend on retargeted DOF targets.
+    # Packed hand points exclude the wrist/base. Indices below follow Inspire.body_names[1:].
+    bone_edges = [
+        [-1, 0],   # wrist -> index_proximal
+        [0, 1],
+        [1, 2],
+        [-1, 3],   # wrist -> middle_proximal
+        [3, 4],
+        [4, 5],
+        [-1, 6],   # wrist -> pinky_proximal
+        [6, 7],
+        [7, 8],
+        [-1, 9],   # wrist -> ring_proximal
+        [9, 10],
+        [10, 11],
+        [-1, 13],  # wrist -> thumb_proximal
+        [13, 14],
+        [14, 15],
+        [15, 16],
+    ]
+    bone_dir_terms = []
+    for edge in bone_edges:
+        parent = edge[0]
+        child = edge[1]
+        sim_parent = current_eef_pos if parent < 0 else sim_hand_points[:, parent]
+        ref_parent = target_eef_pos if parent < 0 else ref_hand_points[:, parent]
+        sim_vec = sim_hand_points[:, child] - sim_parent
+        ref_vec = ref_hand_points[:, child] - ref_parent
+        sim_vec = sim_vec / torch.clamp(torch.norm(sim_vec, dim=-1, keepdim=True), min=1e-6)
+        ref_vec = ref_vec / torch.clamp(torch.norm(ref_vec, dim=-1, keepdim=True), min=1e-6)
+        bone_dir_terms.append((torch.sum(sim_vec * ref_vec, dim=-1) + 1.0) * 0.5)
+    reward_bone_dir = torch.stack(bone_dir_terms, dim=-1).mean(dim=-1)
+
+    def joint_angle_cos(points: Tensor, parent_idx: int, joint_idx: int, child_idx: int, wrist_pos: Tensor) -> Tensor:
+        parent_pos = wrist_pos if parent_idx < 0 else points[:, parent_idx]
+        joint_pos = points[:, joint_idx]
+        child_pos = points[:, child_idx]
+        parent_vec = parent_pos - joint_pos
+        child_vec = child_pos - joint_pos
+        parent_vec = parent_vec / torch.clamp(torch.norm(parent_vec, dim=-1, keepdim=True), min=1e-6)
+        child_vec = child_vec / torch.clamp(torch.norm(child_vec, dim=-1, keepdim=True), min=1e-6)
+        return torch.clamp(torch.sum(parent_vec * child_vec, dim=-1), -1.0, 1.0)
+
+    finger_angle_edges = [
+        [-1, 0, 1],
+        [0, 1, 2],
+        [-1, 3, 4],
+        [3, 4, 5],
+        [-1, 6, 7],
+        [6, 7, 8],
+        [-1, 9, 10],
+        [9, 10, 11],
+        [-1, 13, 14],
+        [13, 14, 15],
+        [14, 15, 16],
+    ]
+    curl_terms = []
+    for edge in finger_angle_edges:
+        sim_curl = joint_angle_cos(sim_hand_points, edge[0], edge[1], edge[2], current_eef_pos)
+        ref_curl = joint_angle_cos(ref_hand_points, edge[0], edge[1], edge[2], target_eef_pos)
+        curl_terms.append(torch.exp(-3.0 * torch.abs(sim_curl - ref_curl)))
+    reward_finger_curl = torch.stack(curl_terms, dim=-1).mean(dim=-1)
+
     num_envs = current_eef_pos.shape[0]
 
     # === 调试断点 2：检查奖励计算输入 ===
@@ -4821,16 +5005,9 @@ def compute_imitation_reward(
     dynamic_mask = ~obj_is_static
     dynamic_count = dynamic_mask.sum(dim=-1).clamp_min(1)  # 避免除0
     
-    # 处理多物体维度 [N, K, 3]
+    # Legacy root-pose metrics are kept for logging and cross-checking.
     diff_obj_pos = target_obj_pos - current_obj_pos
-    diff_obj_pos_dist = torch.norm(diff_obj_pos, dim=-1)
-    # 屏蔽静态物体，避免静态占位的 NaN/无效值污染奖励
-    diff_obj_pos_dist = torch.where(dynamic_mask, diff_obj_pos_dist, torch.zeros_like(diff_obj_pos_dist))
-    
-    # 如果是多物体 [N, K]，我们对每个物体计算 Reward 然后 Sum
-    reward_obj_pos = torch.exp(-30 * diff_obj_pos_dist)
-    if reward_obj_pos.dim() > 1:
-        reward_obj_pos = (reward_obj_pos * dynamic_mask).sum(dim=-1) / dynamic_count
+    legacy_diff_obj_pos_dist = torch.norm(diff_obj_pos, dim=-1)
 
     # Rotation
     # Flatten to [N*K, 4] for quat functions
@@ -4838,51 +5015,57 @@ def compute_imitation_reward(
     flat_targ = target_obj_quat.reshape(-1, 4)
     
     diff_obj_rot = quat_mul(flat_targ, quat_conjugate(flat_curr))
-    diff_obj_rot_angle = quat_to_angle_axis(diff_obj_rot)[0].view(num_envs, num_objs)
+    legacy_diff_obj_rot_angle = quat_to_angle_axis(diff_obj_rot)[0].view(num_envs, num_objs)
+    legacy_diff_obj_rot_angle = torch.where(dynamic_mask, legacy_diff_obj_rot_angle, torch.zeros_like(legacy_diff_obj_rot_angle))
+
+    sampled_obj_pose_errors = compute_sampled_object_pose_errors(
+        current_pos=current_obj_pos,
+        current_quat_xyzw=current_obj_quat,
+        target_pos=target_obj_pos,
+        target_quat_xyzw=target_obj_quat,
+        sample_points_local=target_states["manip_obj_sample_points_local"],
+    )
+    diff_obj_pos_dist = sampled_obj_pose_errors["mean_point_err"]
+    diff_obj_pos_dist = torch.where(dynamic_mask, diff_obj_pos_dist, torch.zeros_like(diff_obj_pos_dist))
+    diff_obj_rot_angle = sampled_obj_pose_errors["rot_err_rad"]
     diff_obj_rot_angle = torch.where(dynamic_mask, diff_obj_rot_angle, torch.zeros_like(diff_obj_rot_angle))
+    diff_obj_rot_angle_deg = sampled_obj_pose_errors["rot_err_deg"]
+    diff_obj_rot_angle_deg = torch.where(dynamic_mask, diff_obj_rot_angle_deg, torch.zeros_like(diff_obj_rot_angle_deg))
+    diff_obj_mean_point_err = sampled_obj_pose_errors["mean_point_err"]
+    diff_obj_mean_point_err = torch.where(dynamic_mask, diff_obj_mean_point_err, torch.zeros_like(diff_obj_mean_point_err))
+    diff_obj_centroid_err = sampled_obj_pose_errors["centroid_err"]
+    diff_obj_centroid_err = torch.where(dynamic_mask, diff_obj_centroid_err, torch.zeros_like(diff_obj_centroid_err))
+    diff_obj_rot_point_disp = sampled_obj_pose_errors["mean_centered_disp"]
+    diff_obj_rot_point_disp = torch.where(dynamic_mask, diff_obj_rot_point_disp, torch.zeros_like(diff_obj_rot_point_disp))
     
-    reward_obj_rot = torch.exp(-3 * (diff_obj_rot_angle).abs())
+    # 如果是多物体 [N, K]，我们对每个物体计算 Reward 然后 Sum
+    reward_obj_pos_raw = torch.exp(-30 * diff_obj_pos_dist)
+    reward_obj_pos = reward_obj_pos_raw
+    if reward_obj_pos.dim() > 1:
+        reward_obj_pos = (reward_obj_pos * dynamic_mask).sum(dim=-1) / dynamic_count
+
+    reward_obj_rot_raw = torch.exp(-3 * (diff_obj_rot_angle).abs())
+    reward_obj_rot = reward_obj_rot_raw
     if reward_obj_rot.dim() > 1:
         reward_obj_rot = (reward_obj_rot * dynamic_mask).sum(dim=-1) / dynamic_count
 
-    # === [新增] 计算 Alpha (基于 Reference 中的抓握力) ===
-    # 规则: 统计 reference 中指尖距离 < 0.004 的手指数量 N
-    # alpha = 0.2 + (归一化力分数之和 * 0.8 / N)
-    # 归一化分数: force < 0.5 为 0, force > 2.0 为 1
-    ref_finger_dist = target_states["tips_distance"] # [N, 5]
-    ref_finger_force = torch.norm(target_states["tip_force"], dim=-1) # [N, 5]
-    
-    contact_mask = ref_finger_dist < 0.03 # [N, 5]
-    N_contacts = contact_mask.sum(dim=-1, keepdim=True).float() # [N, 1]
-    
-    # 计算归一化力分数 [N, 5]
-    force_score = torch.clamp((ref_finger_force - 0.1) / (1.5 - 0.1), 0.0, 1.0)
-    
-    # 计算每个手指的贡献权重
-    force_contribution = (force_score * 1.0) / (N_contacts + 1e-6)
-    alpha_sum = (force_contribution * contact_mask.float()).sum(dim=-1, keepdim=True) # [N, 1]
-    
-    alpha = 0.4 + 2.6 * alpha_sum
-    # 如果没有手指接触，alpha 设为 1.0
-    alpha = torch.where(N_contacts > 0.5, alpha, torch.ones_like(alpha)).squeeze(-1) # [N]
-
-    # 将 alpha 应用到位姿奖励
-    reward_obj_pos = reward_obj_pos * alpha
-    reward_obj_rot = reward_obj_rot * alpha
+    # Keep object tracking independent from achieved contact force. The object
+    # phase below is defined only by the reference object motion.
+    alpha = torch.ones_like(reward_obj_pos)
 
     diff_obj_vel = target_obj_vel - current_obj_vel
     diff_obj_vel = torch.where(dynamic_mask.unsqueeze(-1), diff_obj_vel, torch.zeros_like(diff_obj_vel))
     # [N, K, 3] -> norm -> [N, K] -> mean over D
     # diff_obj_vel.abs().mean(dim=-1) 是原代码逻辑 (L1 Norm per dim)
-    reward_obj_vel = torch.exp(-1 * diff_obj_vel.abs().mean(dim=-1))
+    reward_obj_vel_raw = torch.exp(-1 * diff_obj_vel.abs().mean(dim=-1))
+    reward_obj_vel = reward_obj_vel_raw
     if reward_obj_vel.dim() > 1:
         reward_obj_vel = (reward_obj_vel * dynamic_mask).sum(dim=-1) / dynamic_count
 
-    current_obj_ang_vel = states["manip_obj_ang_vel"]
-    target_obj_ang_vel = target_states["manip_obj_ang_vel"]
     diff_obj_ang_vel = target_obj_ang_vel - current_obj_ang_vel
     diff_obj_ang_vel = torch.where(dynamic_mask.unsqueeze(-1), diff_obj_ang_vel, torch.zeros_like(diff_obj_ang_vel))
-    reward_obj_ang_vel = torch.exp(-1 * diff_obj_ang_vel.abs().mean(dim=-1))
+    reward_obj_ang_vel_raw = torch.exp(-1 * diff_obj_ang_vel.abs().mean(dim=-1))
+    reward_obj_ang_vel = reward_obj_ang_vel_raw
     if reward_obj_ang_vel.dim() > 1:
         reward_obj_ang_vel = (reward_obj_ang_vel * dynamic_mask).sum(dim=-1) / dynamic_count
 
@@ -4936,9 +5119,9 @@ def compute_imitation_reward(
     )  # sanity check
 
     # For failed_execute logic involving multi-object distances
-    # diff_obj_pos_dist is [N, K], we probably want "if any object is too far"
-    # or "mean distance too far". Original code was single object.
-    # Let's assume "any object deviates too much" => failure
+    # We now use a single object-pose metric in meters:
+    # mean sampled-point world error, which naturally includes both
+    # translation and rotation effects.
     # 排除静态物体：只计算动态物体的误差
     # 确保 obj_is_static 的形状与 diff_obj_pos_dist 匹配
     if obj_is_static.dim() >= 2 and obj_is_static.shape[0] == diff_obj_pos_dist.shape[0]:
@@ -4947,23 +5130,23 @@ def compute_imitation_reward(
             # 将静态物体的误差设置为负无穷，这样 max 操作会忽略它们
             dynamic_mask = ~obj_is_static  # [N, K]
             # 对于静态物体，设置误差为负无穷，这样 max 操作会忽略它们
-            obj_pos_err = torch.where(dynamic_mask, diff_obj_pos_dist, torch.full_like(diff_obj_pos_dist, float('-inf')))
-            obj_rot_err_deg = diff_obj_rot_angle.abs() / np.pi * 180  # [N, K]
+            obj_pose_err = torch.where(dynamic_mask, diff_obj_pos_dist, torch.full_like(diff_obj_pos_dist, float('-inf')))
+            obj_rot_err_deg = diff_obj_rot_angle_deg
             obj_rot_err = torch.where(dynamic_mask, obj_rot_err_deg, torch.full_like(obj_rot_err_deg, float('-inf')))
         else:
             # 如果形状不匹配，使用原始逻辑
-            obj_pos_err = diff_obj_pos_dist
-            obj_rot_err = diff_obj_rot_angle.abs() / np.pi * 180
+            obj_pose_err = diff_obj_pos_dist
+            obj_rot_err = diff_obj_rot_angle_deg
     else:
         # 如果 obj_is_static 形状不匹配或为空，使用原始逻辑
-        obj_pos_err = diff_obj_pos_dist
-        obj_rot_err = diff_obj_rot_angle.abs() / np.pi * 180
+        obj_pose_err = diff_obj_pos_dist
+        obj_rot_err = diff_obj_rot_angle_deg
     
-    if obj_pos_err.dim() > 1:
-        obj_pos_err = obj_pos_err.max(dim=-1)[0] # Max error among K objects (excluding static)
+    if obj_pose_err.dim() > 1:
+        obj_pose_err = obj_pose_err.max(dim=-1)[0] # Max error among K objects (excluding static)
         # 如果所有物体都是静态的，max 会返回 -inf，需要处理为 0
-        obj_pos_err = torch.clamp(obj_pos_err, min=0.0)
-    elif obj_pos_err.dim() == 1:
+        obj_pose_err = torch.clamp(obj_pose_err, min=0.0)
+    elif obj_pose_err.dim() == 1:
         # 如果已经是 [N]，直接使用
         pass
     else:
@@ -4995,10 +5178,10 @@ def compute_imitation_reward(
     )
 
     # 1. 计算各个失败原因
-    obj_pos_threshold_final = terminate_obj_pos_final / 0.343 * scale_factor**3
+    obj_pose_threshold_final = terminate_obj_pos_final / 0.343 * scale_factor**3
     obj_rot_threshold_final = terminate_obj_rot_final / 0.343 * rot_scale_factor**3
 
-    obj_pos_failed = obj_pos_err > obj_pos_threshold_final
+    obj_pose_failed = obj_pose_err > obj_pose_threshold_final
     obj_rot_failed = obj_rot_err > obj_rot_threshold_final
     thumb_failed = diff_thumb_tip_pos_dist > 2 * 1.5 * terminate_thumb_threshold / 0.7 * (scale_factor * scale_factor)
     index_failed = diff_index_tip_pos_dist > 2 * 1.5 * terminate_index_threshold / 0.7 * (scale_factor * scale_factor)
@@ -5014,9 +5197,9 @@ def compute_imitation_reward(
     eef_vel_err = diff_eef_vel.abs().mean(dim=-1)
     eef_ang_vel_err = diff_eef_ang_vel.abs().mean(dim=-1)
 
-    eef_pos_threshold = 0.08 / 0.7 * scale_factor
+    eef_pos_threshold = 0.1 / 0.7 * scale_factor
     eef_rot_threshold_deg = 45 / 0.7 * scale_factor
-    eef_vel_threshold = 1.0 / 0.7 * scale_factor
+    eef_vel_threshold = 1.5 / 0.7 * scale_factor
     eef_ang_vel_threshold = 14.0 / 0.7 * scale_factor
 
     eef_pos_failed = eef_pos_err > eef_pos_threshold
@@ -5027,11 +5210,11 @@ def compute_imitation_reward(
     failed_execute_eef = (
         eef_pos_failed
         | eef_rot_failed
-    ) if terminate_on_eef else torch.zeros_like(obj_pos_err, dtype=torch.bool)
+    ) if terminate_on_eef else torch.zeros_like(obj_pose_err, dtype=torch.bool)
 
     failed_execute = (
         (
-            obj_pos_failed
+            obj_pose_failed
             | thumb_failed
             | index_failed
             | middle_failed
@@ -5039,7 +5222,6 @@ def compute_imitation_reward(
             | ring_failed
             | level_1_failed
             | level_2_failed
-            | obj_rot_failed
             | failed_execute_eef
             | (contact_violation if terminate_on_contact else torch.zeros_like(contact_violation, dtype=torch.bool))
         )
@@ -5047,7 +5229,8 @@ def compute_imitation_reward(
     ) | error_buf
 
     failure_reasons = {
-        "obj_pos_failed": obj_pos_failed,
+        "obj_pose_failed": obj_pose_failed,
+        "obj_pos_failed": obj_pose_failed,
         "obj_rot_failed": obj_rot_failed,
         "thumb_failed": thumb_failed,
         "index_failed": index_failed,
@@ -5064,8 +5247,14 @@ def compute_imitation_reward(
     }
 
     failure_values = {
-        "obj_pos_err": obj_pos_err,
+        "obj_pose_err": obj_pose_err,
+        "obj_pos_err": obj_pose_err,
         "obj_rot_err": obj_rot_err,
+        "obj_mean_point_err": diff_obj_mean_point_err,
+        "obj_centroid_err": diff_obj_centroid_err,
+        "obj_rot_point_disp": diff_obj_rot_point_disp,
+        "legacy_obj_pos_err": legacy_diff_obj_pos_dist,
+        "legacy_obj_rot_err_deg": legacy_diff_obj_rot_angle.abs() / np.pi * 180.0,
         "thumb_tip_dist": diff_thumb_tip_pos_dist,
         "index_tip_dist": diff_index_tip_pos_dist,
         "middle_tip_dist": diff_middle_tip_pos_dist,
@@ -5083,7 +5272,8 @@ def compute_imitation_reward(
         "dof_vel_norm": torch.abs(current_dof_vel).mean(-1),
         "obj_vel_norm": obj_vel_norm,
         "obj_ang_vel_norm": obj_ang_vel_norm,
-        "obj_pos_threshold": obj_pos_threshold_final,
+        "obj_pose_threshold": obj_pose_threshold_final,
+        "obj_pos_threshold": obj_pose_threshold_final,
         "obj_rot_threshold": obj_rot_threshold_final,
         "thumb_threshold": 2 * 1.5 * terminate_thumb_threshold / 0.7 * (scale_factor * scale_factor),
         "index_threshold": 2 * 1.5 * terminate_index_threshold / 0.7 * (scale_factor * scale_factor),
@@ -5167,7 +5357,7 @@ def compute_imitation_reward(
     force_sim = torch.norm(target_states["tip_force"], dim=-1) # [N, 5]
     
     ref_contact_mask = dist_ref < 0.03
-    # sim_contact_mask = dist_sim < 0.003
+    sim_contact_mask = dist_sim < 0.03
 
     force_score = torch.clamp((force_sim - 0.1) / (1.5 - 0.1), 0.0, 1.0)
     
@@ -5175,8 +5365,180 @@ def compute_imitation_reward(
     # 基础奖励 4.0 + 额外力奖励 6.0 * force_score
     current_finger_reward = (0.1 + 3.0 * force_score)
 
-    contact_bonus = ((ref_contact_mask).float() * current_finger_reward).sum(dim=-1)
+    tip_contact_denom = ref_contact_mask.float().sum(dim=-1).clamp_min(1.0)
+    contact_bonus = ((ref_contact_mask & sim_contact_mask).float() * current_finger_reward).sum(dim=-1) / tip_contact_denom
     reward_interact = reward_interact + contact_bonus
+
+    # === Multi-link human contact map reward ===
+    contact_point_indices = [13, 14, 15, 16, 0, 1, 2, 3, 4, 5, 9, 10, 11, 6, 7, 8]
+    contact_ref_dist = target_states["hand_contact_distance"]  # [N, P]
+    contact_ref_mask = contact_ref_dist < 0.03
+    contact_obj_idx = target_states["hand_contact_closest_obj_idx"]
+    contact_obj_local = target_states["hand_contact_closest_pt_local"]
+    contact_N = states["base_state"].shape[0]
+    contact_P = contact_obj_local.shape[1]
+    contact_curr_obj_pos = torch.gather(
+        states["manip_obj_pos"],
+        1,
+        contact_obj_idx.view(contact_N, 1, 1).expand(-1, 1, 3),
+    ).squeeze(1)
+    contact_curr_obj_quat = torch.gather(
+        states["manip_obj_quat"],
+        1,
+        contact_obj_idx.view(contact_N, 1, 1).expand(-1, 1, 4),
+    ).squeeze(1)
+    contact_curr_obj_rot = quat_to_rotmat(contact_curr_obj_quat[:, [3, 0, 1, 2]])
+    contact_obj_sim = (
+        torch.bmm(contact_curr_obj_rot, contact_obj_local.transpose(-1, -2)).transpose(-1, -2)
+        + contact_curr_obj_pos.unsqueeze(1)
+    )
+    contact_hand_sim = states["joints_state"][:, [idx + 1 for idx in contact_point_indices], :3]
+    contact_sim_dist = torch.norm(contact_hand_sim - contact_obj_sim, dim=-1)
+    contact_sim_mask = contact_sim_dist < 0.03
+    contact_dist_reward = torch.exp(-80.0 * contact_sim_dist)
+
+    contact_force_by_point = torch.zeros((contact_N, contact_P), device=states["base_state"].device)
+    # Map the available sim contact bodies to the closest semantic contact points:
+    # thumb_distal, index_intermediate, middle_intermediate, ring_intermediate, pinky_intermediate.
+    contact_force_by_point[:, 2] = force_score[:, 0]
+    contact_force_by_point[:, 5] = force_score[:, 1]
+    contact_force_by_point[:, 8] = force_score[:, 2]
+    contact_force_by_point[:, 11] = force_score[:, 3]
+    contact_force_by_point[:, 14] = force_score[:, 4]
+    contact_denom = contact_ref_mask.float().sum(dim=-1).clamp_min(1.0)
+    reward_contact_map = (
+        contact_ref_mask.float()
+        * contact_sim_mask.float()
+        * (0.5 + contact_force_by_point)
+        * contact_dist_reward
+    ).sum(dim=-1) / contact_denom
+
+    thumb_contact = (contact_ref_mask[:, :4] & contact_sim_mask[:, :4]).any(dim=-1).float()
+    other_contact = (contact_ref_mask[:, 4:] & contact_sim_mask[:, 4:]).any(dim=-1).float()
+    reward_opposition = thumb_contact * other_contact
+
+    # === Small-handle grasp rewards ===
+    # Contact alone is too weak for a small shelf handle. These terms encourage
+    # the thumb and other fingers to cage the contacted handle area from
+    # opposite sides, and to keep the hand-object local relation stable.
+    contact_hand_ref = target_states["joints_pos"][:, contact_point_indices, :]
+    contact_obj_ref = target_states["hand_contact_closest_pt_world"]
+    ref_contact_weight = contact_ref_mask.float()
+    soft_contact_weight = ref_contact_weight * contact_dist_reward
+
+    def masked_centroid(points: Tensor, weights: Tensor) -> Tensor:
+        denom = weights.sum(dim=-1, keepdim=True).clamp_min(1.0)
+        return (points * weights.unsqueeze(-1)).sum(dim=1) / denom
+
+    grasp_center_ref = masked_centroid(contact_obj_ref, ref_contact_weight)
+    grasp_center_sim = masked_centroid(contact_obj_sim, ref_contact_weight)
+
+    thumb_ref_weight = ref_contact_weight[:, :4]
+    other_ref_weight = ref_contact_weight[:, 4:]
+    thumb_soft_weight = soft_contact_weight[:, :4]
+    other_soft_weight = soft_contact_weight[:, 4:]
+
+    ref_has_index = ref_contact_weight[:, 4:7].sum(dim=-1) > 0.5
+    ref_has_middle = ref_contact_weight[:, 7:10].sum(dim=-1) > 0.5
+    ref_has_ring = ref_contact_weight[:, 10:13].sum(dim=-1) > 0.5
+    ref_has_pinky = ref_contact_weight[:, 13:16].sum(dim=-1) > 0.5
+    ref_non_thumb_group_count = (
+        ref_has_index.float()
+        + ref_has_middle.float()
+        + ref_has_ring.float()
+        + ref_has_pinky.float()
+    )
+    has_ref_grasp = (ref_non_thumb_group_count >= 2.0).float()
+    sim_grasp_strength = (
+        torch.clamp(thumb_soft_weight.sum(dim=-1), min=0.0, max=1.0)
+        * torch.clamp(other_soft_weight.sum(dim=-1), min=0.0, max=1.0)
+    )
+
+    thumb_sim_centroid = masked_centroid(contact_hand_sim[:, :4], thumb_soft_weight)
+    other_sim_centroid = masked_centroid(contact_hand_sim[:, 4:], other_soft_weight)
+    thumb_ref_centroid = masked_centroid(contact_hand_ref[:, :4], thumb_ref_weight)
+    other_ref_centroid = masked_centroid(contact_hand_ref[:, 4:], other_ref_weight)
+
+    thumb_sim_vec = thumb_sim_centroid - grasp_center_sim
+    other_sim_vec = other_sim_centroid - grasp_center_sim
+    thumb_sim_vec = thumb_sim_vec / torch.clamp(torch.norm(thumb_sim_vec, dim=-1, keepdim=True), min=1e-6)
+    other_sim_vec = other_sim_vec / torch.clamp(torch.norm(other_sim_vec, dim=-1, keepdim=True), min=1e-6)
+    # Disabled for now: thumb-vs-other opposition is too narrow for shelf handles,
+    # where the useful enclosure can be palm/fingers rather than thumb/fingers.
+    reward_grasp_opposition_raw = torch.zeros_like(sim_grasp_strength)
+
+    thumb_ref_radius = torch.norm(thumb_ref_centroid - grasp_center_ref, dim=-1)
+    other_ref_radius = torch.norm(other_ref_centroid - grasp_center_ref, dim=-1)
+    thumb_sim_radius = torch.norm(thumb_sim_centroid - grasp_center_sim, dim=-1)
+    other_sim_radius = torch.norm(other_sim_centroid - grasp_center_sim, dim=-1)
+    radius_err = torch.abs(thumb_sim_radius - thumb_ref_radius) + torch.abs(other_sim_radius - other_ref_radius)
+    reward_grasp_enclosure_raw = torch.zeros_like(reward_grasp_opposition_raw)
+
+    contact_target_obj_pos = torch.gather(
+        target_obj_pos,
+        1,
+        contact_obj_idx.view(contact_N, 1, 1).expand(-1, 1, 3),
+    ).squeeze(1)
+    contact_target_obj_quat = torch.gather(
+        target_obj_quat,
+        1,
+        contact_obj_idx.view(contact_N, 1, 1).expand(-1, 1, 4),
+    ).squeeze(1)
+    contact_target_obj_rot = quat_to_rotmat(contact_target_obj_quat[:, [3, 0, 1, 2]])
+    contact_hand_ref_local = torch.bmm(
+        contact_target_obj_rot.transpose(-1, -2),
+        (contact_hand_ref - contact_target_obj_pos.unsqueeze(1)).transpose(-1, -2),
+    ).transpose(-1, -2)
+    contact_hand_sim_local = torch.bmm(
+        contact_curr_obj_rot.transpose(-1, -2),
+        (contact_hand_sim - contact_curr_obj_pos.unsqueeze(1)).transpose(-1, -2),
+    ).transpose(-1, -2)
+    local_grip_err = torch.norm(contact_hand_sim_local - contact_hand_ref_local, dim=-1)
+    reward_grip_stability_raw = (
+        soft_contact_weight * torch.exp(-50.0 * local_grip_err)
+    ).sum(dim=-1) / contact_denom
+    reward_grip_stability_raw = reward_grip_stability_raw * has_ref_grasp
+
+    # === Reference object phase reward ===
+    ref_obj_speed = torch.norm(target_obj_vel, dim=-1)
+    ref_obj_ang_speed = torch.norm(target_obj_ang_vel, dim=-1)
+    if ref_obj_speed.dim() > 1:
+        ref_obj_speed = (ref_obj_speed * dynamic_mask).sum(dim=-1) / dynamic_count
+    if ref_obj_ang_speed.dim() > 1:
+        ref_obj_ang_speed = (ref_obj_ang_speed * dynamic_mask).sum(dim=-1) / dynamic_count
+    ref_obj_static = (ref_obj_speed < 0.02) & (ref_obj_ang_speed < 0.10)
+    current_obj_speed = torch.norm(current_obj_vel, dim=-1)
+    if current_obj_speed.dim() > 1:
+        current_obj_speed = current_obj_speed.max(dim=-1)[0]
+    current_obj_ang_speed = torch.norm(current_obj_ang_vel, dim=-1)
+    if current_obj_ang_speed.dim() > 1:
+        current_obj_ang_speed = current_obj_ang_speed.max(dim=-1)[0]
+    reward_obj_static_hold = 0.5 * reward_obj_pos_scale * reward_obj_pos + 0.5 * reward_obj_rot_scale * reward_obj_rot
+    reward_obj_moving_track = (
+        0.45 * reward_obj_pos_scale * reward_obj_pos
+        + 0.35 * reward_obj_rot_scale * reward_obj_rot
+        + 0.10 * reward_obj_vel
+        + 0.10 * reward_obj_ang_vel
+    )
+    reward_obj_phase = torch.where(ref_obj_static, reward_obj_static_hold, reward_obj_moving_track)
+    penalty_obj_static_motion = torch.where(
+        ref_obj_static,
+        -0.5 * torch.tanh(5.0 * current_obj_speed) - 0.2 * torch.tanh(1.0 * current_obj_ang_speed),
+        torch.zeros_like(current_obj_speed),
+    )
+    grasp_form_weight = torch.where(
+        ref_obj_static,
+        torch.ones_like(reward_grasp_opposition_raw),
+        torch.ones_like(reward_grasp_opposition_raw) * 0.6,
+    ) * has_ref_grasp
+    grip_stability_weight = torch.where(
+        ref_obj_static,
+        torch.ones_like(reward_grip_stability_raw) * 0.35,
+        torch.ones_like(reward_grip_stability_raw),
+    ) * has_ref_grasp
+    reward_grasp_opposition = reward_grasp_opposition_raw * grasp_form_weight
+    reward_grasp_enclosure = reward_grasp_enclosure_raw * grasp_form_weight
+    reward_grip_stability = reward_grip_stability_raw * grip_stability_weight
 
     # === [新增] 基于 Bin 的进度奖励 ===
     # 使用外部传入的、基于全长计算的每帧固定奖励
@@ -5197,25 +5559,30 @@ def compute_imitation_reward(
     reward_execute = (
         1.5 * reward_eef_pos  # 从0.1增加到0.3，提高wrist位置跟踪的权重
         + 2 * reward_eef_rot
-        + 0.9 * reward_thumb_tip_pos
-        + 0.8 * reward_index_tip_pos
-        + 0.75 * reward_middle_tip_pos
-        + 0.6 * reward_pinky_tip_pos
-        + 0.6 * reward_ring_tip_pos
-        + 0.1 * reward_level_1_pos
-        + 0.1 * reward_level_2_pos
-        + reward_obj_pos_scale * reward_obj_pos
-        + reward_obj_rot_scale * reward_obj_rot
+        + 0.45 * reward_thumb_tip_pos
+        + 0.4 * reward_index_tip_pos
+        + 0.4 * reward_middle_tip_pos
+        + 0.3 * reward_pinky_tip_pos
+        + 0.3 * reward_ring_tip_pos
+        + 0.4 * reward_level_1_pos
+        + 0.3 * reward_level_2_pos
+        + 2.0 * reward_bone_dir
+        + 1.5 * reward_finger_curl
+        + reward_obj_phase
         + 0.6 * reward_eef_vel
         + 0.8 * reward_eef_ang_vel
         + 0.1 * reward_joints_vel
-        + 0.1 * reward_obj_vel
-        + 0.1 * reward_obj_ang_vel
         + reward_finger_tip_force_scale * reward_finger_tip_force
         + 0.5 * reward_power
         + 0.5 * reward_wrist_power
         + 0.0 * reward_contact_violation
         + reward_interact_scale * reward_interact # 新增
+        + 3.0 * reward_contact_map
+        + 1.0 * reward_opposition
+        + 1.5 * reward_grasp_opposition
+        + 1.0 * reward_grasp_enclosure
+        + 2.0 * reward_grip_stability
+        + penalty_obj_static_motion
         + 1.0 * (reward_progress + reward_success_bonus + reward_bin_pass) # 新增进度、成功和跨 bin 奖励
     )
 
@@ -5240,7 +5607,21 @@ def compute_imitation_reward(
         "reward_obj_vel": reward_obj_vel,
         "reward_obj_ang_vel": reward_obj_ang_vel,
         "reward_obj_alpha": alpha, # 新增记录 alpha
+        "reward_obj_point_mean_err": diff_obj_mean_point_err.mean(dim=-1) if diff_obj_mean_point_err.dim() > 1 else diff_obj_mean_point_err,
+        "reward_obj_rot_point_disp": diff_obj_rot_point_disp.mean(dim=-1) if diff_obj_rot_point_disp.dim() > 1 else diff_obj_rot_point_disp,
         "reward_interact": reward_interact,
+        "reward_bone_dir": reward_bone_dir,
+        "reward_finger_curl": reward_finger_curl,
+        "reward_contact_map": reward_contact_map,
+        "reward_opposition": reward_opposition,
+        "reward_grasp_opposition": reward_grasp_opposition,
+        "reward_grasp_enclosure": reward_grasp_enclosure,
+        "reward_grip_stability": reward_grip_stability,
+        "ref_non_thumb_group_count": ref_non_thumb_group_count,
+        "grasp_form_weight": grasp_form_weight,
+        "grip_stability_weight": grip_stability_weight,
+        "reward_obj_phase": reward_obj_phase,
+        "penalty_obj_static_motion": penalty_obj_static_motion,
         "reward_progress": reward_progress,         # 新增
         "reward_success_bonus": reward_success_bonus, # 新增
         "reward_bin_pass": reward_bin_pass,           # 新增

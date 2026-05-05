@@ -1455,6 +1455,15 @@ class MyContinuousA2CBase(MyA2CBase):
                                 self.save(os.path.join(self.nn_dir, checkpoint_name))
                                 should_exit = True
 
+                    if epoch_num % 10 == 0:
+                        sr_str = f"{mean_success_rate:.4f}" if mean_success_rate is not None else "n/a"
+                        fr_str = f"{mean_fail_rate:.4f}" if mean_fail_rate is not None else "n/a"
+                        print(
+                            f"[TRAIN STATS] epoch={epoch_num} "
+                            f"reward={float(mean_rewards[0]):.3f} "
+                            f"sr={sr_str} fr={fr_str} len={float(mean_lengths):.2f}"
+                        )
+
                 if epoch_num >= self.early_stop_epochs:
                     slope_early_stop = True
                     for horizon in [8, 32, 64]:  # short term, mid term, long term trend

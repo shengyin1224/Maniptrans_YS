@@ -1,5 +1,6 @@
 import os
 import pickle
+import xml.etree.ElementTree as ET
 import torch
 import numpy as np
 import trimesh
@@ -186,6 +187,44 @@ class HumotoDatasetBase(ManipData):
         mats[:, :3, 3] = pos
         return mats
 
+    def _load_urdf_point_cloud(self, urdf_path: str, num_points: int = 5000):
+        if not os.path.exists(urdf_path):
+            return None
+
+        try:
+            root = ET.parse(urdf_path).getroot()
+            mesh_elem = root.find(".//mesh")
+            if mesh_elem is None:
+                return None
+
+            mesh_filename = mesh_elem.attrib.get("filename", "")
+            if mesh_filename.startswith("package://"):
+                mesh_filename = mesh_filename.replace("package://", "")
+            mesh_path = os.path.join(os.path.dirname(urdf_path), mesh_filename)
+            if not os.path.exists(mesh_path):
+                return None
+
+            scale_vals = [float(v) for v in mesh_elem.attrib.get("scale", "1 1 1").split()]
+            if len(scale_vals) == 1:
+                scale_vals = scale_vals * 3
+
+            mesh_obj = trimesh.load(mesh_path, force="mesh")
+            if isinstance(mesh_obj, trimesh.Scene):
+                mesh_obj = trimesh.util.concatenate(mesh_obj.dump())
+            mesh_obj.vertices *= np.asarray(scale_vals[:3], dtype=np.float32)
+
+            points, _ = trimesh.sample.sample_surface_even(mesh_obj, count=num_points, seed=2024)
+            points = np.asarray(points, dtype=np.float32)
+            while points.shape[0] < num_points and points.shape[0] > 0:
+                points = np.concatenate([points, points[: num_points - points.shape[0]]], axis=0)
+            if points.shape[0] == 0:
+                return None
+            return torch.tensor(points[:num_points], dtype=torch.float32, device=self.device)
+        except Exception as exc:
+            if self.verbose:
+                print(f"Warning: failed to load URDF point cloud from {urdf_path}: {exc}")
+            return None
+
     def __getitem__(self, index):
         if isinstance(index, str):
              if index not in self.indices:
@@ -230,26 +269,30 @@ class HumotoDatasetBase(ManipData):
              traj_tensor = torch.matmul(self.global_fix_matrix, traj_tensor)
              traj_tensor = traj_tensor[::self.skip]
 
-             # 1.3 获取 Mesh 并采样点云
-             if obj_name in raw_data['object_models']:
+             # 1.3 获取 URDF 路径
+             obj_urdf_path = os.path.join(seq_folder_path, f"{obj_name}.urdf")
+
+             # 1.4 获取 Mesh 并采样点云
+             # HUMOTO raw object mesh and the IsaacGym URDF mesh can use different
+             # local axes. Use the URDF mesh here so reference contact distances
+             # are computed in the same object frame as simulation.
+             obj_verts = self._load_urdf_point_cloud(obj_urdf_path, num_points=5000)
+             if obj_verts is None and obj_name in raw_data['object_models']:
                  verts_np, faces_np = raw_data['object_models'][obj_name]['mesh']
                  mesh_torch = Meshes(
                      verts=torch.tensor(verts_np, dtype=torch.float32, device=self.device)[None],
                      faces=torch.tensor(faces_np, dtype=torch.float32, device=self.device)[None]
                  )
                  obj_verts = self.random_sampling_pc(mesh_torch)
-             else:
-                 obj_verts = torch.zeros((1000, 3), device=self.device)
-
-             # 1.4 获取 URDF 路径
-             obj_urdf_path = os.path.join(seq_folder_path, f"{obj_name}.urdf")
+             elif obj_verts is None:
+                 obj_verts = torch.zeros((5000, 3), device=self.device)
              
              # 1.5 存入列表
              scene_objects_info.append({
                  "name": obj_name,
                  "urdf": obj_urdf_path,
                  "trajectory": traj_tensor, # [T, 4, 4]
-                 "verts": obj_verts,        # [1000, 3]
+                 "verts": obj_verts,
                  "is_dynamic": True 
              })
         
